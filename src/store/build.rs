@@ -31,6 +31,8 @@ pub const MAX_ENTRIES: usize = 200_000;
 pub const PAGE: usize = 2_000;
 /// v1 唯一参与同步的 ref。
 pub const MAIN: &str = "main";
+/// `status`/`diff` 一次最多列多少条路径。再多就只给计数，不给内存。
+pub const SAMPLE_MAX: usize = 30;
 /// FR-10 的字节闸：一次删除超过 2 GB 就得有人签字。
 const MASS_DELETE_BYTES: u64 = 2 << 30;
 /// FR-10 的条数闸：超过已知条目的两成，**且**不少于这个绝对数，才算大规模删除。
@@ -58,11 +60,64 @@ pub struct ChangeSet {
     pub bytes: u64,
     /// 只算被删文件（目录恒 0）。FR-10 的字节闸看的是这个，不是 `bytes`。
     pub deleted_bytes: u64,
+    /// 变更路径样本，**上限 `SAMPLE_MAX`**。`status`/`diff` 要能列出"到底是哪几个文件"，
+    /// 而列出全部是 O(文件数) —— 那违反 §9.6.1 的常数内存承诺。计数才是完整的。
+    pub sample: Vec<Change>,
+    /// 因为上限被丢掉多少条（0 = 样本就是全量）。
+    pub sample_more: usize,
 }
 
 impl ChangeSet {
     pub fn is_empty(&self) -> bool {
         self.add + self.modify + self.delete == 0
+    }
+
+    /// 记一条变更：计数永远记全，路径只留前 `SAMPLE_MAX` 条。
+    fn note(&mut self, what: ChangeKind, path: String, size: u64) {
+        match what {
+            ChangeKind::Add => {
+                self.add += 1;
+                self.bytes += size;
+            }
+            ChangeKind::Modify => {
+                self.modify += 1;
+                self.bytes += size;
+            }
+            ChangeKind::Delete => {
+                self.delete += 1;
+                self.deleted_bytes += size;
+            }
+        }
+        if self.sample.len() < SAMPLE_MAX {
+            self.sample.push(Change { what, path, size });
+        } else {
+            self.sample_more += 1;
+        }
+    }
+}
+
+/// 一条变更的样本。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Change {
+    pub what: ChangeKind,
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeKind {
+    Add,
+    Modify,
+    Delete,
+}
+
+impl ChangeKind {
+    pub fn sign(self) -> &'static str {
+        match self {
+            ChangeKind::Add => "+",
+            ChangeKind::Modify => "~",
+            ChangeKind::Delete => "-",
+        }
     }
 }
 
@@ -97,6 +152,8 @@ pub struct Built {
     pub blocks_stored: usize,
     pub block_bytes: u64,
     pub blobs_new: usize,
+    /// `plan` 算出来但**没落盘**的那些目录清单，供 `diff` 递归（`build` 恒为空）。
+    pub trees: TreeStore,
 }
 
 /// 一次提交要带的外部信息。单独成结构体而不是一路摊成参数：`build` 已经有四个
@@ -112,6 +169,40 @@ pub struct Meta<'a> {
     pub allow_mass_delete: bool,
 }
 
+/// HEAD 指向的 commit 的树；还没有任何 commit 时是 `None`。
+///
+/// 多 head 时取第一个 —— 与 `plan`/`build` 现有语义一致（真正的 union 是 M3 的活）。
+fn head_tree(db: &dyn KvEngine, pid: ProjectId) -> Result<Option<Hash>> {
+    match ref_heads(db, pid, MAIN)?.first() {
+        Some(h) => Ok(Some(object::read_commit(db, pid, h)?.tree)),
+        None => Ok(None),
+    }
+}
+
+/// 只读地算出"如果现在 commit，树会长什么样、与 HEAD 差在哪"。**一个字节都不写**。
+///
+/// 它存在的理由是 `status` / `diff`：这两条必须能在任何时刻跑，包括磁盘快满、或者扫描
+/// 之后文件又被改了的时候。让它们直接复用 `build` 就等于"看一眼"要落块、写对象、撑大
+/// 版本链——那已经不是看一眼了。
+///
+/// 代价说清：`plan` 用 `W` 里现成的整文件 hash，**不复核磁盘**。所以它可能报出一个随后
+/// 被 `commit` 以 `StaleScan` 拒掉的改动。这是"按最后一次扫描说话"的定义，不是 bug。
+pub fn plan(db: &dyn KvEngine, pid: ProjectId) -> Result<Built> {
+    let snap = snapshot(db, pid, MAX_ENTRIES)?;
+    let prev_tree = head_tree(db, pid)?;
+    let mut built = Built {
+        entries: snap.entries.len(),
+        epoch: snap.epoch,
+        known: snap.known,
+        ..Default::default()
+    };
+    let mut sink = PlanSink::default();
+    built.tree = assemble(db, pid, &snap, &mut built, &mut sink)?;
+    built.trees = sink.trees;
+    built.changes = diff(db, pid, prev_tree.as_ref(), &built.tree, &built.trees)?;
+    Ok(built)
+}
+
 /// 构建并落库一个 commit。无改动时返回 `commit: None`，**不产生空提交也不移 head**。
 pub fn build(
     db: &dyn KvEngine,
@@ -122,10 +213,7 @@ pub fn build(
 ) -> Result<Built> {
     let snap = snapshot(db, pid, MAX_ENTRIES)?;
     let prev_heads = ref_heads(db, pid, MAIN)?;
-    let prev_tree = match prev_heads.first() {
-        Some(h) => Some(object::read_commit(db, pid, h)?.tree),
-        None => None,
-    };
+    let prev_tree = head_tree(db, pid)?;
 
     let mut built = Built {
         entries: snap.entries.len(),
@@ -133,71 +221,22 @@ pub fn build(
         known: snap.known,
         ..Default::default()
     };
-    let mut dirs: BTreeMap<String, Vec<object::TreeEntry>> = BTreeMap::new();
-    let mut known: BTreeSet<String> = BTreeSet::new();
-    // 每个目录的 mode 来自它自己的 W 记录（§8：只同步 owner 可执行位）。
-    let mut dir_mode: BTreeMap<String, u32> = BTreeMap::new();
+    built.tree = assemble(
+        db,
+        pid,
+        &snap,
+        &mut built,
+        &mut WriteSink { store, work_root },
+    )?;
 
-    for (path, e) in &snap.entries {
-        let (dir, name) = split(path);
-        ensure_dir(&mut dirs, &mut known, dir);
-        match e.kind {
-            Kind::Dir => {
-                ensure_dir(&mut dirs, &mut known, path);
-                dir_mode.insert(path.clone(), e.mode);
-            }
-            Kind::File => {
-                let blob = put_blob(db, pid, store, work_root, path, e, &mut built)?;
-                dirs.entry(dir.to_string())
-                    .or_default()
-                    .push(object::TreeEntry {
-                        name: name.to_string(),
-                        kind: Kind::File,
-                        hash: blob,
-                        size: e.size,
-                        mode: e.mode,
-                    });
-            }
-            Kind::Symlink => {
-                // 目标文本本身必须进 CAS，否则树里那个 hash 永远解不回文本（§17 补记三）。
-                // 走 blob 而不是给 TreeEntry 加字段：git 也是这么做的，且**不动编码** ⇒
-                // 已存的历史不会作废。链接目标很短，`put_bytes` 的物化代价可以忽略。
-                let target = e.symlink_target.as_deref().ok_or_else(|| {
-                    Error::Codec(format!(
-                        "{path} 标成符号链接却没有目标文本：W 记录不完整，拒绝写进历史"
-                    ))
-                })?;
-                let outcome = store.put_bytes(target.as_bytes())?;
-                if outcome.blob.hash != e.blob_hash {
-                    return Err(Error::StaleScan {
-                        path: path.to_string(),
-                    });
-                }
-                record_blob(db, pid, &outcome, path, &mut built)?;
-                dirs.entry(dir.to_string())
-                    .or_default()
-                    .push(object::TreeEntry {
-                        name: name.to_string(),
-                        kind: Kind::Symlink,
-                        hash: e.blob_hash,
-                        size: 0,
-                        mode: e.mode,
-                    });
-            }
-        }
-    }
-
-    // 逆字典序 = 先子后父（"a" < "a/b"），所以子目录的 tree hash 一定先算好。
-    let mut tree_of: BTreeMap<String, Hash> = BTreeMap::new();
-    for dir in known.iter().rev() {
-        let mut list = dirs.remove(dir).unwrap_or_default();
-        list.extend(collect_children(&known, &tree_of, &dir_mode, dir)?);
-        let hash = object::put_tree(db, pid, &list)?;
-        tree_of.insert(dir.clone(), hash);
-    }
-    built.tree = tree_of.get("").copied().unwrap_or_else(object::empty_tree);
-
-    built.changes = diff(db, pid, prev_tree.as_ref(), &built.tree)?;
+    // build 已经把树写进库了，diff 直接读库，不必再带一份内存副本。
+    built.changes = diff(
+        db,
+        pid,
+        prev_tree.as_ref(),
+        &built.tree,
+        &TreeStore::default(),
+    )?;
     if built.changes.is_empty() {
         return Ok(built); // 不产生空提交：碎 commit 会把引擎版本链白白撑大（§9.6.2）
     }
@@ -221,6 +260,164 @@ pub fn build(
     set_ref(db, pid, MAIN, &[commit])?;
     built.commit = Some(commit);
     Ok(built)
+}
+
+/// 树从哪儿读：库里的（`build` 之后都在），还是 `plan` 刚算出来、**还没落盘**的那份内存。
+///
+/// 为什么非要有这个东西：`plan` 的承诺是"一个字节都不写"，可 `diff` 要递归进新树的每一层
+/// 才能报出具体路径。只把根 hash 交给 diff，它就会去库里找一个不存在的新树 ⇒ `MissingObject`。
+/// 所以 `PlanSink` 边算边把清单留在这儿，`WriteSink` 留空（已经写进库了，再留一份是白占内存）。
+#[derive(Debug, Default, Clone)]
+pub struct TreeStore(BTreeMap<Hash, Vec<object::TreeEntry>>);
+
+impl TreeStore {
+    fn read(
+        &self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        hash: &Hash,
+    ) -> Result<Vec<object::TreeEntry>> {
+        if let Some(entries) = self.0.get(hash) {
+            return Ok(entries.clone());
+        }
+        object::read_tree(db, pid, hash) // 空树在这里有特判，不查表也读得出来
+    }
+}
+
+/// 组装阶段"要不要落盘"的两个决策点。
+///
+/// 用 trait 而不是 `write: bool`：布尔参数会一路传到调用链上，谁传反了谁就静默产出半成品；
+/// 这里两个实现各自只有一条路可走，编译器替你记住。
+pub trait Sink {
+    /// 一个文件 / 符号链接条目 → 它的 blob hash。
+    fn blob_of(
+        &mut self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        path: &str,
+        e: &WtEntry,
+        built: &mut Built,
+    ) -> Result<Hash>;
+    /// 一份目录清单 → tree hash（写或不写）。
+    fn tree_of(
+        &mut self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        entries: &[object::TreeEntry],
+    ) -> Result<Hash>;
+}
+
+/// 只算不写，喂给 `plan`。算出来的清单留在 `trees` 里给 diff 递归用。
+#[derive(Default)]
+struct PlanSink {
+    trees: TreeStore,
+}
+
+impl Sink for PlanSink {
+    fn blob_of(
+        &mut self,
+        _db: &dyn KvEngine,
+        _pid: ProjectId,
+        _path: &str,
+        e: &WtEntry,
+        _built: &mut Built,
+    ) -> Result<Hash> {
+        Ok(e.blob_hash)
+    }
+
+    fn tree_of(
+        &mut self,
+        _db: &dyn KvEngine,
+        _pid: ProjectId,
+        entries: &[object::TreeEntry],
+    ) -> Result<Hash> {
+        // 存**排好序的**那份：从库里读回来的是规范序，两边形状一样，diff 才不可能
+        // 因为顺序差异给出两种答案。
+        let mut sorted = entries.to_vec();
+        sorted.sort();
+        let hash = object::tree_hash(&sorted);
+        self.trees.0.entry(hash).or_insert(sorted);
+        Ok(hash)
+    }
+}
+
+/// 真落盘，喂给 `build`。
+struct WriteSink<'a> {
+    store: &'a cas::Cas,
+    work_root: &'a Path,
+}
+
+impl Sink for WriteSink<'_> {
+    fn blob_of(
+        &mut self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        path: &str,
+        e: &WtEntry,
+        built: &mut Built,
+    ) -> Result<Hash> {
+        match e.kind {
+            Kind::File => put_blob(db, pid, self.store, self.work_root, path, e, built),
+            Kind::Symlink => put_link(db, pid, self.store, path, e, built),
+            Kind::Dir => Err(Error::Codec(format!(
+                "{path} 是目录，它没有 blob：这一层归 tree"
+            ))),
+        }
+    }
+
+    fn tree_of(
+        &mut self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        entries: &[object::TreeEntry],
+    ) -> Result<Hash> {
+        object::put_tree(db, pid, entries)
+    }
+}
+
+/// 快照 → 一棵根 tree。**这段逻辑全站只有这一份**：顶层目录静默丢失那个 bug 就住在这里，
+/// 给 `plan` 复制一份等于再埋一个同根因的坑，而且第二份没人会去测。
+fn assemble<S: Sink>(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    snap: &Snapshot,
+    built: &mut Built,
+    sink: &mut S,
+) -> Result<Hash> {
+    let mut dirs: BTreeMap<String, Vec<object::TreeEntry>> = BTreeMap::new();
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    // 每个目录的 mode 来自它自己的 W 记录（§8：只同步 owner 可执行位）。
+    let mut dir_mode: BTreeMap<String, u32> = BTreeMap::new();
+
+    for (path, e) in &snap.entries {
+        let (dir, name) = split(path);
+        ensure_dir(&mut dirs, &mut known, dir);
+        if e.kind == Kind::Dir {
+            ensure_dir(&mut dirs, &mut known, path);
+            dir_mode.insert(path.clone(), e.mode);
+            continue;
+        }
+        let hash = sink.blob_of(db, pid, path, e, built)?;
+        dirs.entry(dir.to_string())
+            .or_default()
+            .push(object::TreeEntry {
+                name: name.to_string(),
+                kind: e.kind,
+                hash,
+                size: e.size, // 目录/链接的逻辑大小恒 0，定义在 `worktree::logical_size`
+                mode: e.mode,
+            });
+    }
+
+    // 逆字典序 = 先子后父（"a" < "a/b"），所以子目录的 tree hash 一定先算好。
+    let mut tree_of: BTreeMap<String, Hash> = BTreeMap::new();
+    for dir in known.iter().rev() {
+        let mut list = dirs.remove(dir).unwrap_or_default();
+        list.extend(collect_children(&known, &tree_of, &dir_mode, dir)?);
+        let hash = sink.tree_of(db, pid, &list)?;
+        tree_of.insert(dir.clone(), hash);
+    }
+    Ok(tree_of.get("").copied().unwrap_or_else(object::empty_tree))
 }
 
 /// 分页读 `W` 前缀，只保留**最新一轮扫描**盖过章的行。
@@ -323,6 +520,34 @@ fn put_blob(
     Ok(e.blob_hash)
 }
 
+/// 把符号链接的**目标文本**当 blob 落进 CAS。
+///
+/// 为什么用 blob 而不是给 `TreeEntry` 加一个 `target` 字段：加字段 = 改编码 = 已存历史的
+/// tree hash 全体作废，而那时两台机器都已经有数据了（M1 之后代价就变成迁移）。目标文本
+/// 本身就是一个几十字节的小对象，当 blob 存正好复用去重与 refcnt，git 也是这么做的。
+fn put_link(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    store: &cas::Cas,
+    path: &str,
+    e: &WtEntry,
+    built: &mut Built,
+) -> Result<Hash> {
+    let target = e.symlink_target.as_deref().ok_or_else(|| {
+        Error::Codec(format!(
+            "{path} 标成符号链接却没有目标文本：W 记录不完整，拒绝写进历史"
+        ))
+    })?;
+    let outcome = store.put_bytes(target.as_bytes())?;
+    if outcome.blob.hash != e.blob_hash {
+        return Err(Error::StaleScan {
+            path: path.to_string(),
+        });
+    }
+    record_blob(db, pid, &outcome, path, built)?;
+    Ok(e.blob_hash)
+}
+
 /// 把一个已经落盘的 blob 记进库：`B` 清单 + 每块引用数。**文件和符号链接共用这一条**。
 ///
 /// 已存在的 blob 直接返回：清单是内容寻址的，重写一遍只会多长一个版本行（§9.6.2），
@@ -402,7 +627,15 @@ fn bump_block(db: &dyn KvEngine, pid: ProjectId, hash: Hash, size: u32) -> Resul
 }
 
 /// 递归比对两棵树。**子树 hash 相同就整块跳过**——这就是 NFR-6 的 O(变更目录数)。
-fn diff(db: &dyn KvEngine, pid: ProjectId, old: Option<&Hash>, new: &Hash) -> Result<ChangeSet> {
+///
+/// `pub` 是给 `diff --at <rev>` 用的：那条要拿任意两个版本比，不只是跟 HEAD 比。
+pub fn diff(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    old: Option<&Hash>,
+    new: &Hash,
+    new_trees: &TreeStore,
+) -> Result<ChangeSet> {
     let mut out = ChangeSet::default();
     if old == Some(new) || (old.is_none() && *new == object::empty_tree()) {
         return Ok(out);
@@ -411,15 +644,20 @@ fn diff(db: &dyn KvEngine, pid: ProjectId, old: Option<&Hash>, new: &Hash) -> Re
         Some(h) => object::read_tree(db, pid, h)?,
         None => Vec::new(),
     };
-    let new_list = object::read_tree(db, pid, new)?;
-    walk_dir(db, pid, &old_list, &new_list, &mut out)?;
+    let new_list = new_trees.read(db, pid, new)?;
+    walk_dir(db, pid, "", new_trees, &old_list, &new_list, &mut out)?;
     Ok(out)
 }
 
 /// 同一目录名下一棵子树的全部差异。删除 = 在 `old` 里而**不在** `new` 里的那些名字。
+///
+/// `prefix` 是为了样本里能给出**可直接喂给 `restore` 的完整路径**——只给文件名的话，
+/// 用户看到 `guide.md` 不知道该从哪儿恢复。
 fn walk_dir(
     db: &dyn KvEngine,
     pid: ProjectId,
+    prefix: &str,
+    new_trees: &TreeStore,
     old: &[object::TreeEntry],
     new: &[object::TreeEntry],
     out: &mut ChangeSet,
@@ -428,12 +666,12 @@ fn walk_dir(
     let n: BTreeMap<&str, &object::TreeEntry> = new.iter().map(|e| (e.name.as_str(), e)).collect();
 
     for (name, ne) in &n {
+        let full = join(prefix, name);
         let Some(oe) = o.get(*name) else {
-            out.add += 1;
-            out.bytes += ne.size;
+            out.note(ChangeKind::Add, full.clone(), ne.size);
             if ne.kind == Kind::Dir {
-                let kids = object::read_tree(db, pid, &ne.hash)?;
-                walk_dir(db, pid, &[], &kids, out)?;
+                let kids = new_trees.read(db, pid, &ne.hash)?;
+                walk_dir(db, pid, &full, new_trees, &[], &kids, out)?;
             }
             continue;
         };
@@ -442,25 +680,24 @@ fn walk_dir(
         }
         if oe.kind == Kind::Dir && ne.kind == Kind::Dir {
             let kids_old = object::read_tree(db, pid, &oe.hash)?;
-            let kids_new = object::read_tree(db, pid, &ne.hash)?;
-            walk_dir(db, pid, &kids_old, &kids_new, out)?;
+            let kids_new = new_trees.read(db, pid, &ne.hash)?;
+            walk_dir(db, pid, &full, new_trees, &kids_old, &kids_new, out)?;
         } else {
-            out.modify += 1;
-            out.bytes += ne.size;
+            out.note(ChangeKind::Modify, full, ne.size);
         }
     }
     // 判删除只能问"这个名字还在不在新清单里"，不能问"刚才有没有被我改过"：
     // 未变更的条目上一轮就 continue 了，拿那条线筛会把好文件报成删除。
     for oe in o.values().filter(|e| !n.contains_key(&e.name.as_str())) {
-        out.delete += 1;
-        out.deleted_bytes += oe.size;
-        // 只有文件有 blob：目录的 hash 是 tree，符号链接的 hash 是目标串。
+        let full = join(prefix, &oe.name);
+        // 只有文件有 blob：目录的 hash 是 tree，符号链接的 hash 是目标文本的 blob。
         if oe.kind == Kind::File {
             out.deleted_blobs.push(oe.hash);
         }
+        out.note(ChangeKind::Delete, full.clone(), oe.size);
         if oe.kind == Kind::Dir {
             let kids = object::read_tree(db, pid, &oe.hash)?;
-            walk_dir(db, pid, &kids, &[], out)?;
+            walk_dir(db, pid, &full, new_trees, &kids, &[], out)?;
         }
     }
     Ok(())
@@ -518,6 +755,15 @@ fn collect_children(
 
 fn split(path: &str) -> (&str, &str) {
     split_opt(path).unwrap_or(("", path))
+}
+
+/// 目录前缀 + 条目名 → 完整路径（`/` 分隔，与 `W` 的键尾一致）。
+fn join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
 }
 
 fn split_opt(path: &str) -> Option<(&str, &str)> {

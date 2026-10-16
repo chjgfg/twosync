@@ -85,6 +85,19 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
+
+    /// 工作树（按最后一次扫描）与 HEAD 差在哪。**只读，一个字节都不写**
+    ///
+    /// 它不看文件内容，只看 `W` 与上一版树的差 —— 所以"扫描之后又改了"的那部分
+    /// 不在这里（要先 `scan`）。这一条与 git 的 `status` 语义相同，代价也相同。
+    Status,
+
+    /// 工作树与任意版本的差异，列出具体路径
+    Diff {
+        /// 和谁比：`HEAD` / ref 名 / commit hash 前缀
+        #[arg(long, default_value = "HEAD")]
+        at: String,
+    },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync

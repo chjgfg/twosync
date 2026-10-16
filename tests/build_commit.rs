@@ -420,3 +420,103 @@ fn nested_directories_survive_into_history() {
 fn names(entries: &[object::TreeEntry]) -> Vec<&str> {
     entries.iter().map(|e| e.name.as_str()).collect()
 }
+
+/// `plan`（`status`/`diff` 的底座）必须**一个字节都不写**，且算出来的树与随后真
+/// commit 的树完全一致。第二条才是这条用例的价值：两条路径共用 `assemble`，
+/// 一旦哪天有人给 `build` 加了 `plan` 没跟上的步骤，`status` 就开始骗人而测试全绿。
+#[test]
+fn plan_writes_nothing_and_matches_the_commit_that_follows() {
+    let site = Site::new();
+    write(&site.proj().join("top/leaf.txt"), b"one");
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    write(&site.proj().join("top/new.txt"), b"two");
+    fs::remove_file(site.proj().join("top/leaf.txt")).unwrap();
+    site.scan();
+
+    let rows = site.db.health().total_rows;
+    let p = build::plan(&*site.db, site.pid).unwrap();
+    assert_eq!(
+        site.db.health().total_rows,
+        rows,
+        "看一眼不该产生任何版本行"
+    );
+    assert_eq!(
+        (p.changes.add, p.changes.modify, p.changes.delete),
+        (1, 0, 1)
+    );
+
+    let b = site.build(cas::DEFAULT_BLOCK, false);
+    assert_eq!(b.tree, p.tree, "plan 的树必须等于真 commit 的树");
+    assert_eq!(
+        b.changes.sample, p.changes.sample,
+        "status 列出的路径必须与随后提交的一致"
+    );
+}
+
+/// 列表有界、计数全量，且样本给的是**能直接喂给 `restore` 的完整路径**。
+#[test]
+fn change_sample_lists_full_paths_and_stops_at_the_cap() {
+    let site = Site::new();
+    for i in 0..40 {
+        write(&site.proj().join(format!("dir{i}/f.txt")), b"x");
+    }
+    site.commit(cas::DEFAULT_BLOCK, false);
+    for i in 0..40 {
+        fs::remove_file(site.proj().join(format!("dir{i}/f.txt"))).unwrap();
+    }
+    // 40 / 80 行 = 50% ⇒ 触发 FR-10，这一条要签字（空掉的目录本身没被删，不算删除）。
+    let built = site.commit(cas::DEFAULT_BLOCK, true);
+    let cs = &built.changes;
+    assert_eq!(cs.delete, 40);
+    assert_eq!(cs.sample.len(), build::SAMPLE_MAX, "列表必须有界");
+    assert_eq!(cs.sample_more, 40 - build::SAMPLE_MAX);
+    assert!(
+        cs.sample
+            .iter()
+            .all(|c| c.what == build::ChangeKind::Delete),
+        "样本里混进了别的类型：{:?}",
+        cs.sample[0]
+    );
+    assert!(
+        cs.sample.iter().all(|c| c.path.ends_with("/f.txt")),
+        "路径得是完整的（{:?}），只给文件名的话 restore 不知道该恢复哪个",
+        cs.sample[0].path
+    );
+}
+
+/// `diff --at <旧版本>` 走的是同一个 `diff`，但比较对象是任意两棵树。
+/// 顺序也钉一下：样本按目录内名字升序，输出才可比对。
+#[test]
+fn diff_against_an_older_commit_lists_paths_in_order() {
+    let site = Site::new();
+    write(&site.proj().join("a.txt"), b"v1");
+    let v1 = site.commit(cas::DEFAULT_BLOCK, false).commit.unwrap();
+    write(&site.proj().join("a.txt"), b"v2-longer");
+    write(&site.proj().join("b.txt"), b"new");
+    let v2 = site.commit(cas::DEFAULT_BLOCK, false).commit.unwrap();
+
+    let t1 = object::read_commit(&*site.db, site.pid, &v1).unwrap().tree;
+    let t2 = object::read_commit(&*site.db, site.pid, &v2).unwrap().tree;
+    let cs = build::diff(
+        &*site.db,
+        site.pid,
+        Some(&t1),
+        &t2,
+        &build::TreeStore::default(),
+    )
+    .unwrap();
+    assert_eq!((cs.add, cs.modify, cs.delete), (1, 1, 0));
+    let got: Vec<(String, String)> = cs
+        .sample
+        .iter()
+        .map(|c| (c.what.sign().to_string(), c.path.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("~".to_string(), "a.txt".to_string()),
+            ("+".to_string(), "b.txt".to_string())
+        ]
+    );
+}

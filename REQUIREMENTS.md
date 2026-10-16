@@ -497,6 +497,34 @@ NFR-1 / FR-3 / §9.6.1 / §10.1(f) 四处的"峰值 ≤ 4 MB"统一改为"≤ 8 
 **M0 剩余**：`status` / `diff` / `ls-files` / `mv` / `checkout`（目录级恢复）/ `config`，
 以及把 `MAX_ENTRIES` 换成流式栈式聚合。Windows 的 `mode` 恒 0 那条缺口仍在（见补记三第 2 条）。
 
+### v0.4 补记五（2026-10-16 深夜，`status` / `diff` 落地 = 只读路径与写路径正式分家）
+
+**`build::plan()`：只读地算出"现在 commit 会长什么样、与 HEAD 差在哪"，一个字节都不写。**
+`status` 与 `diff --at <rev>` 都走它。实测（2005 条目的站点）：跑 `status` + 两次 `diff`，
+引擎 `rows` **12027 → 12027，差 0**。这条数字是"只读"承诺的唯一证据，长跑期间要复测。
+
+**组装阶段用 `Sink` trait 分两种落盘策略**（`PlanSink` 只算 hash / `WriteSink` 真落块+写对象），
+而不是给 `assemble` 加一个 `write: bool`：布尔参数会一路传到调用链上，谁传反了就静默产出半成品。
+更重要的是**树组装逻辑只留一份**——顶层目录静默丢失那个 bug 就住在这段里，
+给 `plan` 复制一份等于再埋一个同根因的坑，而且第二份没人会去测（用例
+`plan_writes_nothing_and_matches_the_commit_that_follows` 直接断言两次的根 tree 与样本全等）。
+
+**`plan` 第一版踩的坑值得记下来**：它算 hash 但不写 tree，于是 `diff` 递归时要读新树的
+某一层 ⇒ `MissingObject{tree}`。**"只读路径复用写路径的产物"这件事是双向的**：`history.rs`
+的模块头说不许让读依赖写，这里撞到的是另一半——读路径自己产出的中间结果也不能假装在库里。
+解法是 `TreeStore`：`PlanSink` 边算边把清单留在内存（`build` 留空，因为它已经写进库了），
+`diff` 先查内存再查库。存进去的清单**排序后再放**，与 `read_tree` 的形状一致，
+免得 diff 因为顺序差异在两条路上给出不同答案。
+
+**变更样本：计数全量，列表有界**（`SAMPLE_MAX = 30`，超出只报 `sample_more`）。
+样本给的是**完整路径**（`data/sub/deep.txt`），因为 `status` 列出来的东西下一步就要喂给
+`restore`；只给文件名的话用户不知道该恢复哪个。实测 `diff --at <首个 commit>` 正确给出
+`+1 ~1 -5` 并列出三层深的完整路径。
+
+**顺带**：`ChangeSet` 现在带 `sample`/`sample_more`，`build::diff` 转为 `pub`（任意两棵树可比）。
+M0 剩余：`ls-files` / `mv` / `checkout`（目录级恢复）/ `config` / `restore` 的 `--at HEAD~n` 语法，
+以及把 `MAX_ENTRIES` 换成流式栈式聚合。Windows `mode` 恒 0 那条仍在。
+
 ### v0.3 → v0.4（2026-10-15，同日）
 
 依据用户指令："我不想用 rusqlite、libsqlite3-sys 这两个，我想用 `D:\develop\workspace\rust_workspace\storage-engines` 这个发出的 crate"。

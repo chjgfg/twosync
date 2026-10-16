@@ -455,3 +455,79 @@ fn kind_word(k: Kind) -> &'static str {
         Kind::Symlink => "符号链接",
     }
 }
+
+/// `status`：工作树（按最后一次扫描）与 HEAD 的差。**走 `build::plan`，不落任何盘**。
+pub fn status(cli: &Cli) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let p = build::plan(&*db, pid)?;
+
+    println!("project   = {name}  (id={pid:#010x})");
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    println!(
+        "head      = {}",
+        if heads.is_empty() {
+            "（还没有 commit）".to_string()
+        } else {
+            heads.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+        }
+    );
+    match p.epoch {
+        0 => println!("最后扫描  = 从来没有扫过：先 twosync scan"),
+        e => println!(
+            "最后扫描  = {}  ({}/{} 条被看见)",
+            history::fmt_ts(e),
+            p.entries,
+            p.known
+        ),
+    }
+    print_changes(&p.changes);
+    println!("注意：比的是「最后一次扫描」与 HEAD；扫描之后又改的文件不在这里，先 scan。");
+    Ok(())
+}
+
+/// `diff --at REV`：同一份变更表，只是比较对象换成任意一个版本。
+pub fn diff(cli: &Cli, at: &str) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
+    let want = object::read_commit(&*db, pid, &commit)?;
+    let p = build::plan(&*db, pid)?;
+    let c = build::diff(&*db, pid, Some(&want.tree), &p.tree, &p.trees)?;
+
+    println!("project   = {name}  (id={pid:#010x})");
+    println!(
+        "对比      = 工作树(按最后扫描) vs {}  ({at})",
+        keys::short(&commit)
+    );
+    print_changes(&c);
+    Ok(())
+}
+
+/// `status` 与 `diff` 共用。路径只列 `SAMPLE_MAX` 条：**计数是全的，列表是有界的**。
+fn print_changes(c: &build::ChangeSet) {
+    if c.is_empty() {
+        println!("变更      = 无");
+        return;
+    }
+    println!(
+        "变更      = +{} ~{} -{}   入 {:.1} KiB / 删 {:.1} KiB",
+        c.add,
+        c.modify,
+        c.delete,
+        c.bytes as f64 / 1024.0,
+        c.deleted_bytes as f64 / 1024.0
+    );
+    for ch in &c.sample {
+        println!("  {} {:>10} B  {}", ch.what.sign(), ch.size, ch.path);
+    }
+    if c.sample_more > 0 {
+        println!(
+            "  …另有 {} 条未列出（列表上限 {}）",
+            c.sample_more,
+            build::SAMPLE_MAX
+        );
+    }
+}
