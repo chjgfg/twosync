@@ -20,6 +20,10 @@ pub enum Error {
     WriteConflict(String),
     #[error("编码/解码失败：{0}")]
     Codec(String),
+    /// 对象在库里找不到。与 `CorruptBlock` 是**两件事**：缺失可以合法（还没同步到），
+    /// 损坏永远不合法。混为一谈就会把磁盘损坏当成一次普通的重传。
+    #[error("{kind} 对象缺失：{hash}")]
+    MissingObject { hash: String, kind: String },
     /// CAS 的字节与其 hash 对不上 = **磁盘损坏**，不是"块缺失"。§9.4.7：损坏必须报错，
     /// 不许静默重传——那会把数据损坏伪装成一次普通同步。
     #[error("块校验失败 {hash} @ {path}: {why}")]

@@ -6,6 +6,56 @@
 //! 3. **变长段必须放在键尾**（path / ref_name），否则前缀扫会串。变长段后面还要再接定长段时，
 //!    中间必须插 `0x00` 分隔符——见 [`head_key`]。
 
+use serde::{Deserialize, Serialize};
+
+/// 我们写进引擎的每个 value 都以这个字节开头。
+///
+/// **为什么必须有**：引擎的 `set` 把 value 当"已打 TTL 信封"的逻辑值处理，首字节 `0x00`
+/// 会被当"永久"标签吃掉 1 字节、`0x01` 会被当 TTL 吃掉 9 字节（README 已知局限第 7 条，
+/// 本仓库 `tests/engine_envelope.rs` 有实测）。而 postcard 编码的 `WtEntry`/`Vec<TreeEntry>`
+/// 首字节常常就是枚举变体号（`Kind::File = 0`），也就是说这个坑对我们是**默认命中**的。
+///
+/// 更麻烦的是引擎的 `set` 与 `batch_set` 在这个问题上行为不一致（实测：同一个裸字节，
+/// `set` 少 1 字节、`batch_set` 完好）。所以对策不能是"统一走 batch_set"——那等于把
+/// 正确性押在引擎的偶然行为上。前置标签让这个不变量**归我们所有**。
+///
+/// 顺带它也是格式版本位：将来换编码只需新增 `VALUE_TAG_V2`，读侧按首字节分流。
+pub const VALUE_TAG: u8 = b'T'; // 0x54：既不是 0x00 也不是 0x01
+
+/// 打包：加标签前缀。写引擎前最后一步。
+pub fn wrap(bytes: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.push(VALUE_TAG);
+    out.extend_from_slice(&bytes);
+    out
+}
+
+/// 拆包：零拷贝去掉标签。首字节不对就是数据损坏或格式不认，**不许猜**。
+pub fn strip(raw: &[u8]) -> Result<&[u8], crate::error::Error> {
+    // `Some(&VALUE_TAG)` 而不是 `Some((VALUE_TAG, _))`：const 模式不享受 match 默认绑定
+    // 模式，直接写在 `&u8` 的位置上会类型不匹配。
+    match raw.first() {
+        Some(&VALUE_TAG) => Ok(&raw[1..]),
+        Some(&other) => Err(crate::error::Error::Codec(format!(
+            "value 标签不认识：0x{other:02x}（期望 0x{VALUE_TAG:02x}）——格式版本或磁盘内容有问题"
+        ))),
+        None => Err(crate::error::Error::Codec(
+            "value 是空的，连标签都没有".to_string(),
+        )),
+    }
+}
+
+/// 条目类型。**工作树记录与对象清单共用这一个枚举**：两边各写一份的话，W→tree 的转换
+/// 就要手写映射，而映射表是最容易漂的地方（`copy_out` 那个 hasher bug 是同一类错误）。
+///
+/// 变体顺序是磁盘格式的一部分：`File=0 / Dir=1 / Symlink=2`，改动会让已存的 `W` 记录错位。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    File,
+    Dir,
+    Symlink,
+}
+
 /// blake3 摘要，**落盘用满 32 B**（§12：20 B 截断只许出现在线上传输与比对提示）。
 pub type Hash = [u8; 32];
 pub type ProjectId = u32;

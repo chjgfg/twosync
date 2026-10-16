@@ -43,12 +43,9 @@ const HASH_BUF: usize = 1 << 20;
 /// 重算样本的上限：够诊断用，又不至于让 `scan` 的记忆变成 O(文件数)。
 const SAMPLE_MAX: usize = 10;
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    File,
-    Dir,
-    Symlink,
-}
+/// 条目类型统一住在 `keys`（对象层要用同一个枚举）。这里再导出一次是为了让
+/// `worktree::Kind` 这个既有路径继续可用，同时保证只有一份定义。
+pub use crate::store::keys::Kind;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WtEntry {
@@ -143,7 +140,8 @@ pub fn scan(
             symlink_target,
             scanned_at: now,
         };
-        let encoded = postcard::to_allocvec(&value).map_err(|e| Error::Codec(e.to_string()))?;
+        let encoded =
+            keys::wrap(postcard::to_allocvec(&value).map_err(|e| Error::Codec(e.to_string()))?);
         pending.push((key, encoded));
 
         if pending.len() >= batch {
@@ -235,7 +233,9 @@ fn unchanged(
     mtime_ns: i64,
 ) -> Option<WtEntry> {
     let raw = tx.get(key)?;
-    let prev: WtEntry = postcard::from_bytes(&raw).ok()?;
+    let prev: WtEntry = keys::strip(&raw)
+        .ok()
+        .and_then(|b| postcard::from_bytes(b).ok())?;
     (prev.kind == kind && prev.size == len && prev.mtime_ns == mtime_ns).then_some(prev)
 }
 

@@ -2,4 +2,5 @@
 
 pub mod cas;
 pub mod keys;
+pub mod object;
 pub mod worktree;
