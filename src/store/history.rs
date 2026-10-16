@@ -14,7 +14,7 @@
 //! 有 `--max-count`，而"0 = 全部"必须写成显式选项而不是默认（十万历史 × 32 B 也要 3 MB）。
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 
 use storage_engines::{KvEngine, SearchQuery};
 
@@ -92,7 +92,46 @@ fn read_node(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Node> {
     })
 }
 
-/// 按路径走到某个条目。`path` 用 `/` 分隔；空串 = 根目录本身。
+/// 一份"树从哪儿读"：内存里那份（`plan` 算出来、**还没落盘**），或者库里的。
+///
+/// 为什么住在读层而不是写层：`TreeStore` 说的是"我要看一棵树"，产出它的可以是 `plan`
+/// （内存）也可以是 `commit`（库）。放这儿，写层来借；反过来就成了"读依赖写"，
+/// 而本模块开头明令禁止那件事。
+#[derive(Debug, Default, Clone)]
+pub struct TreeStore(BTreeMap<Hash, Vec<object::TreeEntry>>);
+
+impl TreeStore {
+    /// 取一份目录清单：内存里有就用内存的，否则读库。
+    pub fn entries(
+        &self,
+        db: &dyn KvEngine,
+        pid: ProjectId,
+        hash: &Hash,
+    ) -> Result<Vec<object::TreeEntry>> {
+        if let Some(entries) = self.0.get(hash) {
+            return Ok(entries.clone());
+        }
+        object::read_tree(db, pid, hash) // 空树在那里有特判，不查表也读得出来
+    }
+
+    /// `plan` 边算边往里放。同 hash 必然同内容（内容寻址），先到先得。
+    pub(crate) fn remember(&mut self, hash: Hash, entries: Vec<object::TreeEntry>) {
+        self.0.entry(hash).or_insert(entries);
+    }
+}
+
+/// 按路径走到某个条目。见 [`resolve_in`]——这一条只是"树都在库里"那个常见情形。
+pub fn resolve(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Hash,
+    path: &str,
+) -> Result<Option<object::TreeEntry>> {
+    resolve_in(db, pid, &TreeStore::default(), root, path)
+}
+
+/// 同一件事，但树可以先查内存：`checkout` 要在工作树那一侧走子树，而那棵树是 `plan`
+/// 算出来的、从来没进过库。**逐层走的逻辑只有一份**，两边共用。
 ///
 /// 返回 `None` 表示"这个版本里没有这条路径"，**中间层不是目录也算 `None`**：git 就是
 /// 这么报的（`path 'a.txt/b' does not exist in HEAD`），为一种输入错误再开一种错误类型
@@ -100,10 +139,11 @@ fn read_node(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Node> {
 /// / `CorruptBlock`，不会被这一条吞掉。
 ///
 /// `..` 不需要特判：清单里不可能有这个名字（扫描器从不产出），所以它自然就是"不存在"。
-/// 但**从历史里取出的路径拼成磁盘路径时必须在调用方再校验一次**（`restore` 的活）。
-pub fn resolve(
+/// 但**从历史里取出的路径拼成磁盘路径时必须在调用方再校验一次**（`restore`/`checkout` 的活）。
+pub fn resolve_in(
     db: &dyn KvEngine,
     pid: ProjectId,
+    trees: &TreeStore,
     root: &Hash,
     path: &str,
 ) -> Result<Option<object::TreeEntry>> {
@@ -115,7 +155,7 @@ pub fn resolve(
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
     for (depth, name) in parts.iter().enumerate() {
-        let entries = object::read_tree(db, pid, &cur)?;
+        let entries = trees.entries(db, pid, &cur)?;
         let Some(e) = entries.into_iter().find(|e| e.name == *name) else {
             return Ok(None);
         };
@@ -136,6 +176,50 @@ pub fn resolve(
     }))
 }
 
+/// [`walk_tree`] 与 [`descend`] 的回调：拿到（完整路径, 条目）。
+pub type TreeVisit<'a> = dyn FnMut(&str, &object::TreeEntry) -> Result<()> + 'a;
+
+/// 深度优先列出一棵树的全部路径，**边遍历边回调**：`ls-files` 面对一百万个文件时
+/// 也不许先把它们装进一个 `Vec`（§9.6.1）。
+///
+/// 这里用递归而不是显式栈：显式栈要拿到**字典序前序**就得连未读的兄弟一起压进去，
+/// 内存反而回到 O(条目数)；递归的栈深 = 路径层数，而层数被 `PATH_MAX` 钉在几百以内。
+pub fn walk_tree(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Hash,
+    visit: &mut TreeVisit<'_>,
+) -> Result<()> {
+    // 空树在这里有特判（`read_tree`），所以根是空的也能正常走完。
+    for e in object::read_tree(db, pid, root)? {
+        visit(&e.name, &e)?;
+        if e.kind == Kind::Dir {
+            descend(db, pid, &e, "", visit)?;
+        }
+    }
+    Ok(())
+}
+
+fn descend(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    dir: &object::TreeEntry,
+    prefix: &str,
+    visit: &mut TreeVisit<'_>,
+) -> Result<()> {
+    let path = if prefix.is_empty() {
+        dir.name.clone()
+    } else {
+        format!("{prefix}/{}", dir.name)
+    };
+    for e in object::read_tree(db, pid, &dir.hash)? {
+        visit(&format!("{path}/{}", e.name), &e)?;
+        if e.kind == Kind::Dir {
+            descend(db, pid, &e, &path, visit)?;
+        }
+    }
+    Ok(())
+}
 /// 把用户写的 rev 解析成 commit 集合：`HEAD`/ref 名 → 该 ref 的 head 集合；
 /// 否则按 **commit hash 的十六进制前缀**查（长度须为偶数，不唯一就报错）。
 pub fn resolve_rev(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<Hash>> {

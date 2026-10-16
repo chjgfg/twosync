@@ -15,7 +15,7 @@ use crate::cli::cmd::ProjectCmd;
 use crate::cli::registry::Registry;
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
-use crate::store::{build, cas, history, object, restore, worktree};
+use crate::store::{build, cas, checkout, history, object, restore, worktree};
 use crate::utils::{
     db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
 };
@@ -445,6 +445,113 @@ pub fn restore(cli: &Cli, at: &str, path: &str, to: Option<&Path>, force: bool) 
             "目标不存在，不需要门"
         }
     );
+    Ok(())
+}
+
+/// `ls-files`：列一个版本里的路径。**流式打印，不物化**（一百万个文件也不先装进 Vec）。
+///
+/// 与 git 的差别：这里连目录一起列。目录在本项目里是真条目（它带 mode，也可能是空的），
+/// 藏起来就会让"这个版本里到底有什么"少一层。
+pub fn ls_files(cli: &Cli, at: &str, prefix: Option<&str>) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
+    let c = object::read_commit(&*db, pid, &commit)?;
+
+    let root = match prefix {
+        None => c.tree,
+        Some(p) => {
+            let clean = p.trim_matches('/');
+            let e =
+                history::resolve(&*db, pid, &c.tree, clean)?.ok_or_else(|| Error::NoSuchPath {
+                    rev: at.to_string(),
+                    path: p.to_string(),
+                })?;
+            if e.kind != Kind::Dir {
+                return Err(Error::NotYet {
+                    what: format!("--prefix {p} 指向的不是目录"),
+                    milestone: "看单个文件用 `show <rev> <path>`",
+                });
+            }
+            e.hash
+        }
+    };
+    let mut n = 0usize;
+    history::walk_tree(&*db, pid, &root, &mut |path, e| {
+        n += 1;
+        println!("{:>10} B  {}  {}", e.size, keys::short(&e.hash), path);
+        Ok(())
+    })?;
+    println!(
+        "共 {n} 条  (project={name} rev={} prefix={})",
+        keys::short(&commit),
+        prefix.unwrap_or(".")
+    );
+    Ok(())
+}
+
+/// `checkout`：把一个版本落到工作树。默认**只报不动手**。
+pub fn checkout(
+    cli: &Cli,
+    at: &str,
+    prefix: Option<&str>,
+    apply: bool,
+    allow_mass_delete: bool,
+) -> Result<()> {
+    let (name, root) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
+
+    let started = Instant::now();
+    let r = checkout::checkout(
+        &*db,
+        pid,
+        &store,
+        &root,
+        &commit,
+        prefix,
+        checkout::Opts {
+            apply,
+            allow_mass_delete,
+        },
+    )?;
+
+    println!("project   = {name}  (id={pid:#010x})");
+    println!("目标      = {}  ({at})", keys::hex(&commit));
+    println!("工作树    = {}", root.display());
+    if r.is_noop() {
+        println!("动作      = 无（工作树已经是这个样子）");
+        return Ok(());
+    }
+    println!(
+        "动作      = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}",
+        r.create, r.mkdir, r.overwrite, r.delete, r.rmdir, r.skipped
+    );
+    if r.dirty > 0 {
+        println!(
+            "提醒      = 工作树相对 HEAD 另有 {n} 处未提交改动（`status` 能列出来）。这次只碰上面列出的路径，其余原样留下。",
+            n = r.dirty
+        );
+    }
+    for line in &r.sample {
+        println!("  {line}");
+    }
+    if r.sample_more > 0 {
+        println!(
+            "  …另有 {} 条未列出（列表上限 {}）",
+            r.sample_more,
+            build::SAMPLE_MAX
+        );
+    }
+    if r.applied {
+        println!("已执行。工作树变了而 `W` 还是旧的 ⇒ 下一步 `scan`，再看 `status`。");
+    } else {
+        println!("没有动任何东西：加 --apply 才真做。");
+    }
+    println!("elapsed   = {:.3} s", started.elapsed().as_secs_f64());
     Ok(())
 }
 

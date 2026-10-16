@@ -13,6 +13,7 @@
 //! GC 那轮再补——GC 看不到"本该 +1 却没 +1"的差额。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::format;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
@@ -21,6 +22,7 @@ use storage_engines::KvEngine;
 use storage_engines::SearchQuery;
 
 use crate::error::{Error, Result};
+use crate::store::history::TreeStore;
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::worktree::WtEntry;
 use crate::store::{cas, object};
@@ -240,7 +242,12 @@ pub fn build(
     if built.changes.is_empty() {
         return Ok(built); // 不产生空提交：碎 commit 会把引擎版本链白白撑大（§9.6.2）
     }
-    check_mass_delete(&built.changes, snap.known, meta.allow_mass_delete)?;
+    check_mass_delete(
+        built.changes.delete,
+        built.changes.deleted_bytes,
+        snap.known,
+        meta.allow_mass_delete,
+    )?;
 
     let c = object::Commit {
         parents: prev_heads.clone(),
@@ -260,28 +267,6 @@ pub fn build(
     set_ref(db, pid, MAIN, &[commit])?;
     built.commit = Some(commit);
     Ok(built)
-}
-
-/// 树从哪儿读：库里的（`build` 之后都在），还是 `plan` 刚算出来、**还没落盘**的那份内存。
-///
-/// 为什么非要有这个东西：`plan` 的承诺是"一个字节都不写"，可 `diff` 要递归进新树的每一层
-/// 才能报出具体路径。只把根 hash 交给 diff，它就会去库里找一个不存在的新树 ⇒ `MissingObject`。
-/// 所以 `PlanSink` 边算边把清单留在这儿，`WriteSink` 留空（已经写进库了，再留一份是白占内存）。
-#[derive(Debug, Default, Clone)]
-pub struct TreeStore(BTreeMap<Hash, Vec<object::TreeEntry>>);
-
-impl TreeStore {
-    fn read(
-        &self,
-        db: &dyn KvEngine,
-        pid: ProjectId,
-        hash: &Hash,
-    ) -> Result<Vec<object::TreeEntry>> {
-        if let Some(entries) = self.0.get(hash) {
-            return Ok(entries.clone());
-        }
-        object::read_tree(db, pid, hash) // 空树在这里有特判，不查表也读得出来
-    }
 }
 
 /// 组装阶段"要不要落盘"的两个决策点。
@@ -336,7 +321,7 @@ impl Sink for PlanSink {
         let mut sorted = entries.to_vec();
         sorted.sort();
         let hash = object::tree_hash(&sorted);
-        self.trees.0.entry(hash).or_insert(sorted);
+        self.trees.remember(hash, sorted);
         Ok(hash)
     }
 }
@@ -479,20 +464,21 @@ pub fn snapshot(db: &dyn KvEngine, pid: ProjectId, max: usize) -> Result<Snapsho
 /// 而它同时也是写进 `commit.stats` 的那个数。前面已经落盘的块与目录对象不会被任何 commit
 /// 引用，§9.3 的 GC 会回收，所以在这里拒绝依然是安全的。
 /// 两侧都要过这道闸（§16.3）：它防的是"客户端 bug 把误 `rm -rf` 变成合法历史"，跟谁发起无关。
-pub fn check_mass_delete(cs: &ChangeSet, known: u32, allow: bool) -> Result<()> {
-    if allow || cs.delete == 0 || known == 0 {
+///
+/// 收的是两个数而不是 `&ChangeSet`：`checkout` 也要用同一道闸，而它手里没有 ChangeSet。
+/// **两个调用方共用一个阈值函数**，否则"20% 且不少于 20 条"这个口径会在第二处漂掉。
+pub fn check_mass_delete(deleted: u32, deleted_bytes: u64, known: u32, allow: bool) -> Result<()> {
+    if allow || deleted == 0 || known == 0 {
         return Ok(());
     }
     // 比例与绝对值**取大**：纯 20% 在小项目上不可用——删 2 个文件里的 1 个就是 50%，
-    // 那个仓库从此再也提不了交。熔断防的是"误 rm -rf"，那是规模问题不是比例问题。
+    // 那个仓库从此再也提不了交。熔断要拦的是规模，不是比例。
     let threshold = ((known as f64 * MASS_DELETE_RATIO) as u32).max(MASS_DELETE_MIN);
-    let too_many = cs.delete > threshold;
-    let too_big = cs.deleted_bytes > MASS_DELETE_BYTES;
-    if too_many || too_big {
+    if deleted > threshold || deleted_bytes > MASS_DELETE_BYTES {
         return Err(Error::MassDelete {
-            deleted: cs.delete,
+            deleted,
             known,
-            deleted_bytes: cs.deleted_bytes,
+            deleted_bytes,
         });
     }
     Ok(())
@@ -626,6 +612,74 @@ fn bump_block(db: &dyn KvEngine, pid: ProjectId, hash: Hash, size: u32) -> Resul
     Ok(())
 }
 
+/// 配对遍历的回调类型。收成别名有两个理由：三处签名要重复它，而且 clippy 说得对——
+/// 这个函数指针类型已经难读到"看不出参数顺序"了，而顺序错一个是静默的语义错误。
+///
+/// 生命周期标在 `+ 'a` 而**不是**标在参数上：参数里那些引用每次调用都换一批，那需要
+/// `for<'b>`（写成省略形式就是编译器自己给的高阶约束）；`'a` 管的是闭包本身能活多久。
+/// 反过来写（`&'a str` 挂在参数上）会把闭包逼成 `'static`，借用局部计数器直接编译不过。
+pub type Visit<'a> = dyn FnMut(ChangeKind, &str, Option<&object::TreeEntry>, Option<&object::TreeEntry>) -> Result<()>
+    + 'a;
+
+/// 两棵树的**配对遍历**：全站只有这一份。
+///
+/// 为什么不各写一份：`diff`（只数数）和 `checkout`（要真落地）问的是同一个问题——这一层里
+/// 谁多了、谁少了、谁变了、哪些子树可以整块跳过。分两处写，"跳过未变子树"这类判断就会
+/// 在两处各错一次，而 `checkout` 错的那一次是**删文件**。
+///
+/// 回调里 `old`/`new` 谁是 `None` 由 `kind` 决定：`Add` 没有 old，`Delete` 没有 new。
+/// 目录的 `Add`/`Delete` 先回调目录本身、再带着空的一侧递归进去，所以整棵子树的每个后代
+/// 都会被记一次——与 `ChangeSet` 的计数口径一致。
+///
+/// `prefix` 是为了回调能拿到**可直接喂给 `restore`/`checkout` 的完整路径**。
+pub fn walk_pair(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    trees: &TreeStore,
+    prefix: &str,
+    old: &[object::TreeEntry],
+    new: &[object::TreeEntry],
+    visit: &mut Visit<'_>,
+) -> Result<()> {
+    let o: BTreeMap<&str, &object::TreeEntry> = old.iter().map(|e| (e.name.as_str(), e)).collect();
+    let n: BTreeMap<&str, &object::TreeEntry> = new.iter().map(|e| (e.name.as_str(), e)).collect();
+
+    for (name, ne) in &n {
+        let full = join(prefix, name);
+        let Some(oe) = o.get(*name) else {
+            visit(ChangeKind::Add, &full, None, Some(ne))?;
+            if ne.kind == Kind::Dir {
+                let kids = trees.entries(db, pid, &ne.hash)?;
+                walk_pair(db, pid, trees, &full, &[], &kids, visit)?;
+            }
+            continue;
+        };
+        if oe.hash == ne.hash && oe.mode == ne.mode {
+            continue; // 子树 hash 相同 ⇒ 整块跳过，一个条目都不读（NFR-6）
+        }
+        if oe.kind == Kind::Dir && ne.kind == Kind::Dir {
+            let kids_old = object::read_tree(db, pid, &oe.hash)?;
+            let kids_new = trees.entries(db, pid, &ne.hash)?;
+            walk_pair(db, pid, trees, &full, &kids_old, &kids_new, visit)?;
+        } else {
+            visit(ChangeKind::Modify, &full, Some(oe), Some(ne))?;
+        }
+    }
+    // 判删除只能问"这个名字还在不在新清单里"，不能问"刚才有没有被我碰过"：
+    // 未变更的条目上一轮就 continue 了，拿那条线筛会把好文件报成删除。
+    for oe in o.values().filter(|e| !n.contains_key(&e.name.as_str())) {
+        let full = join(prefix, &oe.name);
+        // **先递归再回调自己**（后序）：`checkout` 要在同一趟流式遍历里 `remove_dir`，
+        // 而目录只有空了才删得掉。计数不受顺序影响，所以 `diff` 那边没有代价。
+        if oe.kind == Kind::Dir {
+            let kids = object::read_tree(db, pid, &oe.hash)?;
+            walk_pair(db, pid, trees, &full, &kids, &[], visit)?;
+        }
+        visit(ChangeKind::Delete, &full, Some(oe), None)?;
+    }
+    Ok(())
+}
+
 /// 递归比对两棵树。**子树 hash 相同就整块跳过**——这就是 NFR-6 的 O(变更目录数)。
 ///
 /// `pub` 是给 `diff --at <rev>` 用的：那条要拿任意两个版本比，不只是跟 HEAD 比。
@@ -644,63 +698,25 @@ pub fn diff(
         Some(h) => object::read_tree(db, pid, h)?,
         None => Vec::new(),
     };
-    let new_list = new_trees.read(db, pid, new)?;
-    walk_dir(db, pid, "", new_trees, &old_list, &new_list, &mut out)?;
-    Ok(out)
-}
-
-/// 同一目录名下一棵子树的全部差异。删除 = 在 `old` 里而**不在** `new` 里的那些名字。
-///
-/// `prefix` 是为了样本里能给出**可直接喂给 `restore` 的完整路径**——只给文件名的话，
-/// 用户看到 `guide.md` 不知道该从哪儿恢复。
-fn walk_dir(
-    db: &dyn KvEngine,
-    pid: ProjectId,
-    prefix: &str,
-    new_trees: &TreeStore,
-    old: &[object::TreeEntry],
-    new: &[object::TreeEntry],
-    out: &mut ChangeSet,
-) -> Result<()> {
-    let o: BTreeMap<&str, &object::TreeEntry> = old.iter().map(|e| (e.name.as_str(), e)).collect();
-    let n: BTreeMap<&str, &object::TreeEntry> = new.iter().map(|e| (e.name.as_str(), e)).collect();
-
-    for (name, ne) in &n {
-        let full = join(prefix, name);
-        let Some(oe) = o.get(*name) else {
-            out.note(ChangeKind::Add, full.clone(), ne.size);
-            if ne.kind == Kind::Dir {
-                let kids = new_trees.read(db, pid, &ne.hash)?;
-                walk_dir(db, pid, &full, new_trees, &[], &kids, out)?;
-            }
-            continue;
-        };
-        if oe.hash == ne.hash && oe.mode == ne.mode {
-            continue; // 子树 hash 相同 ⇒ 整块跳过，一个条目都不读（NFR-6）
-        }
-        if oe.kind == Kind::Dir && ne.kind == Kind::Dir {
-            let kids_old = object::read_tree(db, pid, &oe.hash)?;
-            let kids_new = new_trees.read(db, pid, &ne.hash)?;
-            walk_dir(db, pid, &full, new_trees, &kids_old, &kids_new, out)?;
-        } else {
-            out.note(ChangeKind::Modify, full, ne.size);
-        }
-    }
-    // 判删除只能问"这个名字还在不在新清单里"，不能问"刚才有没有被我改过"：
-    // 未变更的条目上一轮就 continue 了，拿那条线筛会把好文件报成删除。
-    for oe in o.values().filter(|e| !n.contains_key(&e.name.as_str())) {
-        let full = join(prefix, &oe.name);
+    let new_list = new_trees.entries(db, pid, new)?;
+    let mut collect = |kind: ChangeKind,
+                       path: &str,
+                       oe: Option<&object::TreeEntry>,
+                       ne: Option<&object::TreeEntry>|
+     -> Result<()> {
         // 只有文件有 blob：目录的 hash 是 tree，符号链接的 hash 是目标文本的 blob。
-        if oe.kind == Kind::File {
-            out.deleted_blobs.push(oe.hash);
+        if kind == ChangeKind::Delete
+            && let Some(e) = oe
+            && e.kind == Kind::File
+        {
+            out.deleted_blobs.push(e.hash);
         }
-        out.note(ChangeKind::Delete, full.clone(), oe.size);
-        if oe.kind == Kind::Dir {
-            let kids = object::read_tree(db, pid, &oe.hash)?;
-            walk_dir(db, pid, &full, new_trees, &kids, &[], out)?;
-        }
-    }
-    Ok(())
+        let size = ne.or(oe).map_or(0, |e| e.size);
+        out.note(kind, path.to_string(), size);
+        Ok(())
+    };
+    walk_pair(db, pid, new_trees, "", &old_list, &new_list, &mut collect)?;
+    Ok(out)
 }
 
 fn ensure_dir(

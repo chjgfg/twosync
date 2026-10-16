@@ -525,6 +525,47 @@ NFR-1 / FR-3 / §9.6.1 / §10.1(f) 四处的"峰值 ≤ 4 MB"统一改为"≤ 8 
 M0 剩余：`ls-files` / `mv` / `checkout`（目录级恢复）/ `config` / `restore` 的 `--at HEAD~n` 语法，
 以及把 `MAX_ENTRIES` 换成流式栈式聚合。Windows `mode` 恒 0 那条仍在。
 
+### v0.4 补记六（2026-10-17 凌晨，`ls-files` / `checkout` 落地）
+
+**`ls-files`**：`history::walk_tree` 深度优先、**边遍历边回调**，一百万个文件也不会先装进
+`Vec`（§9.6.1）。这里刻意用递归而不是显式栈：要拿到字典序前序，显式栈得把未读的兄弟一起压进去，
+内存反而回到 O(条目数)；而递归深度被 `PATH_MAX` 钉在几百以内。目录也占一条（空目录只有靠它表达）。
+
+**`checkout`**：两趟遍历，第一趟只记账并过 FR-10 熔断，第二趟才落地。分类逻辑**只有一份**
+（`Job::on`）——早先"只数"和"真干"是两个函数，`skipped` 的判定条件写了两遍，那是下一个静默
+偏差的产地。落地动作全部复用 `restore` 的那套（`check_local_is_recoverable` / `link_target` /
+`make_symlink` / `apply_owner_exec`），**不给 checkout 另写一份 §7.3 检查**。
+`--prefix` 只接受目录：单文件是 `restore` 的活，两条命令的边界不许糊。
+
+**本轮最重要的判断修正：把"脏工作树前置闸"拿掉。** 第一版照 git 的样子写"工作树相对 HEAD
+有未提交改动就拒，`--force` 才放行"，用例立刻红了两次，原因相同：**`checkout` 只改工作树、
+不动 head（v1 没有分支），所以它每执行一次就把工作树变成相对 HEAD 永久脏**——那道闸会在第一次
+apply 之后把命令彻底废掉。真正的危险从来不是"W 与 HEAD 不一致"，而是"**磁盘与 W 不一致**"
+（扫描器没见过的内容被覆盖），而那是逐路径的性质，§7.3 那道门本来就按 kind/size/mtime 逐字查。
+现在：脏不脏只在报告里**告知**（`Report.dirty`，与 `status` 同口径），不再当闸；`--force`
+这个开关随之删掉——**不留一个已经什么都不做的旗标**。
+补的一条：`Add` 落到一个**已存在**的路径上（未跟踪文件挡在那儿）也要过 §7.3，否则
+`read_blob` 的 `rename` 就是一次静默删除。
+
+**结构收敛**：`walk_pair` 成为两棵树配对遍历的唯一一份（`diff` 与 `checkout` 共用），删除目录
+改成**后序**回调，这样 `checkout` 能在同一趟流式遍历里 `remove_dir`（不用另存一份待删目录列表，
+那会是 O(目录数) 内存）。`TreeStore` 从 `build` 移到 `history`——它表达的是"我要看一棵树"，
+放读层让写层来借；放写层就成了"读依赖写"，正是 `history` 模块头禁止的方向。
+
+**一个 Rust 坑值得记**：回调类型别名 `type Visit<'a> = dyn FnMut(&'a str, ...) -> Result<()>`
+把生命周期标在**参数**上，会逼闭包成为 `'static`，借用局部计数器直接编译不过；标在
+`+ 'a` 上、参数写省略形式（编译器给 `for<'b>` 高阶约束）才是对的。
+
+**实测（release，Windows）**：`ls-files` 3 条含目录本身；`checkout` 只报 = 建 1 / 覆盖 1 / 删 1，
+耗时 0.000 s 且引擎 `rows` 一字不增；`--apply` 0.007 s 后 `a.txt` 回到 v1、`c.txt` 消失、
+`head` 仍在 v2；紧接着第二次 `checkout` 同一版本报"无"（旧那道脏闸就是在这儿把命令卡死的）；
+未跟踪文件 `d/keepme.txt` 在整趟操作后原样还在。
+
+**已知不做**：类型互换（文件 ↔ 目录）记 `skipped` 并原样保留；目录 mode 变化不落地
+（Windows 侧 mode 恒 0，见补记三第 2 条）。M0 剩余：`mv` / `config` / `--at HEAD~n` 相对写法 /
+`status` 的未跟踪文件视图（需要扫描器给"见过但没记录"留痕迹），以及流式栈式聚合替换
+`MAX_ENTRIES`。
+
 ### v0.3 → v0.4（2026-10-15，同日）
 
 依据用户指令："我不想用 rusqlite、libsqlite3-sys 这两个，我想用 `D:\develop\workspace\rust_workspace\storage-engines` 这个发出的 crate"。

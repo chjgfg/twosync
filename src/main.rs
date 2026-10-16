@@ -42,5 +42,12 @@ fn dispatch(cli: &Cli) -> Result<()> {
         } => m0::restore(cli, at, path, to.as_deref(), *force),
         Cmd::Status => m0::status(cli),
         Cmd::Diff { at } => m0::diff(cli, at),
+        Cmd::LsFiles { at, prefix } => m0::ls_files(cli, at, prefix.as_deref()),
+        Cmd::Checkout {
+            at,
+            prefix,
+            apply,
+            allow_mass_delete,
+        } => m0::checkout(cli, at, prefix.as_deref(), *apply, *allow_mass_delete),
     }
 }

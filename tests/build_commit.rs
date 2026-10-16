@@ -15,6 +15,7 @@ use storage_engines::{EngineKind, KvEngine};
 use twosync::error::Error;
 use twosync::store::build::{self, BlockMeta, MAX_ENTRIES};
 use twosync::store::cas::{self, Cas};
+use twosync::store::history;
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
 use twosync::store::object;
 use twosync::store::worktree;
@@ -503,7 +504,7 @@ fn diff_against_an_older_commit_lists_paths_in_order() {
         site.pid,
         Some(&t1),
         &t2,
-        &build::TreeStore::default(),
+        &history::TreeStore::default(),
     )
     .unwrap();
     assert_eq!((cs.add, cs.modify, cs.delete), (1, 1, 0));

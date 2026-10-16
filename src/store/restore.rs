@@ -118,7 +118,15 @@ pub fn restore(
 }
 
 /// §7.3：确认工作树里**当前**这一版已经在历史里、且块都在。
-fn check_local_is_recoverable(
+///
+/// `pub` 是给 `checkout` 用的——它要覆盖/删除的每一个文件都过这同一道门。**两道门必须是
+/// 同一个函数**：`checkout` 是本项目唯一会批量删工作树文件的命令，给它另写一份检查，
+/// 就是给"哪一版算已备份"留下第二个定义。
+///
+/// `path_in_w` 是 `W` 键里那条**斜杠路径**（不是磁盘路径）：调用方手里通常只有前者，
+/// 而 `abs` 必须由 `work_root` 拼出来，不能让每个调用方各拼一次。
+#[allow(clippy::too_many_arguments)] // 六个都是"去哪、看哪一版"的坐标，收成一个结构体反而更难读
+pub fn check_local_is_recoverable(
     db: &dyn KvEngine,
     store: &cas::Cas,
     pid: ProjectId,
@@ -207,7 +215,7 @@ pub fn link_target(blob: &cas::Blob, store: &cas::Cas) -> Result<String> {
     res
 }
 
-fn make_symlink(target: &str, dest: &Path) -> Result<()> {
+pub fn make_symlink(target: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -223,7 +231,7 @@ fn make_symlink(target: &str, dest: &Path) -> Result<()> {
 }
 
 /// §8：只同步 owner 可执行位，不还原整串 mode。
-fn apply_owner_exec(dest: &Path, mode: u32) -> Result<()> {
+pub fn apply_owner_exec(dest: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -98,6 +98,35 @@ pub enum Cmd {
         #[arg(long, default_value = "HEAD")]
         at: String,
     },
+
+    /// 列出一个版本里的全部路径（流式打印，不物化）
+    LsFiles {
+        /// 列哪个版本
+        #[arg(long, default_value = "HEAD")]
+        at: String,
+        /// 只列这个目录下面的
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+
+    /// 把一个版本落到工作树。**默认只报不动手。**
+    ///
+    /// 这是唯一会批量删工作树文件的命令，所以闸的顺序固定：先只报，再过 FR-10 熔断，
+    /// 真执行时每个覆盖/删除/盖到已有路径上动作再各过一遍 §7.3。它**不动 head**（v1 没有分支）。
+    Checkout {
+        /// 落到哪个版本
+        #[arg(long, default_value = "HEAD")]
+        at: String,
+        /// 只动这一棵子树；单文件请用 `restore`
+        #[arg(long)]
+        prefix: Option<String>,
+        /// 真的执行。省略时只打印要做什么
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync

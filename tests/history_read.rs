@@ -235,3 +235,53 @@ fn rev_resolution_accepts_head_and_full_hash_but_rejects_garbage() {
         Err(Error::MissingObject { .. })
     ));
 }
+
+/// `ls-files` 的底座：前序字典序 + 完整路径 + 目录也算一条。
+#[test]
+fn walk_tree_lists_paths_in_lexicographic_preorder() {
+    let (_site, engine) = db();
+    let deep = object::put_tree(&*engine, PID, &[file("deep.txt", 9, 5)]).unwrap();
+    let top =
+        object::put_tree(&*engine, PID, &[dir("inner", deep), file("leaf.txt", 8, 4)]).unwrap();
+    let root = object::put_tree(
+        &*engine,
+        PID,
+        &[dir("b", top), file("a.txt", 1, 1), dir("z", top)],
+    )
+    .unwrap();
+
+    let mut got: Vec<String> = Vec::new();
+    history::walk_tree(&*engine, PID, &root, &mut |path, e| {
+        got.push(format!("{}:{}", e.kind as u8, path));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        got,
+        vec![
+            "0:a.txt",
+            "1:b",
+            "1:b/inner",
+            "0:b/inner/deep.txt",
+            "0:b/leaf.txt",
+            "1:z",
+            "1:z/inner",
+            "0:z/inner/deep.txt",
+            "0:z/leaf.txt",
+        ],
+        "父在子前、同级按字节序；目录自己也要占一条（空目录只有靠它才表达得出来）"
+    );
+}
+
+/// 空树也要能走完：`ls-files` 对一个空版本该给"共 0 条"而不是报错。
+#[test]
+fn walk_tree_on_an_empty_version_yields_nothing() {
+    let (_site, engine) = db();
+    let mut n = 0;
+    history::walk_tree(&*engine, PID, &object::empty_tree(), &mut |_, _| {
+        n += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(n, 0);
+}
