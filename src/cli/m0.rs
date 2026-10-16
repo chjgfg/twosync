@@ -113,8 +113,179 @@ pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
             reg.save(&cli.root)?;
             println!("当前项目 = {name}");
         }
+        ProjectCmd::Remove { name, purge } => {
+            // 先判 `--purge` 再动手：回收还不支持，不能把注册表改了才说后半截没做。
+            if *purge {
+                return Err(Error::NotYet {
+                    what: format!("project remove --purge {name}"),
+                    milestone: "回收要按跨 project 的 refcnt 走，那是 M1 的 `gc`（§9.3）",
+                });
+            }
+            let p = reg.remove(name)?;
+            reg.save(&cli.root)?;
+            let pid = keys::project_id(name);
+            let st = proj_stats(&*db_or_open(cli)?, pid)?;
+            println!("已摘掉 {name}  (id={pid:#010x} → {})", p.path);
+            println!("  工作树没动 : {}", cli.root.join(&p.path).display());
+            println!(
+                "  历史也没动 : W {} 行 / commit {} 个 / head {} 个",
+                st.wt_rows,
+                st.commit_rows,
+                st.heads.len()
+            );
+            println!("  再 `project add {name}` 会接上**同一份**历史（id 由名字派生，§16.1）");
+            if st.heads.is_empty() {
+                println!("  这个项目还没有 commit，摘掉不留任何东西");
+            } else {
+                println!("  要真回收磁盘：等 M1 的 `gc`（跨 project 的 refcnt 只有它算得清）");
+            }
+            println!("  `current` 已清空：下一条命令请先 `project use <name>`");
+        }
+        ProjectCmd::Status { name } => {
+            let db = db_or_open(cli)?;
+            match name {
+                None => {
+                    if reg.projects.is_empty() {
+                        println!("（还没有项目：twosync project add <name>）");
+                        return Ok(());
+                    }
+                    println!(
+                        "{:<4} {:<20} {:<11} {:<9} {:<21} {:>7} {:>7}",
+                        "", "project", "id", "head", "最后完整扫描", "W 行", "commit"
+                    );
+                    for n in reg.projects.keys() {
+                        print_row(&*db, &reg, n)?;
+                    }
+                }
+                Some(n) => {
+                    let p = reg
+                        .projects
+                        .get(n)
+                        .ok_or_else(|| Error::Registry(format!("没有项目 {n}")))?;
+                    let pid = keys::project_id(n);
+                    let st = proj_stats(&*db, pid)?;
+                    let work = cli.root.join(&p.path);
+                    println!("project   = {n}  (id={pid:#010x})");
+                    println!(
+                        "path      = {}  ({})",
+                        work.display(),
+                        if work.is_dir() {
+                            "在"
+                        } else {
+                            "目录不存在！"
+                        }
+                    );
+                    println!(
+                        "current   = {}",
+                        if reg.current.as_deref() == Some(n.as_str()) {
+                            "是（后续命令默认作用在它）"
+                        } else {
+                            "否"
+                        }
+                    );
+                    match st.mark {
+                        Some(m) => println!(
+                            "最后扫描  = {}  第 {} 轮，盖章 {}/{} 行",
+                            history::fmt_ts(m.epoch),
+                            m.round,
+                            m.seen,
+                            m.walked
+                        ),
+                        None => println!(
+                            "最后扫描  = 从没**完整**跑完过 ⇒ commit 认为没有任何活行，先 scan"
+                        ),
+                    }
+                    if st.heads.is_empty() {
+                        println!("head      = （还没有 commit）");
+                    }
+                    for h in &st.heads {
+                        let c = object::read_commit(&*db, pid, h)?;
+                        println!(
+                            "head      = {}  {}  {:<7} +{} ~{} -{}  {}",
+                            keys::short(h),
+                            history::fmt_ts(c.ts),
+                            c.peer,
+                            c.stats.add,
+                            c.stats.modify,
+                            c.stats.delete,
+                            c.msg
+                        );
+                    }
+                    println!(
+                        "库里      = W {} 行 / commit {} 行",
+                        st.wt_rows, st.commit_rows
+                    );
+                    let plan = build::plan(&*db, pid)?;
+                    let cs = &plan.changes;
+                    println!(
+                        "未提交    = +{} ~{} -{}  (按最后一次扫描；再改的先 scan)",
+                        cs.add, cs.modify, cs.delete
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// 一个项目在引擎里的体检数字。
+///
+/// 每一项都要开引擎数一遍键前缀（`key_count` 是 O(匹配行数)），所以这条和 `doctor` 一样
+/// 只许人工触发，不许进任何自动循环（NFR-8）。
+struct ProjStats {
+    mark: Option<worktree::ScanMark>,
+    wt_rows: usize,
+    commit_rows: usize,
+    heads: Vec<Hash>,
+}
+
+fn proj_stats(db: &dyn KvEngine, pid: ProjectId) -> Result<ProjStats> {
+    let count = |tag: u8| {
+        let tx = db.begin();
+        let n = tx.key_count(&keys::project_prefix(tag, pid));
+        tx.commit();
+        n
+    };
+    Ok(ProjStats {
+        mark: worktree::last_mark(db, pid),
+        wt_rows: count(keys::TAG_WORKTREE),
+        commit_rows: count(keys::TAG_COMMIT),
+        heads: build::ref_heads(db, pid, build::MAIN)?,
+    })
+}
+
+fn print_row(db: &dyn KvEngine, reg: &Registry, name: &str) -> Result<()> {
+    let pid = keys::project_id(name);
+    let st = proj_stats(db, pid)?;
+    let mark = match st.mark {
+        Some(m) => format!("{} 第{}轮", history::fmt_ts(m.epoch), m.round),
+        None => "从没完整扫过".to_string(),
+    };
+    let head = match st.heads.len() {
+        0 => "—".to_string(),
+        1 => keys::short(&st.heads[0]),
+        n => format!("{n}head"),
+    };
+    let star = if reg.current.as_deref() == Some(name) {
+        "*"
+    } else {
+        " "
+    };
+    println!(
+        "{star:<4} {:<20} {:<11} {:<9} {:<21} {:>7} {:>7}",
+        name,
+        format!("{pid:#010x}"),
+        head,
+        mark,
+        st.wt_rows,
+        st.commit_rows
+    );
+    Ok(())
+}
+
+/// `project` 里几条命令都要开引擎，但 `add`/`list`/`use` 不需要——所以不在函数开头统一开。
+fn db_or_open(cli: &Cli) -> Result<Box<dyn KvEngine>> {
+    open_store(&cli.root, cli.engine)
 }
 
 /// 项目作用域：`--project` 显式指定 > `project use` 选中的那个。

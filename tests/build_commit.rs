@@ -13,7 +13,7 @@ use std::path::Path;
 
 use storage_engines::{EngineKind, KvEngine};
 use twosync::error::Error;
-use twosync::store::build::{self, BlockMeta, MAX_ENTRIES};
+use twosync::store::build::{self, BlockMeta};
 use twosync::store::cas::{self, Cas};
 use twosync::store::history;
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
@@ -83,6 +83,13 @@ impl Site {
                 allow_mass_delete,
             },
         )
+    }
+
+    /// 最近一次完整扫描的 epoch。
+    fn epoch(&self) -> i64 {
+        worktree::last_mark(&*self.db, self.pid)
+            .expect("用例里扫过")
+            .epoch
     }
 
     fn head(&self) -> Vec<Hash> {
@@ -370,24 +377,102 @@ fn stale_scan_is_refused() {
     assert!(matches!(err, Error::StaleScan { .. }), "实际是 {err}");
 }
 
-/// 条目表是 O(文件数) 的权宜实现 ⇒ 超限必须**拒绝**，不是把机器 OOM 掉（NFR-3）。
+/// 流式读 `W`：活行数、总行数、epoch 都得对，而且**不许把不活的行吐出去**。
 #[test]
-fn too_many_rows_are_refused_not_oomed() {
+fn live_rows_stream_and_count() {
     let site = Site::new();
     for i in 0..5 {
         write(&site.proj().join(format!("f{i}.txt")), b"x");
     }
-    worktree::scan(&*site.db, site.pid, &site.proj(), false, 10).unwrap();
+    site.scan();
 
-    let snap = build::snapshot(&*site.db, site.pid, MAX_ENTRIES).unwrap();
-    assert_eq!(snap.entries.len(), 5);
-    assert_eq!(snap.known, 5);
-    assert!(snap.epoch > 0, "epoch 来自扫描时间戳");
-
-    match build::snapshot(&*site.db, site.pid, 3) {
-        Err(Error::TooManyEntries { n, max }) => assert_eq!((n, max), (4, 3)),
-        other => panic!("超限该报 TooManyEntries，实际 {other:?}"),
+    let mut rows = build::LiveRows::new(&*site.db, site.pid);
+    let mut paths = Vec::new();
+    for item in &mut rows {
+        let (path, _) = item.unwrap();
+        paths.push(path);
     }
+    assert!(rows.complete, "扫描完整跑完就该有 Z 标记");
+    assert_eq!(paths.len(), 5, "引擎按字节序给，所以这里天然升序");
+    assert_eq!(paths, {
+        let mut v = paths.clone();
+        v.sort();
+        v
+    });
+    assert_eq!((rows.live, rows.seen_rows), (5, 5));
+    assert!(rows.mark > 0, "epoch 来自扫描标记");
+}
+
+/// 上限现在守在**真正还在攒内存的那一处**：`plan` 要把算出来的树留给 diff 递归。
+/// `commit` 这一侧已经没有条目上限了（树直接进库，内存只剩"最大单目录 + 深度"）。
+#[test]
+fn plan_is_capped_where_it_still_accumulates() {
+    let site = Site::new();
+    for i in 0..5 {
+        write(&site.proj().join(format!("f{i}.txt")), b"x");
+    }
+    site.scan();
+    match build::plan_capped(&*site.db, site.pid, 3) {
+        // 上限数的是"攒在内存里的条目总数"：先结算的是根目录那一层，5 个文件一次超掉。
+        Err(Error::TooManyEntries { n, max }) => assert_eq!((n, max), (5, 3)),
+        other => panic!(
+            "超限该报 TooManyEntries，实际 {:?}",
+            other.map(|b| b.entries)
+        ),
+    }
+    // 上限放宽之后就正常：报错必须是"拒绝"，不是把机器 OOM 掉（NFR-3 红线）。
+    assert_eq!(
+        build::plan_capped(&*site.db, site.pid, 1000)
+            .unwrap()
+            .entries,
+        5
+    );
+}
+
+/// 一轮扫描**中途被打断**不再伪装成大规模删除。
+///
+/// 老写法拿"行里最大的 scanned_at"当 epoch，于是半轮新数据 + 半轮旧数据 ⇒ 旧的那半
+/// 看起来全被删了，一次 Ctrl-C 就制造一次假删除（只等 FR-10 去拦）。现在 epoch 只由
+/// **完整跑完**的扫描推进，活性判据是 `>=`：中断那半轮盖过的行更新、照样算活，
+/// 没盖到的行还留着上一次完整扫描的章 ⇒ 一条都不丢。
+#[test]
+fn an_interrupted_scan_does_not_look_like_a_mass_deletion() {
+    let site = Site::new();
+    for i in 0..6 {
+        write(&site.proj().join(format!("f{i}.txt")), b"x");
+    }
+    let first = site.commit(cas::DEFAULT_BLOCK, false).commit.unwrap();
+
+    // 手工模拟"扫描走到一半被杀"：只有两行被盖到更新时间戳。
+    let later = site.epoch() + 1_000_000;
+    for p in ["f0.txt", "f1.txt"] {
+        let key = keys::worktree_key(site.pid, p);
+        let raw = {
+            let tx = site.db.begin();
+            let got = tx.get(&key).unwrap();
+            tx.commit();
+            got
+        };
+        let mut e: worktree::WtEntry = postcard::from_bytes(keys::strip(&raw).unwrap()).unwrap();
+        e.scanned_at = later;
+        let tx = site.db.begin();
+        tx.set(&key, keys::wrap(postcard::to_allocvec(&e).unwrap()));
+        tx.commit();
+    }
+
+    // 计数器要迭代完才有效（它是流式的，没有"预先数好"这一步）。
+    let mut rows = build::LiveRows::new(&*site.db, site.pid);
+    let n = rows.by_ref().count();
+    assert_eq!(
+        (n, rows.live as usize, rows.seen_rows),
+        (6, 6, 6),
+        "六行都该算活着（两行更新、四行是上一次完整扫描的章）"
+    );
+
+    let again = site.commit(cas::DEFAULT_BLOCK, false);
+    assert_eq!(again.commit, None, "什么都没变 ⇒ 不该产生提交");
+    assert_eq!(again.changes.delete, 0, "半轮扫描不许被读成删除");
+    assert_eq!(site.head(), vec![first]);
 }
 
 /// 回归：`collect_children` 早先用 `split_opt` 取父目录，而**顶层目录里没有 `/`** ⇒ 返回

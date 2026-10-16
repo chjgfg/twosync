@@ -296,10 +296,8 @@ fn an_untracked_file_keeps_its_directory_and_the_report_honest() {
 
     // 手工造一个"没有 d"的目标版本。用真提交做不出来：那次提交会顺手把 `W` 也改成没有 d，
     // 于是删除判定根本不会触发。
-    let a = build::snapshot(&*site.db, site.pid, build::MAX_ENTRIES)
-        .unwrap()
-        .entries
-        .into_iter()
+    let (_, a) = build::LiveRows::new(&*site.db, site.pid)
+        .map(|r| r.unwrap())
         .find(|(p, _)| p == "a.txt")
         .expect("a.txt 该在快照里");
     let tree = object::put_tree(
@@ -308,9 +306,9 @@ fn an_untracked_file_keeps_its_directory_and_the_report_honest() {
         &[object::TreeEntry {
             name: "a.txt".into(),
             kind: keys::Kind::File,
-            hash: a.1.blob_hash,
-            size: a.1.size,
-            mode: a.1.mode,
+            hash: a.blob_hash,
+            size: a.size,
+            mode: a.mode,
         }],
     )
     .unwrap();

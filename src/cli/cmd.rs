@@ -145,4 +145,23 @@ pub enum ProjectCmd {
     List,
     /// 切换后续命令默认作用的项目
     Use { name: String },
+
+    /// 摘掉一个项目。**只动注册表**：工作树、历史、CAS 块一概不碰（§16.1）
+    ///
+    /// `project_id` 由名字派生，所以再 `add` 同名会接上同一份历史——摘掉不是"忘掉"。
+    Remove {
+        name: String,
+        /// 连带回收 CAS 空间。跨 project 的 refcnt 回收是 M1 `gc` 的活，现在会明确拒绝。
+        #[arg(long)]
+        purge: bool,
+    },
+
+    /// 项目体检：完整扫描过没有、head 在哪、库里多少行
+    ///
+    /// 每一项都要开引擎数一遍键前缀（`key_count` 是 O(匹配行数)），所以这条和 `doctor`
+    /// 一样只适合人工触发，不许进任何自动循环（NFR-8）。
+    Status {
+        /// 省略 = 全部项目的概览
+        name: Option<String>,
+    },
 }

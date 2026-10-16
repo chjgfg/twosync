@@ -12,7 +12,7 @@
 //! 所以"新 blob 才加引用、老 blob 不重复加"这条判断（`is_new_blob`）不能省，也不能推迟到
 //! GC 那轮再补——GC 看不到"本该 +1 却没 +1"的差额。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::format;
 use std::path::Path;
 
@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::store::history::TreeStore;
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::worktree::WtEntry;
-use crate::store::{cas, object};
+use crate::store::{cas, object, worktree};
 
 /// 一次最多聚合多少条目。超过就拒绝，不 OOM。
 pub const MAX_ENTRIES: usize = 200_000;
@@ -123,17 +123,6 @@ impl ChangeKind {
     }
 }
 
-/// `commit` 眼中的工作树：**最新一轮扫描**留下的行。
-#[derive(Debug)]
-pub struct Snapshot {
-    /// 引擎按字节序返回，所以这里天然按路径升序。
-    pub entries: Vec<(String, WtEntry)>,
-    /// 这批行共同的 `scanned_at`；0 = 表是空的，也就是还没扫描过。
-    pub epoch: i64,
-    /// 库里 `W` 行的总数（含本轮没看见的）。FR-10 的分母用它。
-    pub known: u32,
-}
-
 /// 块的引用记账（`K` 值）。`k` 前缀是它的排序索引，两者必须同事务改（不变量 (g)）。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -190,18 +179,24 @@ fn head_tree(db: &dyn KvEngine, pid: ProjectId) -> Result<Option<Hash>> {
 /// 代价说清：`plan` 用 `W` 里现成的整文件 hash，**不复核磁盘**。所以它可能报出一个随后
 /// 被 `commit` 以 `StaleScan` 拒掉的改动。这是"按最后一次扫描说话"的定义，不是 bug。
 pub fn plan(db: &dyn KvEngine, pid: ProjectId) -> Result<Built> {
-    let snap = snapshot(db, pid, MAX_ENTRIES)?;
+    plan_capped(db, pid, MAX_ENTRIES)
+}
+
+/// `plan` 的实现，但内存上限可注入——给用例留着"超限要报错、不许 OOM"这条可测性。
+pub fn plan_capped(db: &dyn KvEngine, pid: ProjectId, max_trees: usize) -> Result<Built> {
     let prev_tree = head_tree(db, pid)?;
-    let mut built = Built {
-        entries: snap.entries.len(),
-        epoch: snap.epoch,
-        known: snap.known,
-        ..Default::default()
+    let mut rows = LiveRows::new(db, pid);
+    let mut built = Built::default();
+    let mut sink = PlanSink {
+        trees: TreeStore::default(),
+        max: max_trees,
     };
-    let mut sink = PlanSink::default();
-    built.tree = assemble(db, pid, &snap, &mut built, &mut sink)?;
+    assemble(db, pid, &mut rows, &mut built, &mut sink)?;
+    built.entries = rows.live as usize;
+    built.known = rows.seen_rows;
+    built.epoch = rows.mark;
+    built.changes = diff(db, pid, prev_tree.as_ref(), &built.tree, &sink.trees)?;
     built.trees = sink.trees;
-    built.changes = diff(db, pid, prev_tree.as_ref(), &built.tree, &built.trees)?;
     Ok(built)
 }
 
@@ -213,23 +208,23 @@ pub fn build(
     work_root: &Path,
     meta: Meta<'_>,
 ) -> Result<Built> {
-    let snap = snapshot(db, pid, MAX_ENTRIES)?;
     let prev_heads = ref_heads(db, pid, MAIN)?;
     let prev_tree = head_tree(db, pid)?;
 
-    let mut built = Built {
-        entries: snap.entries.len(),
-        epoch: snap.epoch,
-        known: snap.known,
-        ..Default::default()
-    };
-    built.tree = assemble(
+    // `build` 这一侧**没有条目上限了**：树直接写进库，内存只剩"最大单个目录 + 深度"。
+    let mut rows = LiveRows::new(db, pid);
+    let mut built = Built::default();
+    assemble(
         db,
         pid,
-        &snap,
+        &mut rows,
         &mut built,
         &mut WriteSink { store, work_root },
     )?;
+    let known = rows.seen_rows;
+    built.entries = rows.live as usize;
+    built.known = known;
+    built.epoch = rows.mark;
 
     // build 已经把树写进库了，diff 直接读库，不必再带一份内存副本。
     built.changes = diff(
@@ -245,7 +240,7 @@ pub fn build(
     check_mass_delete(
         built.changes.delete,
         built.changes.deleted_bytes,
-        snap.known,
+        known,
         meta.allow_mass_delete,
     )?;
 
@@ -293,9 +288,12 @@ pub trait Sink {
 }
 
 /// 只算不写，喂给 `plan`。算出来的清单留在 `trees` 里给 diff 递归用。
-#[derive(Default)]
 struct PlanSink {
     trees: TreeStore,
+    /// 攒在内存里的树条目上限。**退休掉的是"条目表 O(文件数)"那一项**，这里留着的是
+    /// `plan` 独有的代价：它要把算出来的树留给 `diff` 递归。解法是把 diff 融进建树
+    /// （每层结算时顺手与旧树对应层比掉），那是下一步，不是已经做完。
+    max: usize,
 }
 
 impl Sink for PlanSink {
@@ -321,6 +319,12 @@ impl Sink for PlanSink {
         let mut sorted = entries.to_vec();
         sorted.sort();
         let hash = object::tree_hash(&sorted);
+        if self.trees.len() + sorted.len() > self.max {
+            return Err(Error::TooManyEntries {
+                n: self.trees.len() + sorted.len(),
+                max: self.max,
+            });
+        }
         self.trees.remember(hash, sorted);
         Ok(hash)
     }
@@ -360,102 +364,257 @@ impl Sink for WriteSink<'_> {
     }
 }
 
-/// 快照 → 一棵根 tree。**这段逻辑全站只有这一份**：顶层目录静默丢失那个 bug 就住在这里，
-/// 给 `plan` 复制一份等于再埋一个同根因的坑，而且第二份没人会去测。
-fn assemble<S: Sink>(
-    db: &dyn KvEngine,
-    pid: ProjectId,
-    snap: &Snapshot,
-    built: &mut Built,
-    sink: &mut S,
-) -> Result<Hash> {
-    let mut dirs: BTreeMap<String, Vec<object::TreeEntry>> = BTreeMap::new();
-    let mut known: BTreeSet<String> = BTreeSet::new();
-    // 每个目录的 mode 来自它自己的 W 记录（§8：只同步 owner 可执行位）。
-    let mut dir_mode: BTreeMap<String, u32> = BTreeMap::new();
-
-    for (path, e) in &snap.entries {
-        let (dir, name) = split(path);
-        ensure_dir(&mut dirs, &mut known, dir);
-        if e.kind == Kind::Dir {
-            ensure_dir(&mut dirs, &mut known, path);
-            dir_mode.insert(path.clone(), e.mode);
-            continue;
-        }
-        let hash = sink.blob_of(db, pid, path, e, built)?;
-        dirs.entry(dir.to_string())
-            .or_default()
-            .push(object::TreeEntry {
-                name: name.to_string(),
-                kind: e.kind,
-                hash,
-                size: e.size, // 目录/链接的逻辑大小恒 0，定义在 `worktree::logical_size`
-                mode: e.mode,
-            });
-    }
-
-    // 逆字典序 = 先子后父（"a" < "a/b"），所以子目录的 tree hash 一定先算好。
-    let mut tree_of: BTreeMap<String, Hash> = BTreeMap::new();
-    for dir in known.iter().rev() {
-        let mut list = dirs.remove(dir).unwrap_or_default();
-        list.extend(collect_children(&known, &tree_of, &dir_mode, dir)?);
-        let hash = sink.tree_of(db, pid, &list)?;
-        tree_of.insert(dir.clone(), hash);
-    }
-    Ok(tree_of.get("").copied().unwrap_or_else(object::empty_tree))
+/// 一条 `W` 流的读取器：分页、按活性线过滤、**内存只有一窗**。
+///
+/// 为什么不再像老实现那样先攒一个 `Vec`：那本身就是 O(文件数)，`MAX_ENTRIES` 只是给它
+/// 盖了个盖子，而盖子意味着"项目大到一定程度就提不了交"。分页是引擎给的
+/// `search_keys(page, page_size)`（§9.6.1：它的 `scan` 返回物化 `Vec`，全表扫一次就顶穿
+/// NFR-1）。**CPU 仍然是 O(页数 × 总行数)**——引擎没有游标式区间扫，这条已经记在 §9.6
+/// 交给上游；内存这一侧现在与条目总数无关。
+pub struct LiveRows<'a> {
+    db: &'a dyn KvEngine,
+    prefix: Vec<u8>,
+    /// 活性线：`scanned_at >= epoch` 的行才算活着。
+    epoch: i64,
+    /// `Z` 缺失 = 从没完整扫描过 ⇒ 一律不算活（把活性线抬到 `i64::MAX` 让谁都对不上）。
+    pub complete: bool,
+    page: usize,
+    buf: std::vec::IntoIter<(String, WtEntry)>,
+    done: bool,
+    /// 扫过的全部 `W` 行（含不活的）。FR-10 的分母用它；迭代走完才完整。
+    pub seen_rows: u32,
+    /// 其中活着的行数 = 本轮要进树的数量。
+    pub live: u32,
+    /// 最近一次完整扫描的 epoch，原样带给命令层显示。
+    pub mark: i64,
 }
 
-/// 分页读 `W` 前缀，只保留**最新一轮扫描**盖过章的行。
-///
-/// **必须分页**：引擎的 `scan` 返回物化 `Vec`，一次全表扫在 100 万条下是 150–250 MB
-/// （§9.6.1）。
-///
-/// epoch 的取法就是"最大 `scanned_at`"：扫描器给本轮看见的每一行盖同一个数，包括那些
-/// 内容没变、只续了期的行（见 `worktree` 模块头）。于是 `scanned_at != epoch` 只有一个
-/// 含义——**上一轮之后就没再被看见**，也就是被删了。这一步不许提前到扫描里做：
-/// "没看见 = 删除"必须由拿着上一版 tree 的一方判定，扫描单边判断会违反 §8。
-pub fn snapshot(db: &dyn KvEngine, pid: ProjectId, max: usize) -> Result<Snapshot> {
-    let prefix = keys::project_prefix(keys::TAG_WORKTREE, pid);
-    let mut all: Vec<(String, WtEntry)> = Vec::new();
-    let mut page = 0usize;
-    loop {
+impl<'a> LiveRows<'a> {
+    pub fn new(db: &'a dyn KvEngine, pid: ProjectId) -> Self {
+        let prefix = keys::project_prefix(keys::TAG_WORKTREE, pid);
+        let mut me = Self {
+            db,
+            prefix,
+            epoch: i64::MAX,
+            complete: false,
+            page: 0,
+            buf: Vec::new().into_iter(),
+            done: false,
+            seen_rows: 0,
+            live: 0,
+            mark: 0,
+        };
+        if let Some(m) = worktree::last_mark(db, pid) {
+            me.epoch = m.epoch;
+            me.complete = true;
+            me.mark = m.epoch;
+        }
+        me
+    }
+
+    /// 取下一页。返回 `false` = 已经没有更多页。
+    fn fetch(&mut self) -> Result<bool> {
         let found = {
-            let tx = db.begin();
-            let found = tx.search_keys(&SearchQuery::prefix(prefix.clone(), page, PAGE));
+            let tx = self.db.begin();
+            let found = tx.search_keys(&SearchQuery::prefix(self.prefix.clone(), self.page, PAGE));
             tx.commit();
             found
         };
+        let mut keep = Vec::with_capacity(found.items.len());
         for r in found.items {
-            let Some((_, path)) = r.key.split_at_checked(prefix.len()) else {
+            self.seen_rows += 1;
+            let Some((_, path)) = r.key.split_at_checked(self.prefix.len()) else {
                 continue;
             };
-            // `value` 只在 `include_deleted(true)` 时才会是 None（tombstone），我们没开。
+            // `value` 只在 `include_deleted(true)` 时才是 None（tombstone），我们没开。
             let Some(raw) = r.value else { continue };
-            if all.len() >= max {
-                return Err(Error::TooManyEntries { n: max + 1, max });
+            let e: WtEntry = dec(&raw, "WtEntry")?;
+            if e.scanned_at >= self.epoch {
+                keep.push((String::from_utf8_lossy(path).into_owned(), e));
             }
-            all.push((
-                String::from_utf8_lossy(path).into_owned(),
-                dec(&raw, "WtEntry")?,
-            ));
         }
-        if found.total_pages <= page + 1 {
-            break;
+        self.buf = keep.into_iter();
+        self.page += 1;
+        Ok(self.page < found.total_pages)
+    }
+}
+
+impl Iterator for LiveRows<'_> {
+    type Item = Result<(String, WtEntry)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(v) = self.buf.next() {
+                self.live += 1;
+                return Some(Ok(v));
+            }
+            if self.done {
+                return None;
+            }
+            // 先清缓冲再判结束：`fetch` 报"没有更多页"的那一页，数据**还在 buf 里**，
+            // 先返回 None 就等于把最后一页整个丢掉（老写法是一次性攒完，没这个坑）。
+            match self.fetch() {
+                Ok(more) => self.done = !more,
+                Err(e) => {
+                    // 解不开就是数据坏了，**不许当成"没有更多"**：静默少一半行，
+                    // 下一轮 commit 会把那些路径全判成删除。
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
         }
-        page += 1;
+    }
+}
+
+/// 一个还没结算的目录。
+struct Frame {
+    dir: String,
+    mode: u32,
+    entries: Vec<object::TreeEntry>,
+}
+
+/// `d` 是 `p` 的**真**祖先（或根）。路径都是 `/` 分隔、无尾斜杠。
+fn is_ancestor(d: &str, p: &str) -> bool {
+    d.is_empty() || p.strip_prefix(d).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// 从 `cur` 往 `parent` 方向再下一层。`cur` 必须是 `parent` 的祖先。
+fn next_ancestor(cur: &str, parent: &str) -> String {
+    let rest = parent
+        .strip_prefix(cur)
+        .unwrap_or(parent)
+        .trim_start_matches('/');
+    let seg = rest.split('/').next().unwrap_or(rest);
+    if cur.is_empty() {
+        seg.to_string()
+    } else {
+        format!("{cur}/{seg}")
+    }
+}
+
+/// 流式建树：吃 [`LiveRows`] 的升序路径，维护一条**祖先栈**。
+///
+/// 内存 = O(最大单个目录的子项数 + 目录深度)，不再是 O(文件总数)。根那一帧仍然装着顶层
+/// 全部条目——树对象本身就是一层一份清单，要算它的 hash 就得把这一层拿在手里，这是格式的
+/// 固有代价，git 的 tree 也一样。
+///
+/// 老实现是"先按目录把所有条目分桶，再按逆字典序自底向上收"。顶层目录静默丢失那个 bug
+/// （§17 补记二）就住在那套分桶 + `collect_children` 里，而它编译期防不住；栈式只需要问
+/// 一句"栈顶还是不是我的父目录"，收完立刻结算，没有第二份索引要维护。
+pub struct Builder<'a> {
+    db: &'a dyn KvEngine,
+    pid: ProjectId,
+    built: &'a mut Built,
+    stack: Vec<Frame>,
+}
+
+impl<'a> Builder<'a> {
+    fn new(db: &'a dyn KvEngine, pid: ProjectId, built: &'a mut Built) -> Self {
+        Self {
+            db,
+            pid,
+            built,
+            stack: vec![Frame {
+                dir: String::new(),
+                mode: 0o40755,
+                entries: Vec::new(),
+            }],
+        }
     }
 
-    let epoch = all.iter().map(|(_, e)| e.scanned_at).max().unwrap_or(0);
-    let known = all.len() as u32;
-    let entries = all
-        .into_iter()
-        .filter(|(_, e)| e.scanned_at == epoch)
-        .collect();
-    Ok(Snapshot {
-        entries,
-        epoch,
-        known,
-    })
+    fn row(&mut self, path: &str, e: &WtEntry, sink: &mut dyn Sink) -> Result<()> {
+        let (parent, name) = split(path);
+        self.align(parent, sink)?;
+        if e.kind == Kind::Dir {
+            // 目录自己也要成为父目录的一条条目，但它的 hash 要等结算完才知道 ⇒
+            // 这里只压一帧，条目在 `close_top` 里补。
+            self.stack.push(Frame {
+                dir: path.to_string(),
+                mode: e.mode,
+                entries: Vec::new(),
+            });
+            return Ok(());
+        }
+        let hash = sink.blob_of(self.db, self.pid, path, e, self.built)?;
+        self.top().entries.push(object::TreeEntry {
+            name: name.to_string(),
+            kind: e.kind,
+            hash,
+            size: e.size, // 目录/链接的逻辑大小恒 0，定义在 `worktree::logical_size`
+            mode: e.mode,
+        });
+        Ok(())
+    }
+
+    /// 把栈对齐到 `parent`：比它深的帧先结算出栈，比它浅的缺帧补上。
+    fn align(&mut self, parent: &str, sink: &mut dyn Sink) -> Result<()> {
+        while self.stack.len() > 1 {
+            let top = self.top();
+            if top.dir == parent || is_ancestor(&top.dir, parent) {
+                break;
+            }
+            self.close_top(sink)?;
+        }
+        // 中间层没有 `W` 行（比如手工塞进一条深层路径）⇒ 按段序补空帧。少了这一步，
+        // 那条路径会挂到错误的父目录上去。老实现的 `ensure_dir` 干的是同一件事。
+        while self.top().dir != parent {
+            let cur = self.top().dir.clone();
+            let next = next_ancestor(&cur, parent);
+            self.stack.push(Frame {
+                dir: next,
+                mode: 0o40755,
+                entries: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn close_top(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        let f = self.stack.pop().expect("根帧不许结算");
+        let hash = sink.tree_of(self.db, self.pid, &f.entries)?;
+        let name = f.dir.rsplit_once('/').map_or(f.dir.as_str(), |(_, n)| n);
+        self.top().entries.push(object::TreeEntry {
+            name: name.to_string(),
+            kind: Kind::Dir,
+            hash,
+            size: 0,
+            mode: f.mode,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self, sink: &mut dyn Sink) -> Result<Hash> {
+        while self.stack.len() > 1 {
+            self.close_top(sink)?;
+        }
+        let entries = std::mem::take(&mut self.stack[0].entries);
+        sink.tree_of(self.db, self.pid, &entries)
+    }
+
+    fn top(&mut self) -> &mut Frame {
+        self.stack.last_mut().expect("根帧一直在")
+    }
+}
+
+/// 流 → 一棵根 tree，写进 `built.tree`。
+///
+/// **这段逻辑全站只有这一份**：`plan`（只算）与 `build`（真落盘）只差在 `Sink`，
+/// 其余共用。老写法里"分桶 + 逆序收"出过顶层目录静默丢失的 bug，而那份代码 `plan` 和
+/// `build` 是各抄一遍的——现在抄不动了。
+fn assemble<S: Sink>(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    rows: &mut LiveRows<'_>,
+    built: &mut Built,
+    sink: &mut S,
+) -> Result<()> {
+    let mut b = Builder::new(db, pid, built);
+    for item in &mut *rows {
+        let (path, e) = item?;
+        b.row(&path, &e, sink)?;
+    }
+    built.tree = b.finish(sink)?;
+    Ok(())
 }
 
 /// FR-10：删除条目 > 已知条目的 20%，或删除字节 > 2 GB ⇒ 这个 commit 不算数。
@@ -717,56 +876,6 @@ pub fn diff(
     };
     walk_pair(db, pid, new_trees, "", &old_list, &new_list, &mut collect)?;
     Ok(out)
-}
-
-fn ensure_dir(
-    dirs: &mut BTreeMap<String, Vec<object::TreeEntry>>,
-    known: &mut BTreeSet<String>,
-    dir: &str,
-) {
-    dirs.entry(dir.to_string()).or_default();
-    let mut cur = dir;
-    loop {
-        known.insert(cur.to_string());
-        match cur.rsplit_once('/') {
-            Some((parent, _)) => cur = parent,
-            None => break,
-        }
-    }
-}
-
-/// 把 `dir` 的直接子目录打包成条目（子目录的 tree hash 已经算好了）。
-///
-/// 找不到某个子目录的 hash 就**报错**，不许跳过：跳过 = 那棵子树从历史里静消失，
-/// 而调用方是按"逆序一定算好了"这个前提写的（见 `build` 里那圈 `known.iter().rev()`）。
-fn collect_children(
-    known: &BTreeSet<String>,
-    tree_of: &BTreeMap<String, Hash>,
-    dir_mode: &BTreeMap<String, u32>,
-    dir: &str,
-) -> Result<Vec<object::TreeEntry>> {
-    let mut kids = Vec::new();
-    for candidate in known {
-        // 只能用 `split`，不能用 `split_opt`：顶层目录（"sub"）里没有 `/`，`split_opt`
-        // 返回 None 就被 `continue` 掉了 ⇒ 整个顶层目录连同它下面的一切**静默消失**在历史里。
-        let (parent, name) = split(candidate);
-        if parent != dir || name.is_empty() {
-            continue;
-        }
-        let hash = *tree_of.get(candidate).ok_or_else(|| {
-            Error::Codec(format!(
-                "子目录 {candidate} 的 tree 还没算出来：逆序聚合的前提被破坏"
-            ))
-        })?;
-        kids.push(object::TreeEntry {
-            name: name.to_string(),
-            kind: Kind::Dir,
-            hash,
-            size: 0,
-            mode: dir_mode.get(candidate).copied().unwrap_or(0o40755),
-        });
-    }
-    Ok(kids)
 }
 
 fn split(path: &str) -> (&str, &str) {

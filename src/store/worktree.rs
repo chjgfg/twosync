@@ -70,6 +70,19 @@ pub struct WtEntry {
     pub scanned_at: i64,
 }
 
+/// 一轮**完整跑完**的扫描留下的标记（`Z|p`）。为什么不能靠"行里最大的 `scanned_at`"，
+/// 见 `keys::TAG_SCAN` 那段。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanMark {
+    /// 本轮的 `scanned_at`。凡是 `scanned_at >= epoch` 的 `W` 行都算"还活着"。
+    pub epoch: i64,
+    /// 本轮盖章的行数（新增 + 续期）。它与 `walked` 的差就是读失败又没续上期的那些。
+    pub seen: u32,
+    pub walked: u32,
+    /// 第几轮完整扫描（从 1 起）。`project status` 里给个人看，也方便对账。
+    pub round: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
     pub walked: usize,
@@ -84,6 +97,9 @@ pub struct Report {
     /// 被重算的路径样本，**最多 10 条**（再多就违反 §9.6.1 的常数内存承诺）。
     /// 用途：第二轮本该 hashed=0，出现 hashed=1 时要能问出"是哪一个、为什么"。
     pub sample: Vec<String>,
+    /// 本轮盖章的行数 = 写进 `Z.seen` 的那个数。`walked` 比它大是因为根目录自己不入库、
+    /// 以及读失败又没续上期的行。
+    pub seen: usize,
     pub elapsed_ms: u128,
 }
 
@@ -104,7 +120,7 @@ pub fn scan(
         // 攒满一窗就落盘并换事务。放在循环**开头**，三个 push 点就共用这一处；
         // 代价是 pending 最多 batch+1 条，不是 batch 条。
         if pending.len() >= batch {
-            flush(&mut *tx, &mut pending)?;
+            rep.seen += flush(&mut *tx, &mut pending)?;
             tx.commit();
             drop(tx);
             tx = db.begin(); // 一事务一批，别让它跨整棵树
@@ -168,9 +184,25 @@ pub fn scan(
         pending.push((key, encode(&value)?));
     }
     if !pending.is_empty() {
-        flush(&mut *tx, &mut pending)?;
+        rep.seen += flush(&mut *tx, &mut pending)?;
         tx.commit();
     }
+
+    // 「这一轮完整走完了」的标记。**必须在全部行落盘之后**再写：反过来做，崩溃会留下一个
+    // 指向半轮数据的 epoch，而半轮 epoch 正是我们要消灭的那种假删除的来源。
+    drop(tx);
+    let round = last_mark(db, pid).map_or(0, |m| m.round);
+    let mark = ScanMark {
+        epoch: now,
+        seen: rep.seen as u32,
+        walked: rep.walked as u32,
+        round: round + 1,
+    };
+    let tx = db.begin();
+    if !tx.set(&keys::scan_key(pid), encode_mark(&mark)?) {
+        return Err(Error::WriteConflict("Z 扫描标记".to_string()));
+    }
+    tx.commit();
 
     rep.elapsed_ms = started.elapsed().as_millis();
     Ok(rep)
@@ -253,6 +285,26 @@ fn prev_entry(tx: &dyn storage_engines::KvTxn, key: &[u8]) -> Option<WtEntry> {
     postcard::from_bytes(bytes).ok()
 }
 
+/// 最近一次**完整**扫描的标记。`None` = 从没完整跑完过 ⇒ `commit` 不该认为有任何活行。
+///
+/// 解不开也返回 `None`（保守）：宁可报"还没扫描过"，也不要拿着一个可疑的 epoch 去判删除。
+pub fn last_mark(db: &dyn KvEngine, pid: ProjectId) -> Option<ScanMark> {
+    let raw = {
+        let tx = db.begin();
+        let got = tx.get(&keys::scan_key(pid));
+        tx.commit();
+        got
+    }?;
+    postcard::from_bytes(keys::strip(&raw).ok()?).ok()
+}
+
+/// 写引擎前的最后一步：加信封标签（见 `keys::VALUE_TAG`）。
+fn encode_mark(m: &ScanMark) -> Result<Vec<u8>> {
+    Ok(keys::wrap(
+        postcard::to_allocvec(m).map_err(|e| Error::Codec(e.to_string()))?,
+    ))
+}
+
 fn encode(e: &WtEntry) -> Result<Vec<u8>> {
     Ok(keys::wrap(
         postcard::to_allocvec(e).map_err(|err| Error::Codec(err.to_string()))?,
@@ -304,11 +356,17 @@ fn digest(path: &Path, kind: Kind, buf: &mut [u8]) -> std::io::Result<(Hash, u64
     }
 }
 
-fn flush(tx: &mut dyn storage_engines::KvTxn, pending: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+/// 落一整批。返回**写了几行**——`ScanMark.seen` 要的就是这个数，
+/// 而它只能来自真正落盘的那一步，不能由别处推算。
+fn flush(
+    tx: &mut dyn storage_engines::KvTxn,
+    pending: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<usize> {
+    let n = pending.len();
     tx.batch_set(pending)
         .map_err(|keys| Error::WriteConflict(format!("{:?}", keys.first())))?;
     pending.clear();
-    Ok(())
+    Ok(n)
 }
 
 /// 本轮的"现在"。**一次扫描只取一次**：同一个 epoch 是 `commit` 判删除的依据，

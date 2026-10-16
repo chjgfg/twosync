@@ -114,6 +114,15 @@ impl TreeStore {
         object::read_tree(db, pid, hash) // 空树在那里有特判，不查表也读得出来
     }
 
+    /// 已经攒了多少条目录条目。`plan` 用它守自己的内存上限。
+    pub fn len(&self) -> usize {
+        self.0.values().map(|v| v.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// `plan` 边算边往里放。同 hash 必然同内容（内容寻址），先到先得。
     pub(crate) fn remember(&mut self, hash: Hash, entries: Vec<object::TreeEntry>) {
         self.0.entry(hash).or_insert(entries);

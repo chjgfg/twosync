@@ -69,6 +69,13 @@ pub const TAG_BLOCK: u8 = b'K';
 pub const TAG_REFCNT: u8 = b'k';
 pub const TAG_WORKTREE: u8 = b'W';
 pub const TAG_HEAD: u8 = b'H';
+/// 最近一次**完整跑完**的扫描标记：`Z|p` → `worktree::ScanMark`。
+///
+/// 为什么要有它（不靠"行里最大的 `scanned_at`"）：那个算法在扫描中途被打断时会把
+/// **半轮**的 epoch 当成最新，于是没被走到的那一半全部看起来像被删除——一次 Ctrl-C
+/// 就制造一次假的大规模删除，只等 FR-10 去拦。改成"只有完整扫描才推进 epoch"之后，
+/// 中断的那半轮既不推进 epoch、也不丢数据（见 `build::snapshot` 的 `>=` 规则）。
+pub const TAG_SCAN: u8 = b'Z';
 pub const TAG_FOLDED: u8 = b'A';
 pub const TAG_SESSION: u8 = b'S';
 pub const TAG_PEER: u8 = b'P';
@@ -136,6 +143,11 @@ pub fn refcnt_key(pid: ProjectId, refcnt: u64, hash: &Hash) -> Vec<u8> {
 /// path 在键尾 ⇒ `prefix_scan(W|p|"src/")` 就是一棵子树（§8 的"只扫脏子树"靠它）。
 pub fn worktree_key(pid: ProjectId, path: &str) -> Vec<u8> {
     keyed(TAG_WORKTREE, pid, path.as_bytes())
+}
+
+/// 扫描标记键。`Z|p` 定长 5 字节、无尾段，所以 `project_prefix(TAG_SCAN, pid)` 就是它本身。
+pub fn scan_key(pid: ProjectId) -> Vec<u8> {
+    project_prefix(TAG_SCAN, pid)
 }
 
 /// ref_name 是变长的，后面还要接 32 B hash ⇒ 必须用 `0x00` 分隔，否则

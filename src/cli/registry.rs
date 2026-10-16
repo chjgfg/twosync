@@ -99,6 +99,21 @@ impl Registry {
         Ok(&self.projects[name])
     }
 
+    /// 摘掉一个项目。**只动注册表**：工作树、历史、CAS 块一概不碰（§16.1）。
+    ///
+    /// `current` 指向它时一并清空，**不许**自动改选别的项目——下一条命令作用在哪个目录上
+    /// 必须是用户明确选的，静默换一个项目就是往错的项目里提交。
+    pub fn remove(&mut self, name: &str) -> Result<Project> {
+        let p = self
+            .projects
+            .remove(name)
+            .ok_or_else(|| Error::Registry(format!("没有项目 {name}")))?;
+        if self.current.as_deref() == Some(name) {
+            self.current = None;
+        }
+        Ok(p)
+    }
+
     pub fn select(&mut self, name: &str) -> Result<()> {
         if !self.projects.contains_key(name) {
             let err = format!("没有项目 {name}；先 project add");
@@ -240,5 +255,41 @@ mod tests {
         assert!(reg.add("p", "../outside").is_err());
         assert!(reg.add("p", "a\\b").is_err(), "反斜杠不许进配置（§8）");
         assert!(reg.add("a/b", "x").is_err(), "名字里不许有分隔符");
+    }
+
+    /// 摘掉条目 = 只动注册表。顺带钉两件事：`current` 清空而不是自动改选，
+    /// 以及"再 add 同名会接上同一份历史"（id 由名字派生，这是 §16.1 的必然后果）。
+    #[test]
+    fn remove_touches_only_the_registry_and_clears_current() {
+        let dir = root();
+        let mut reg = Registry::default();
+        reg.add("a", "a").unwrap();
+        reg.add("b", "b").unwrap();
+        reg.select("a").unwrap();
+        reg.save(dir.path()).unwrap();
+
+        let gone = reg.remove("a").unwrap();
+        assert_eq!(gone.path, "a", "要把摘掉的项目回吐给命令层打印");
+        assert_eq!(
+            reg.current, None,
+            "不许自动改选 b：作用在哪个目录必须是人明确选的"
+        );
+        assert!(reg.remove("a").is_err(), "摘两次是打错字，不是幂等操作");
+        reg.save(dir.path()).unwrap();
+
+        let back = Registry::load(dir.path()).unwrap();
+        assert_eq!(back.projects.len(), 1);
+        assert!(back.projects.contains_key("b"));
+        // 摘掉之后再加同名，落回的是**同一个** `project_id`（派生而非自增），所以库里那份
+        // 历史直接接得上。这件事由 `keys::project_id_is_derived_and_stable` 钉住，
+        // 这里不再重复断言一遍同义反复。
+        let mut again = back;
+        again.add("a", "a").unwrap();
+        assert_eq!(again.projects["a"].path, "a");
+        assert_eq!(
+            again.current.as_deref(),
+            Some("a"),
+            "空 current 时 add 会重新自动选中"
+        );
     }
 }
