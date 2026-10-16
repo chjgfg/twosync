@@ -81,7 +81,7 @@ impl Registry {
     /// 注册项目。重名直接拒——`project_id` 由名字派生，改名等于换一个新项目（§16.1）。
     pub fn add(&mut self, name: &str, path: &str) -> Result<&Project> {
         check_name(name)?;
-        check_rel_path(path)?;
+        check_rel_path(path).map_err(Error::BadInput)?;
         if self.projects.contains_key(name) {
             let err = format!("项目 {name} 已存在；改名等于换一个新项目（id 由名字派生）");
             return Err(Error::Registry(err));
@@ -135,22 +135,25 @@ impl Registry {
 
 fn check_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
-        return Err(Error::Registry(format!("项目名不合法：{name:?}")));
+        return Err(Error::BadInput(format!("项目名不合法：{name:?}")));
     }
     Ok(())
 }
 
 /// 路径必须是相对、`/` 分隔、不含 `..`。§9.4.1 的穿越防线，本地配置这一层就先挡住。
-fn check_rel_path(path: &str) -> Result<()> {
+///
+/// `pub(crate)` 且**只返回消息字符串**：这条规则同时被注册表（`project add`）和命令行
+/// （`mv` / `checkout --prefix`）用，两处都想带上"是哪个参数"的前缀。规则留一份、
+/// 消息各自包，免得两份校验器对同一个路径给出两种答案。
+pub(crate) fn check_rel_path(path: &str) -> std::result::Result<(), String> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') {
-        let err: String = format!("项目路径必须是 / 分隔的相对路径：{path:?}");
-        return Err(Error::Registry(err));
+        return Err(format!("路径必须是 / 分隔的相对路径：{path:?}"));
     }
     if Path::new(path).is_absolute() {
-        return Err(Error::Registry(format!("项目路径不许是绝对路径：{path:?}")));
+        return Err(format!("路径不许是绝对路径：{path:?}"));
     }
     if path.split('/').any(|seg| seg == "..") {
-        return Err(Error::Registry(format!("项目路径不许含 ..：{path:?}")));
+        return Err(format!("路径不许含 ..：{path:?}"));
     }
     Ok(())
 }

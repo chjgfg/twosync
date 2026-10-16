@@ -11,14 +11,13 @@ use storage_engines::KvEngine;
 
 use crate::allocstats;
 use crate::cli::Cli;
-use crate::cli::cmd::ProjectCmd;
-use crate::cli::registry::Registry;
+use crate::cli::cmd::{ConfigCmd, ProjectCmd};
+use crate::cli::config::Config;
+use crate::cli::registry::{self, Registry};
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::{build, cas, checkout, history, object, restore, worktree};
-use crate::utils::{
-    db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
-};
+use crate::utils::{db_dir, journal_dir, log_dir, objects_dir, projects_file, site_dir};
 
 /// `Commit.peer` 的占位值。真正的 peer id 要等 M1 的 `peer add|trust`；现在填什么都一样——
 /// 它**只是元数据，不参与任何裁决**（§9.5.2 / §15.7），所以不值得为它提前做一套身份。
@@ -56,7 +55,7 @@ pub fn init(cli: &Cli) -> Result<()> {
 
 /// 打开基座 → FR-21 自检 → 打印健康度。句柄用完即弃，不跨命令持有（§9.6.2）。
 pub fn doctor(cli: &Cli) -> Result<()> {
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     // NFR-8：`health()` 是 O(物理行数)，只允许出现在这种人工触发的诊断路径上。
     let h = db.health();
     println!("engine      = {}", db.name());
@@ -285,7 +284,7 @@ fn print_row(db: &dyn KvEngine, reg: &Registry, name: &str) -> Result<()> {
 
 /// `project` 里几条命令都要开引擎，但 `add`/`list`/`use` 不需要——所以不在函数开头统一开。
 fn db_or_open(cli: &Cli) -> Result<Box<dyn KvEngine>> {
-    open_store(&cli.root, cli.engine)
+    cli.store()
 }
 
 /// 项目作用域：`--project` 显式指定 > `project use` 选中的那个。
@@ -311,7 +310,7 @@ fn resolve_project(cli: &Cli) -> Result<(String, PathBuf)> {
 
 pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     let wm = allocstats::watermark();
     let rep = worktree::scan(&*db, pid, &root, force, batch)?;
@@ -358,10 +357,10 @@ pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
 /// 提交的是上一次扫描看见的状态。中间文件又变了的话会撞 `StaleScan`，不会静默用新内容。
 pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     // 块仓是**站点级**的一份（挂在 `--root` 下），不是每项目一份：跨项目去重靠这个。
-    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
 
     let started = Instant::now();
     let wm = allocstats::watermark();
@@ -421,7 +420,7 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<(
 /// 这里只保证"两个 head 的历史都能列出来、共同祖先不重复"。
 pub fn log(cli: &Cli, max_count: usize) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     let heads = build::ref_heads(&*db, pid, build::MAIN)?;
     if heads.is_empty() {
@@ -459,10 +458,10 @@ pub fn log(cli: &Cli, max_count: usize) -> Result<()> {
 /// `show`：一个 commit 的元数据 + 某一层的清单，或一个文件的块清单。
 pub fn show(cli: &Cli, rev: &str, path: Option<&str>) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     // 只有符号链接那一支会真去读字节（目标文本存在 CAS 里，不在引擎里）。
-    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
     let heads = history::resolve_rev(&*db, pid, rev)?;
     let hash = one_commit(heads, rev)?;
     let c = object::read_commit(&*db, pid, &hash)?;
@@ -594,9 +593,9 @@ fn one_commit(heads: Vec<Hash>, rev: &str) -> Result<Hash> {
 /// `restore`：从某个版本取一个路径回工作树（或取到别处）。
 pub fn restore(cli: &Cli, at: &str, path: &str, to: Option<&Path>, force: bool) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
-    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
 
     let r = restore::restore(&*db, pid, &store, &root, &commit, path, to, force)?;
@@ -625,7 +624,7 @@ pub fn restore(cli: &Cli, at: &str, path: &str, to: Option<&Path>, force: bool) 
 /// 藏起来就会让"这个版本里到底有什么"少一层。
 pub fn ls_files(cli: &Cli, at: &str, prefix: Option<&str>) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
     let c = object::read_commit(&*db, pid, &commit)?;
@@ -671,9 +670,9 @@ pub fn checkout(
     allow_mass_delete: bool,
 ) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
-    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
 
     let started = Instant::now();
@@ -734,10 +733,101 @@ fn kind_word(k: Kind) -> &'static str {
     }
 }
 
+/// `config`：读写站点级配置。真正的规则都在 `cli::config::Config` 里，这里只负责打印
+/// "生效值 + 来源"——因为**没写**和**写了默认值**是两件事，只看文件看不出来。
+pub fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
+    let mut cfg = Config::load(&cli.root)?;
+    match cmd {
+        ConfigCmd::Get { key } => {
+            let keys: Vec<&str> = match key {
+                Some(k) => vec![k.as_str()],
+                None => Config::KEYS.to_vec(),
+            };
+            for k in keys {
+                let (v, src) = cfg.effective(k)?;
+                // 命令行 `--engine` 压过配置文件：不标出来的话，人会对着一个没生效的值做决定。
+                let src = if k == "engine" && cli.engine.is_some() {
+                    "命令行 --engine"
+                } else {
+                    src
+                };
+                println!("{k:<11} = {v:<12}  ({src})");
+            }
+        }
+        ConfigCmd::Set { key, value } => {
+            cfg.set(key, value)?;
+            cfg.save(&cli.root)?;
+            println!(
+                "已写入 {key} = {value}  ({})",
+                Config::path(&cli.root).display()
+            );
+            match key.as_str() {
+                "engine" => println!(
+                    "  注意：换引擎 = 换数据目录（.twosync/db/<engine>/），旧引擎里的数据不会自动带过来。`doctor` 看一眼再动手"
+                ),
+                "block_size" => println!(
+                    "  只影响之后新建的 blob：每个 blob 清单里写着自己的块大小，旧 blob 照原样读"
+                ),
+                _ => {}
+            }
+        }
+        ConfigCmd::Unset { key } => {
+            let had = cfg.unset(key)?;
+            cfg.save(&cli.root)?;
+            if had {
+                println!("已删掉 {key}，回到内置默认");
+            } else {
+                println!("{key} 本来就没写，仍是内置默认");
+            }
+        }
+    }
+    Ok(())
+}
+
+const MV_HINT: &str = "mv 这一条没有覆盖语义，先把它挪开或删掉（删之前想想 §7.3）";
+
+/// `mv`：改个工作树里的路径名。**只动磁盘，不碰库**——改名要等下一次 `scan` + `commit`
+/// 才进历史，那时它在账面上是"一次删除 + 一次新增"（改名检测是 FR-17，还没做）。
+///
+/// 目标已存在一律拒（`LocalExists`）。这里没有 `--force`：`mv` 想覆盖的话，用户应该显式
+/// 先 `restore`/`rm`，少一个静默丢数据的口子。
+pub fn mv(cli: &Cli, src: &str, dst: &str) -> Result<()> {
+    let (_, root) = resolve_project(cli)?;
+    registry::check_rel_path(src).map_err(|m| Error::BadInput(format!("src {m}")))?;
+    registry::check_rel_path(dst).map_err(|m| Error::BadInput(format!("dst {m}")))?;
+    let from = work_path(&root, src);
+    let to = work_path(&root, dst);
+    if to.symlink_metadata().is_ok() {
+        return Err(Error::LocalExists {
+            path: to,
+            hint: MV_HINT,
+        });
+    }
+    let md = from
+        .symlink_metadata()
+        .map_err(|_| Error::BadInput(format!("{} 不存在（工作树 {src}）", from.display())))?;
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&from, &to)?;
+    println!(
+        "已改名 {src} → {dst}  ({})",
+        if md.is_dir() { "目录" } else { "文件" }
+    );
+    println!("  库里还没记：下一步 `scan` 然后 `commit`");
+    println!("  账面上会是 -1 / +1（改名检测是 FR-17）；块是内容寻址的 ⇒ 磁盘和传输都不受影响");
+    Ok(())
+}
+
+/// 仓库内 `/` 路径 → 工作树里的磁盘路径。分隔符换算只在这一处。
+fn work_path(root: &Path, repo_path: &str) -> PathBuf {
+    root.join(repo_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+}
+
 /// `status`：工作树（按最后一次扫描）与 HEAD 的差。**走 `build::plan`，不落任何盘**。
 pub fn status(cli: &Cli) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     let p = build::plan(&*db, pid)?;
 
@@ -768,7 +858,7 @@ pub fn status(cli: &Cli) -> Result<()> {
 /// `diff --at REV`：同一份变更表，只是比较对象换成任意一个版本。
 pub fn diff(cli: &Cli, at: &str) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
-    let db = open_store(&cli.root, cli.engine)?;
+    let db = cli.store()?;
     let pid = keys::project_id(&name);
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
     let want = object::read_commit(&*db, pid, &commit)?;

@@ -32,6 +32,9 @@ use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::{build, cas, history, object, worktree};
 
+/// 两处拒绝覆盖时给的建议，各自说自己的话。
+pub const RESTORE_HINT: &str = "加 --force 才覆盖（仍要求被覆盖的那一版已在历史里）";
+
 #[derive(Debug)]
 pub struct Restored {
     pub dest: PathBuf,
@@ -73,7 +76,10 @@ pub fn restore(
     let mut gate_checked = false;
     if dest.exists() {
         if !force {
-            return Err(Error::LocalExists { path: dest });
+            return Err(Error::LocalExists {
+                path: dest,
+                hint: RESTORE_HINT,
+            });
         }
         // 覆盖之前先确认"被覆盖的这一版"取回来了才谈得上覆盖。
         check_local_is_recoverable(db, store, pid, work_root, path)?;

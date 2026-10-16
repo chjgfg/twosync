@@ -40,6 +40,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
             to,
             force,
         } => m0::restore(cli, at, path, to.as_deref(), *force),
+        Cmd::Config(cmd) => m0::config(cli, cmd),
+        Cmd::Mv { src, dst } => m0::mv(cli, src, dst),
         Cmd::Status => m0::status(cli),
         Cmd::Diff { at } => m0::diff(cli, at),
         Cmd::LsFiles { at, prefix } => m0::ls_files(cli, at, prefix.as_deref()),

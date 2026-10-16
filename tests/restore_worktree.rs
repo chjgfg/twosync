@@ -163,7 +163,13 @@ fn restore_refuses_to_overwrite_without_force() {
     let err = site
         .restore(&first, "a.txt", None, false)
         .expect_err("默认不许覆盖");
-    assert!(matches!(err, Error::LocalExists { .. }), "实际 {err}");
+    match err {
+        Error::LocalExists { hint, .. } => assert!(
+            hint.contains("--force"),
+            "restore 的这条该告诉人有 --force：{hint}"
+        ),
+        other => panic!("应是 LocalExists，实际 {other}"),
+    }
     assert_eq!(fs::read_to_string(site.proj().join("a.txt")).unwrap(), "v2");
     assert_eq!(site.head(), second, "被拒的 restore 不许动 head");
 }

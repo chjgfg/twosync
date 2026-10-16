@@ -86,6 +86,22 @@ pub enum Cmd {
         force: bool,
     },
 
+    /// 站点级配置（`<root>/.twosync/config.toml`）
+    #[command(subcommand)]
+    Config(ConfigCmd),
+
+    /// 改个工作树里的路径名（文件或目录都行）
+    ///
+    /// 它只做"安全地 rename"这一件事：源不存在就拒、目标已存在就拒、父目录自动建。
+    /// **本轮不会记成改名**：`stats.rename` 恒 0，改名检测是 FR-17 的活，现在扫出来是
+    /// 一次删除 + 一次新增。块是内容寻址的，所以磁盘与传输都不受影响，只有账面上难看。
+    Mv {
+        /// 仓库内原路径（`/` 分隔）
+        src: String,
+        /// 仓库内新路径；父目录不存在会自动建
+        dst: String,
+    },
+
     /// 工作树（按最后一次扫描）与 HEAD 差在哪。**只读，一个字节都不写**
     ///
     /// 它不看文件内容，只看 `W` 与上一版树的差 —— 所以"扫描之后又改了"的那部分
@@ -164,4 +180,15 @@ pub enum ProjectCmd {
         /// 省略 = 全部项目的概览
         name: Option<String>,
     },
+}
+
+/// `config` 的三个动作。键清单在 `config::Config::KEYS`，那里同时是校验的唯一入口。
+#[derive(Subcommand, Clone)]
+pub enum ConfigCmd {
+    /// 列出生效值与来源；不带 KEY 就列全部
+    Get { key: Option<String> },
+    /// 写一个键。值会先校验，未知键直接拒——**存进去一个没人读的键比报错难查得多**
+    Set { key: String, value: String },
+    /// 删掉一个键，回到内置默认
+    Unset { key: String },
 }
