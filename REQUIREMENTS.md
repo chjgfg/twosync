@@ -434,6 +434,34 @@ NFR-1 / FR-3 / §9.6.1 / §10.1(f) 四处的"峰值 ≤ 4 MB"统一改为"≤ 8 
    `committed_bytes_roundtrip_through_cas` 证明，**CLI 还做不到**。
 3. `stats.rename` 恒 0（改名按 add+delete 记），FR-17 的改名检测没做。
 
+### v0.4 补记三（2026-10-16 深夜，`log` / `show` 落地 = 历史第一次可见）
+
+**新增 `src/store/history.rs`（只读层）**：`walk`（多起点、时间倒序、共同祖先只走一次）、
+`resolve`（按路径逐层走 tree）、`resolve_rev`（`HEAD`/ref 名/十六进制前缀 → commit）。
+单独成一层而不是塞进 `build`，是因为读路径必须在 GC 之后、在对端只推了半个版本树时依然能用——
+**"读的那条路恰好是写的某条路的副产品"就是 §10 不变量 (b) 最常见的破法**。
+
+**新错误 `NoSuchPath`**：「那个版本里本来就没有这条路径」与 `MissingObject`「库该有却没有」
+是两件事，混起来就会把"用户打错路径"报成"磁盘坏了"。中间层不是目录也算"不存在"（git 同口径）。
+
+**这一轮用例抓到的两个 bug**：
+1. `resolve_rev` 取 hash 尾巴时用了**整个 pattern 的长度**当偏移（含用户输入的那段 hash），
+   于是"用完整 64 字符 hash 查自己的 commit"反而失败。gc/push 的输入形态正是完整 hash，
+   这个 bug 会直接堵死 M1。由 `rev_resolution_accepts_head_and_full_hash_but_rejects_garbage` 抓到。
+2. 测"同时间戳靠 hash 破平"时，我第一版拿**同一棵树**提了两次 ⇒ 内容寻址下那是同一个 commit，
+   断言在比一个空转的相等。改成两棵不同的树并加 `assert_ne!(a, b)` 才算真测到。
+   教训：**内容寻址库里"提两次"不等于"两个对象"，写测多对象的用例必须先证明它们真的不同。**
+
+**单位陷阱钉桩**：`fmt_ts` 收的是**纳秒**（`Commit.ts` 就是 ns），传秒进去不报错、安静落在
+1970 年。测试里我自己就写错过一次（把 epoch 秒当 ns 传），现在那条错误输入被钉成期望值。
+
+**这一轮暴露、但不在本轮修的两个缺口**（都要改磁盘格式或跨平台口径，需拍板）：
+1. `TreeEntry` 对符号链接只存**目标的 hash**，没存目标文本（`W` 里有 `symlink_target`，
+   建树时丢了）⇒ **历史无法重建符号链接**，`checkout` 会做出一个悬空链接。修它要动 tree 编码
+   = 所有已存 hash 作废，所以必须现在定：要么把目标文本放进条目，要么给它一个特殊 blob。
+2. Windows 侧 `mode` 恒 0（`mode_of` 非 unix 直接返回 0），所以 §8"只同步 owner 可执行位"
+   目前只有 Linux 那半边成立。`show` 的输出里 `mode 0` 就是这个，不是显示 bug。
+
 ### v0.3 → v0.4（2026-10-15，同日）
 
 依据用户指令："我不想用 rusqlite、libsqlite3-sys 这两个，我想用 `D:\develop\workspace\rust_workspace\storage-engines` 这个发出的 crate"。

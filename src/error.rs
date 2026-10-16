@@ -48,6 +48,11 @@ pub enum Error {
         known: u32,
         deleted_bytes: u64,
     },
+    /// 读命令（`show`/`restore`）要了一条不存在的路径。**与 `MissingObject` 是两件事**：
+    /// 后者是"库该有却没有"（损坏或还没同步到），这一条是"那个版本里本来就没有"。
+    /// 混在一起就会把"用户打错路径"报成"磁盘坏了"。
+    #[error("{path} 在 {rev} 这个版本里不存在")]
+    NoSuchPath { rev: String, path: String },
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。

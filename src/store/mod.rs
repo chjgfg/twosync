@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod cas;
+pub mod history;
 pub mod keys;
 pub mod object;
 pub mod worktree;

@@ -45,9 +45,27 @@ pub enum Cmd {
         /// 提交说明；省略时写占位串（与 git 一样不拦空说明，但会照样显示出来）
         #[arg(short, long)]
         msg: Option<String>,
-        /// 越过 FR-10 删除熔断（删除条目 > 已知的 20% 或 > 2 GiB）
+        /// 越过 FR-10 删除熔断（删除条目 > 已知的 20% 且 > 20 条，或 > 2 GiB）
         #[arg(long)]
         allow_mass_delete: bool,
+    },
+
+    /// 列出 head 可达的 commit，时间倒序（FR-4 的历史视图）
+    Log {
+        /// 最多列几条；0 = 全部。内存是 O(历史长度)，别在十万历史上用 0
+        #[arg(short = 'n', long, default_value_t = 20)]
+        max_count: usize,
+    },
+
+    /// 看一个版本：commit 本身、某一层的清单，或一个文件的块清单
+    ///
+    /// 只读，**不吐文件字节**（10 GB 文件会把终端淹掉）；要字节得等 `restore`。
+    Show {
+        /// `HEAD` / ref 名 / commit hash 的十六进制前缀（长度须为偶数）
+        #[arg(default_value = "HEAD")]
+        rev: String,
+        /// 仓库内路径（`/` 分隔）；省略 = 提交本身 + 根目录一层
+        path: Option<String>,
     },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch

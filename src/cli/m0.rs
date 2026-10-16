@@ -7,12 +7,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use storage_engines::KvEngine;
+
 use crate::allocstats;
 use crate::cli::Cli;
 use crate::cli::cmd::ProjectCmd;
 use crate::cli::registry::Registry;
 use crate::error::{Error, Result};
-use crate::store::{build, cas, keys, worktree};
+use crate::store::keys::{self, Hash, Kind, ProjectId};
+use crate::store::{build, cas, history, object, worktree};
 use crate::utils::{
     db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
 };
@@ -239,4 +242,160 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<(
     // 上限由 MAX_ENTRIES 显式兜着。这里打印是为了让那次权衡可见。
     println!("peak heap   = {:.1} MiB", peak as f64 / 1048576.0);
     Ok(())
+}
+
+/// `log`：从 head 集合出发按时间倒序列出 commit。
+///
+/// 起点是**集合**不是单个 ref（§4：多 head 是正常态）。真正的 union/裁决是 M3 的活，
+/// 这里只保证"两个 head 的历史都能列出来、共同祖先不重复"。
+pub fn log(cli: &Cli, max_count: usize) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    if heads.is_empty() {
+        println!("project {name} (id={pid:#010x}) 还没有 commit：先 scan，再 commit");
+        return Ok(());
+    }
+    println!(
+        "project   = {name}  (id={pid:#010x})  head = {}",
+        heads.len()
+    );
+    if heads.len() > 1 {
+        println!("注意：多 head。这里只把它们都当起点，union 与 collision 判定是 M3。");
+    }
+
+    let nodes = history::walk(&*db, pid, &heads, max_count)?;
+    for n in &nodes {
+        let s = &n.commit.stats;
+        println!(
+            "{}  {}  {:<7} +{:<5} ~{:<4} -{:<4} {}",
+            keys::short(&n.hash),
+            history::fmt_ts(n.commit.ts),
+            n.commit.peer,
+            s.add,
+            s.modify,
+            s.delete,
+            n.commit.msg,
+        );
+    }
+    if max_count > 0 && nodes.len() == max_count {
+        println!("（已达 {max_count} 条上限；--max-count 0 = 全部，但那是 O(历史长度) 内存）");
+    }
+    Ok(())
+}
+
+/// `show`：一个 commit 的元数据 + 某一层的清单，或一个文件的块清单。
+pub fn show(cli: &Cli, rev: &str, path: Option<&str>) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let heads = history::resolve_rev(&*db, pid, rev)?;
+    let hash = match heads.as_slice() {
+        [one] => *one,
+        many => {
+            return Err(Error::Codec(format!(
+                "{rev} 指向 {} 个 commit：多 head 还没做 union（M3），请指定具体 commit",
+                many.len()
+            )));
+        }
+    };
+    let c = object::read_commit(&*db, pid, &hash)?;
+
+    println!("project   = {name}  (id={pid:#010x})");
+    println!("commit    = {}", keys::hex(&hash));
+    println!("tree      = {}", keys::hex(&c.tree));
+    println!(
+        "parents   = {}",
+        if c.parents.is_empty() {
+            "（无，初始提交）".to_string()
+        } else {
+            c.parents
+                .iter()
+                .map(keys::short)
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    );
+    println!("ts        = {}  (epoch {} ns)", history::fmt_ts(c.ts), c.ts);
+    println!("peer      = {}", c.peer);
+    println!("msg       = {}", c.msg);
+    let s = &c.stats;
+    println!(
+        "stats     = +{} ~{} -{}  改名 {}   入 {:.1} MiB",
+        s.add,
+        s.modify,
+        s.delete,
+        s.rename,
+        s.bytes as f64 / 1048576.0
+    );
+
+    match path {
+        None => {
+            let entries = object::read_tree(&*db, pid, &c.tree)?;
+            println!("根目录 {} 条：", entries.len());
+            for e in &entries {
+                print_entry(e);
+            }
+        }
+        Some(p) => {
+            let e = history::resolve(&*db, pid, &c.tree, p)?.ok_or_else(|| Error::NoSuchPath {
+                rev: rev.to_string(),
+                path: p.to_string(),
+            })?;
+            print_entry(&e);
+            match e.kind {
+                Kind::File => print_blob(&*db, pid, &e.hash)?,
+                Kind::Symlink => println!(
+                    "  注意：清单里只有目标的 hash，没有目标文本 ⇒ 现在还**不能**从历史重建符号链接"
+                ),
+                Kind::Dir => {
+                    let kids = object::read_tree(&*db, pid, &e.hash)?;
+                    println!("目录 {} 条：", kids.len());
+                    for k in &kids {
+                        print_entry(k);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_blob(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<()> {
+    let blob = build::read_blob(db, pid, hash)?;
+    let zero = blob.blocks.iter().filter(|b| b.zero).count();
+    println!("  blob      = {}", keys::hex(&blob.hash));
+    println!(
+        "  block     = {} 块 × {} B（其中全零 {zero} 块不落盘）",
+        blob.blocks.len(),
+        blob.block_size
+    );
+    for (i, b) in blob.blocks.iter().take(4).enumerate() {
+        println!(
+            "  [{i}] {}  {} B{}",
+            keys::short(&b.hash),
+            b.size,
+            if b.zero { "  (zero)" } else { "" }
+        );
+    }
+    if blob.blocks.len() > 4 {
+        println!("  … 其余 {} 块省略", blob.blocks.len() - 4);
+    }
+    Ok(())
+}
+
+fn print_entry(e: &object::TreeEntry) {
+    let kind = match e.kind {
+        Kind::File => "文件",
+        Kind::Dir => "目录",
+        Kind::Symlink => "链接",
+    };
+    println!(
+        "  {kind}  {:>12} B  mode {:o}  {}  {}",
+        e.size,
+        e.mode,
+        keys::short(&e.hash),
+        e.name
+    );
 }
