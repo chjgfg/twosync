@@ -229,9 +229,63 @@ fn descend(
     }
     Ok(())
 }
-/// 把用户写的 rev 解析成 commit 集合：`HEAD`/ref 名 → 该 ref 的 head 集合；
-/// 否则按 **commit hash 的十六进制前缀**查（长度须为偶数，不唯一就报错）。
+/// 把用户写的 rev 解析成 commit 集合。语法三档：
+/// - `HEAD` / ref 名 → 该 ref 的 head 集合（多 head 就返回多个）
+/// - 十六进制前缀（偶数长度）→ 唯一匹配的那个 commit
+/// - 以上任一种后面接 `~N` 或 `^N`（省略 N 就是 1）→ 沿**第一亲代**回溯 N 步
+///
+/// 为什么只跟第一亲代：`~` 在 git 里就是这个语义；而"多亲时该走哪一条"是一个**决策**，
+/// 不是解析细节——那是 M3 union / `branch` 的活，这里不许偷偷替用户选一条链。
 pub fn resolve_rev(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<Hash>> {
+    let (base, steps) = split_rev(rev);
+    let heads = rev_base(db, pid, base)?;
+    if steps == 0 {
+        return Ok(heads);
+    }
+    if heads.len() != 1 {
+        return Err(Error::Codec(format!(
+            "`{rev}` 有歧义：{base} 指向 {} 个 head，`~N` 只能从一个 commit 出发",
+            heads.len()
+        )));
+    }
+    let mut cur = heads[0];
+    for step in 1..=steps {
+        let parents = object::parents_of(db, pid, &cur)?;
+        cur = *parents.first().ok_or_else(|| Error::MissingObject {
+            hash: format!("{}（回溯到第 {step} 步时没有亲代）", keys::short(&cur)),
+            kind: "commit".to_string(),
+        })?;
+    }
+    Ok(vec![cur])
+}
+
+/// 拆出 `~N` / `^N` 后缀。两种写法语义相同（本项目不需要"第 N 亲"那套语法），所以链式
+/// 后缀就是**步数相加**：`HEAD~2^` 与 `HEAD~3` 是同一个 commit。一次 `rfind` 只能剥掉
+/// 一个后缀，链式写法会剩下个 `HEAD~2` 当基座去查 hash ⇒ 必须循环剥。
+///
+/// 后缀不是数字、或者标记出现在开头（`~2` 这种没有基座），就整串当基座交给下游报错——
+/// 报"看不懂这个 rev"比替用户猜一个数诚实。
+fn split_rev(rev: &str) -> (&str, usize) {
+    let mut steps = 0usize;
+    let mut found = false;
+    let mut base = rev;
+    while let Some(i) = base.rfind(['~', '^']).filter(|i| *i > 0) {
+        let n = match &base[i + 1..] {
+            "" => 1,
+            other => match other.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => break,
+            },
+        };
+        steps += n;
+        found = true; // `HEAD~0` 是合法写法：步数是 0，但后缀**确实被认出来了**
+        base = &base[..i];
+    }
+    if found { (base, steps) } else { (rev, 0) }
+}
+
+/// 不含回溯后缀的那部分怎么解析：ref 名或十六进制前缀。
+fn rev_base(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<Hash>> {
     if rev.eq_ignore_ascii_case("head") || rev == build::MAIN {
         return build::ref_heads(db, pid, build::MAIN);
     }
@@ -239,7 +293,7 @@ pub fn resolve_rev(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<H
         Some(b) => b,
         None => {
             return Err(Error::Codec(format!(
-                "rev {rev:?} 看不懂：既不是 HEAD/{}，也不是十六进制 commit 前缀",
+                "rev {rev:?} 看不懂：既不是 HEAD/{}，也不是十六进制 commit 前缀（可接 `~N`）",
                 build::MAIN
             )));
         }

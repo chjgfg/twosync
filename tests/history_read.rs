@@ -285,3 +285,72 @@ fn walk_tree_on_an_empty_version_yields_nothing() {
     .unwrap();
     assert_eq!(n, 0);
 }
+
+/// `HEAD~N` 语法：沿第一亲代回溯。`~0` 必须原样返回，越界要报"到第几步没亲代了"，
+/// 而不是安静地停在根 commit 上——那会让 `checkout --at HEAD~99` 看起来"成功"。
+#[test]
+fn rev_supports_first_parent_walk() {
+    let (_site, engine) = db();
+    let tree = object::put_tree(&*engine, PID, &[file("a", 1, 1)]).unwrap();
+    let c1 = commit(&*engine, PID, &[], &tree, 100);
+    let c2 = commit(&*engine, PID, &[c1], &tree, 200);
+    let c3 = commit(&*engine, PID, &[c2], &tree, 300);
+    build::set_ref(&*engine, PID, build::MAIN, &[c3]).unwrap();
+
+    for (rev, want) in [
+        ("HEAD", vec![c3]),
+        ("HEAD~0", vec![c3]),
+        ("HEAD~1", vec![c2]),
+        ("HEAD~2", vec![c1]),
+        ("HEAD^", vec![c2]),
+        ("HEAD~1^", vec![c1]),
+        ("main~1", vec![c2]),
+        // 两种写法在这里同义 ⇒ 链式后缀是步数相加，不是"第 N 亲"。
+        ("HEAD~1~1", vec![c1]),
+    ] {
+        assert_eq!(
+            history::resolve_rev(&*engine, PID, rev).unwrap(),
+            want,
+            "{rev} 解析错了"
+        );
+    }
+    // 越界：c1 是根，没有亲代。
+    let err = history::resolve_rev(&*engine, PID, "HEAD~9").unwrap_err();
+    assert!(
+        matches!(err, Error::MissingObject { .. }),
+        "越界该报缺亲代，实际 {err}"
+    );
+    // c3 →(1) c2 →(2) c1 →(3) 没了：断在第 3 步，报出来要能数得对。
+    assert!(
+        err.to_string().contains("第 3 步"),
+        "要说清断在哪一步：{err}"
+    );
+    // 后缀不是数字 ⇒ 整串当基座，报"看不懂"，不替用户猜。
+    assert!(matches!(
+        history::resolve_rev(&*engine, PID, "HEAD~x"),
+        Err(Error::Codec(_))
+    ));
+}
+
+/// 多 head 时 `~N` 有歧义：**必须报错**，不许挑一个 head 往回走。
+#[test]
+fn tilde_on_a_multi_head_ref_is_ambiguous() {
+    let (_site, engine) = db();
+    let tree = object::put_tree(&*engine, PID, &[file("a", 1, 1)]).unwrap();
+    let base = commit(&*engine, PID, &[], &tree, 100);
+    let left = commit(&*engine, PID, &[base], &tree, 200);
+    let right = commit(&*engine, PID, &[base], &tree, 300);
+    build::set_ref(&*engine, PID, build::MAIN, &[left, right]).unwrap();
+
+    let err = history::resolve_rev(&*engine, PID, "HEAD~1").unwrap_err();
+    assert!(matches!(err, Error::Codec(_)), "实际 {err}");
+    assert!(
+        err.to_string().contains("2 个 head"),
+        "得说清歧义在哪：{err}"
+    );
+    // 但指定具体 commit 就照走：歧义只在"从哪个 head 出发"这一层。
+    assert_eq!(
+        history::resolve_rev(&*engine, PID, &format!("{}~1", keys::hex(&right))).unwrap(),
+        vec![base]
+    );
+}
