@@ -20,6 +20,14 @@ pub enum Error {
     WriteConflict(String),
     #[error("编码/解码失败：{0}")]
     Codec(String),
+    /// CAS 的字节与其 hash 对不上 = **磁盘损坏**，不是"块缺失"。§9.4.7：损坏必须报错，
+    /// 不许静默重传——那会把数据损坏伪装成一次普通同步。
+    #[error("块校验失败 {hash} @ {path}: {why}")]
+    CorruptBlock {
+        hash: String,
+        path: std::path::PathBuf,
+        why: String,
+    },
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。
