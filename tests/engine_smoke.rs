@@ -2,16 +2,19 @@
 //!
 //! 这些用例的存在理由不是"覆盖率"，而是 §9.6 那六条约束**照 0.4.0 的行为写进文档**了；
 //! 引擎改版时这里是第一个变红的地方。
+//!
+//! 注意：`open_store` 必须从 `twosync::utils` 引，不许在测试里另写一份——之前它住在测试文件里，
+//! 结果 FR-21 自检闸在产品代码里被 `let _ =` 丢掉，用例照样绿。
 
 use std::path::Path;
 
 use storage_engines::engine::{EngineKind, KvEngine, open_engine};
-use twosync::{StoreError, open_store};
+use twosync::error::Error;
+use twosync::utils::open_store;
 
 fn open() -> (Box<dyn KvEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db =
-        open_engine(EngineKind::LsmTree, Some(Path::new(dir.path()))).expect("open lsm_tree");
+    let db = open_engine(EngineKind::LsmTree, Some(Path::new(dir.path()))).expect("open lsm_tree");
     (db, dir)
 }
 
@@ -19,8 +22,14 @@ fn open() -> (Box<dyn KvEngine>, tempfile::TempDir) {
 fn engine_opens_and_roundtrips() {
     let (db, _dir) = open();
     let tx = db.begin();
-    assert!(tx.set(b"C\x00\x00\x00\x01hello", b"world".to_vec()), "set 被拒 = 写冲突");
-    assert_eq!(tx.get(b"C\x00\x00\x00\x01hello").as_deref(), Some(&b"world"[..]));
+    assert!(
+        tx.set(b"C\x00\x00\x00\x01hello", b"world".to_vec()),
+        "set 被拒 = 写冲突"
+    );
+    assert_eq!(
+        tx.get(b"C\x00\x00\x00\x01hello").as_deref(),
+        Some(&b"world"[..])
+    );
     tx.commit();
 }
 
@@ -32,14 +41,20 @@ fn prefix_scan_is_materialized_so_windows_are_required() {
     {
         let tx = db.begin();
         for i in 0..N {
-            assert!(tx.set(format!("W\x00\x00\x00\x01p{i:05}").as_bytes(), vec![0u8; 32]));
+            assert!(tx.set(
+                format!("W\x00\x00\x00\x01p{i:05}").as_bytes(),
+                vec![0u8; 32]
+            ));
         }
         tx.commit();
     }
     let tx = db.begin();
     let hit = tx.prefix_scan(b"W\x00\x00\x00\x01");
     assert_eq!(hit.len(), N as usize);
-    assert_eq!(hit.first().unwrap().key, format!("W\x00\x00\x00\x01p00000").into_bytes());
+    assert_eq!(
+        hit.first().unwrap().key,
+        "W\x00\x00\x00\x01p00000".as_bytes().to_vec()
+    );
     tx.commit();
 }
 
@@ -74,7 +89,7 @@ fn startup_gate_rejects_engines_that_cannot_prove_durability() {
             .err()
             .unwrap_or_else(|| panic!("{kind} 竟通过了 FR-21 自检"));
         match err {
-            StoreError::DurabilityGate { engine, gaps } => {
+            Error::DurabilityGate { engine, gaps } => {
                 assert_eq!(engine, kind.as_str());
                 assert!(!gaps.is_empty(), "缺口必须被说清楚");
             }

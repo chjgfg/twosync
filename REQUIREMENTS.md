@@ -255,7 +255,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
 | **M1 单向推送** | SSH 通道 + `HeadsState/WantHave/PushBatch/PushCommit/UnionAccept` + **多 project 复用一条连接** + FR-10 熔断 + FR-9 配额 GC + FR-13 原子写 | 本地删 30% 文件 → 对端拒绝该 commit 并提示；10 GB 文件改 1 MB → 传输 ≤ 8 MB；crash injection 通过；§10.4 差分表首版数字；20 project 一轮只 1 次认证 |
 | **M2 常驻（仍 1+1）** | watch + debounce + 周期兜底 → 自动 commit + 自动 push/pull；**拨号方向对称**（任一端可发起，§16.3）；断点续传；限速（含 GC 与 vacuum，总预算不叠加）；`status` 指标含引擎健康度；systemd/计划任务 | 拔网重连自动续传；稳态 CPU ≤ 10% 单核实测；**72 h 内 `max_chain` 不单调上升**；Windows 休眠后由对端拉平且不误提交 |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证） |
-| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与引擎矩阵数据入库；指标写进 README；依赖切到 rev（§9.7） |
+| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7） |
 | **M5 多端（暂不承诺）** | 真 3+ peer：部分连通路由、NAT 穿透或自建中继、commit 签名 | 需先重开范围评审；**不在 v1 交付路径上** |
 
 M0–M1 **不需要**回答 §14 任何问题就能开工。
