@@ -84,7 +84,7 @@ Win10 上配好"哪些项目要同步"，Ubuntu 那端接手同一个项目、�
 | FR-7 | `plan` 输出本次会提交什么 + union 判定结果 + 会碰撞的路径，**默认不执行**；`apply` 才执行 | 任何破坏性动作都有 dry-run 前置 |
 | FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测 |
 | FR-9 | **有界历史**：CAS 配额默认 ≤ root 体积 20%（**站点级全局配额**，非每项目），超出时按"最老且不可达优先 / 同 commit 整批淘汰"回收，**不得**删掉仍被保留 head 可达的块。淘汰顺序与保留意图（版本数 N / 天数 D）可配 | §10 不变量 (d) |
-| FR-10 | **删除熔断**（接收侧）：传入 commit 的删除条目数 > 已知条目的 20% 或删除字节 > 2 GB → 拒绝该 commit 进 head 集合、退出码非 0，需 `--allow-mass-delete`。理由是防客户端 bug 把误 `rm -rf` 变成合法历史，不是防并发 | 清空本地 root 后 sync，对端不动并报警 |
+| FR-10 | **删除熔断**：commit 的删除条目数 > max(已知条目的 20%, **20 条**) 或删除字节 > 2 GB → 拒绝该 commit 进 head 集合、退出码非 0，需 `--allow-mass-delete`。理由是防客户端 bug 把误 `rm -rf` 变成合法历史，不是防并发。**绝对下限是本版加的**：纯 20% 在小项目上不可用（2 个文件删 1 个就是 50%，那个仓库从此提不了交），而熔断要拦的是规模不是比例。本地 `commit` 与接收侧**都过这道闸** | 清空本地 root 后 sync，对端不动并报警；100 条里删 30 条 → 本地 commit 也拒 |
 | FR-11 | **多 head 与碰撞处理**（§7）：默认 union；出路 = `--take-local` / `--take-remote` / `--keep-both`（仅无碰撞时结构合并）/ 交给 git | 表格逐行有单测 |
 | FR-12 | 排除规则用 gitignore 语义（`ignore` crate）；`**/.git/`、`.twosync/` 为内置强制排除（配置取消即报错） | 排除 .git 后不会污染仓库 |
 | FR-13 | 崩溃一致性：块写入 → `fsync` → 才允许被清单引用；head 集合更新是最后一步且原子；op 级 journal，重启后重放或丢弃半成品。**引擎事务的持久化点由 `fsync_on_commit` 提供，但 CAS 文件的 fsync 顺序仍归 twosync 自己保证** | §10 crash injection |
@@ -174,8 +174,8 @@ v0.1 那张 16 行"相对 base 动作为 A/B"的裁决表**整张作废**（它�
 | `B` | `B\|p\|blob_hash` | 块清单：`[block_hash]` + `is_zero` 位图 | 文件内容重建 |
 | `K` | `K\|p\|block_hash` | 块元数据：size, chunk_param, refcnt, last_access_ts, pinned | `want/have` 反查、去重统计 |
 | `k` | `k\|p\|refcnt_be\|block_hash` | 空（存在即索引） | **按 refcnt 排序的二级索引**：GC 找 0 是 `prefix_scan(k\|p\|\x00…)`，不是全表扫 |
-| `W` | `W\|p\|path` | worktree 状态：kind, blob_hash, size, mtime_hint_ns, mode, symlink_target, scanned_at | 脏判定；大小写唯一性检查 |
-| `H` | `H\|p\|ref_name\|commit_hash` | `is_head` 标记 | head 集合 = `prefix_scan(H\|p\|main)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因） |
+| `W` | `W\|p\|path` | worktree 状态：kind, blob_hash, size, mtime_hint_ns, mode, symlink_target, scanned_at | 脏判定；大小写唯一性检查；**`scanned_at` 兼任"本轮看见过"的存活性标记**（见 §8 与 §17 补记） |
+| `H` | `H\|p\|ref_name\|commit_hash` | 空（存在即 head）。**原设计的 `is_head` 标记已废弃**：head 身份已经在键里，值再存一份就是两个真值 | head 集合 = `prefix_scan(H\|p\|main\|\x00)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因） |
 | `A` | `A\|p\|path_folded` | canonical path | 大小写折叠唯一映射（§8） |
 | `S` | `S\|p\|session_id_be` | 会话统计 | `status` |
 | `P` | `P\|peer_id`（无 project 前缀，站点级） | TOFU 指纹 + 拨号偏好 | §9.5 |
@@ -186,7 +186,7 @@ v0.1 那张 16 行"相对 base 动作为 A/B"的裁决表**整张作废**（它�
 
 ### 9.3 GC 与保留（配额的可实现路径）
 
-保留集 = **所有 `is_head` commit 的可达闭包** ∪ 按 FR-9 策略选出的更老 commit（天数 D / 版本数 N）∪ 显式 `pinned`。淘汰 = 删除整批 commit 的清单行 → `refcnt--`（**用 `KvTxn::decr`，不许 read-modify-write**，那是两个事务、中间崩了就漏减）→ 从 `k` 索引取 `refcnt==0` → 落 pending-delete 列表 → 异步 `unlink`（**不许在 decrement 现场内联删除**，否则 kill 在中间会让清单引用已消失的块）。删除动作全程挂 FR-15 令牌桶。共享 CAS 意味着 refcnt 跨 project：`project remove` 只能 decrement，不能假设块属于它。
+保留集 = **所有 head commit 的可达闭包** ∪ 按 FR-9 策略选出的更老 commit（天数 D / 版本数 N）∪ 显式 `pinned`。淘汰 = 删除整批 commit 的清单行 → `refcnt--`（**用 `KvTxn::decr`，不许 read-modify-write**，那是两个事务、中间崩了就漏减）→ 从 `k` 索引取 `refcnt==0` → 落 pending-delete 列表 → 异步 `unlink`（**不许在 decrement 现场内联删除**，否则 kill 在中间会让清单引用已消失的块）。删除动作全程挂 FR-15 令牌桶。共享 CAS 意味着 refcnt 跨 project：`project remove` 只能 decrement，不能假设块属于它。
 
 ### 9.4 安全
 
@@ -392,6 +392,47 @@ hash**——第一块恰好相等所以全套用例都绿，直到加进"同一�
 **同步修订**：§6 引言新增"性能数字必须注明 profile + 硬件 + 数据形状"的规矩；
 NFR-1 / FR-3 / §9.6.1 / §10.1(f) 四处的"峰值 ≤ 4 MB"统一改为"≤ 8 MiB 且与块大小、
 文件总数无关"——原来的 4 MB 与 FR-5 的 4 MiB 块自相矛盾，两遍流式才让两者同时成立。
+
+### v0.4 补记二（2026-10-16 深夜，`commit` 流水线落地）
+
+**新增一条扫描↔commit 的接口规矩（§8 / §9.2 的 `W` 行已同步）**：`W` 表只增不删（§8 禁止扫描判删除），
+所以光读 `W` **永远看不出谁被删了**。现在扫描给**本轮看见的每一行**盖 `scanned_at`（含内容没变、
+只走粗筛命中的，也含读失败 deferred 的——后者不续期就会把 §7.2 伪装成删除），`commit` 只认
+`max(scanned_at)` 那一批，其余即删除。代价是实测出来的：稳态扫描也要重写全部行 ⇒
+`doctor` 的 `rows_above_one` = **2002**（2004 条目的库，每键多一个版本行）。回收靠引擎 vacuum
+（`active_txns=0` 时才能跑），所以 **`rows_above_one` 从"诊断项"升格为"必须盯的量表"**。
+
+**FR-10 加了绝对下限 20 条**（口径变更，见 §2 该行）：纯 20% 会让"2 个文件删 1 个"这种日常操作
+永久卡死小仓库。用例 `single_delete_in_a_small_project_is_not_mass_delete` 钉的就是这一条。
+本地 `commit` 与接收侧过同一道闸，且闸在 `put_commit` 之前、diff 之后——删除只有一个定义。
+
+**这一轮被新用例抓到的真 bug（本项目第一个"只有查树本身才能发现"的）**：`collect_children` 用
+`split_opt` 取父目录，而**顶层目录名里没有 `/`** ⇒ 返回 `None` 被 `continue`，于是整个顶层目录
+连同它下面的一切**静默消失**在历史里。所有其他信号都是正常的：块照落、`entries` 照是 4、
+`changes.add` 只是变小而没人报错。改用 `split`（无 `/` ⇒ 父为 `""`）后由
+`nested_directories_survive_into_history` 钉住。教训与 `copy_out` 那条同源：**只要有一层"跳过"
+是静默的，用例就必须直接查那一层的产物。**
+
+**实测（release，Windows 10 开发机，2004 条目 / 8.0 MiB，LSM）**：
+
+| 操作 | 耗时 | 备注 |
+|---|---|---|
+| `scan` 首轮（2004 条全 hash） | 0.392 s | 20.4 MiB/s，peak heap 2.5 MiB |
+| `commit` 首轮（2002 blob / 2003 块） | **12.075 s** | peak heap 5.3 MiB |
+| `commit` 无改动 | 0.732 s | 返回"无改动"，不产生空提交、head 不动 |
+| `commit` 改 1 + 删 3 | 0.733 s | `+0 ~1 -3`，`entries 2001 / 库里 W 行 2004` |
+
+固定开销 ≈ 0.73 s（分页快照 + 建树 + diff），首轮多出的 **11.3 s 花在"每块一次 fsync+rename"
+与"每块三次 KV 写（`B`/`K`/`k`）"这两处**，**还没拆开**——下一步归因先分这两块，再决定要不要
+像 git 的 packfile 那样把小文件打包。按 §6 的规矩：这两个候选在给出数字之前不许当结论写。
+
+**这一轮明确没做的三件**（不是遗漏，是排序）：
+1. `MAX_ENTRIES = 200_000` 是**权宜**：条目表是 O(文件数)，2004 条就 5.3 MiB ⇒ 20 万条顶穿 NFR-1。
+   超限现在是**报错拒绝**而不是 OOM（NFR-3 红线：OOM 会拖下同机的策略进程）。
+   解法是流式栈式聚合，届时这个上限应该消失而不是调大。
+2. `restore` / `checkout` 还没有命令 ⇒ "历史能取回字节"目前只有用例
+   `committed_bytes_roundtrip_through_cas` 证明，**CLI 还做不到**。
+3. `stats.rename` 恒 0（改名按 add+delete 记），FR-17 的改名检测没做。
 
 ### v0.3 → v0.4（2026-10-15，同日）
 

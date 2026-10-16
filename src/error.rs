@@ -32,6 +32,22 @@ pub enum Error {
         path: std::path::PathBuf,
         why: String,
     },
+    /// 扫描之后、落盘之前源文件又被人改了 ⇒ 这一条本轮不提交。
+    /// **绝不静默用新内容**：那会把一个没被扫描证实过的版本写进历史。
+    #[error("工作树在扫描之后被改动：{path}（本轮跳过，等下一轮扫描）")]
+    StaleScan { path: String },
+    /// 条目表目前是 O(文件数) 的权宜实现，所以超上限直接**拒绝**而不是 OOM——
+    /// OOM 会把同机的策略进程一起拖下水，那是 NFR-3 的红线。
+    #[error("条目数 {n} 超过上限 {max}：请改用流式聚合，或把项目拆开同步")]
+    TooManyEntries { n: usize, max: usize },
+    /// FR-10 删除熔断。防的是"客户端 bug 把误 `rm -rf` 变成合法历史"，与谁是发起方无关。
+    #[error("删除熔断：本次将删 {deleted} 条 / {} MiB（已知 {known} 条）。确认无误再加 --allow-mass-delete",
+        deleted_bytes / 1048576)]
+    MassDelete {
+        deleted: u32,
+        known: u32,
+        deleted_bytes: u64,
+    },
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。

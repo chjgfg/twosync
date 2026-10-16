@@ -6,6 +6,15 @@
 //! - 读不了的文件（被占用/权限）标 deferred 跳过，**不许当 missing**（§7.2）。
 //! - 一批一个事务：事务持有期间引擎 vacuum 整轮跳过（§9.6.2），所以不许"一次大事务扫全树"。
 //!
+//! # 「看见过」这件事怎么留下证据
+//!
+//! 前两条规则合起来有个后果：`W` 表只增不删，光看它永远看不出谁被删了。所以扫描给
+//! **每一轮看见的行**盖本轮时间戳 `scanned_at`，`commit` 只认**最新一轮**的行，其余当作已删除
+//! （见 `build::snapshot`）。粗筛未命中的行也要续期（省的是 blake3，不是那次 `set`）；读不了
+//! 的行同样续期，否则 §7.2 的 deferred 会伪装成删除。
+//! 代价：稳态轮也要重写全部行 ⇒ 每个键多一个版本行。回收靠引擎 vacuum，`doctor` 的
+//! `rows_above_one` 是这条的量表；一轮中途被打断（只有半轮带新 epoch）由 FR-10 熔断兜住。
+//!
 //! # 手工验证（`cargo test` 之外，跑给人看的那一遍）
 //!
 //! ```text
@@ -92,6 +101,15 @@ pub fn scan(
     let now = now_ns();
     let mut tx = db.begin();
     for found in walker(root) {
+        // 攒满一窗就落盘并换事务。放在循环**开头**，三个 push 点就共用这一处；
+        // 代价是 pending 最多 batch+1 条，不是 batch 条。
+        if pending.len() >= batch {
+            flush(&mut *tx, &mut pending)?;
+            tx.commit();
+            drop(tx);
+            tx = db.begin(); // 一事务一批，别让它跨整棵树
+        }
+
         let Ok(entry) = found else {
             rep.deferred += 1;
             continue;
@@ -110,9 +128,15 @@ pub fn scan(
         // size + mtime 都没变 ⇒ 不重算 hash（§8 允许粗筛，正确性仍由 hash 兜底）。
         // let 链（edition 2024）：比嵌套 if 少一层缩进，也不会触发 collapsible_if。
         let size = logical_size(&md, kind);
-        if !force && let Some(prev) = unchanged(&*tx, &key, kind, size, mtime_ns) {
+        if !force
+            && let Some(mut prev) = prev_entry(&*tx, &key)
+                .filter(|p| p.kind == kind && p.size == size && p.mtime_ns == mtime_ns)
+        {
             rep.skipped += 1;
             rep.bytes += prev.size;
+            // 内容没变，但「本轮看见了」必须留痕，否则下一轮会被 `commit` 判成删除。
+            prev.scanned_at = now;
+            pending.push((key, encode(&prev)?));
             continue;
         }
 
@@ -121,6 +145,7 @@ pub fn scan(
             Err(_) => {
                 // 打不开/读失败 = deferred，**不是** missing，更不是删除（§8 第一杀手）。
                 rep.deferred += 1;
+                refresh_liveness(&*tx, &key, now, &mut pending);
                 continue;
             }
         };
@@ -140,16 +165,7 @@ pub fn scan(
             symlink_target,
             scanned_at: now,
         };
-        let encoded =
-            keys::wrap(postcard::to_allocvec(&value).map_err(|e| Error::Codec(e.to_string()))?);
-        pending.push((key, encoded));
-
-        if pending.len() >= batch {
-            flush(&mut *tx, &mut pending)?;
-            tx.commit();
-            drop(tx);
-            tx = db.begin(); // 一事务一批，别让它跨整棵树
-        }
+        pending.push((key, encode(&value)?));
     }
     if !pending.is_empty() {
         flush(&mut *tx, &mut pending)?;
@@ -225,18 +241,37 @@ fn mode_of(md: &Metadata) -> u32 {
     }
 }
 
-fn unchanged(
+/// 读一条已有的 `W` 记录。读不到/标签不对/解不开一律返回 `None` = 当新条目处理：
+/// 这三种情况下库里那行都不是可信的旧状态，重算一次 hash 是安全的。
+fn prev_entry(tx: &dyn storage_engines::KvTxn, key: &[u8]) -> Option<WtEntry> {
+    let raw = tx.get(key)?;
+    let bytes = keys::strip(&raw).ok()?;
+    postcard::from_bytes(bytes).ok()
+}
+
+fn encode(e: &WtEntry) -> Result<Vec<u8>> {
+    Ok(keys::wrap(
+        postcard::to_allocvec(e).map_err(|err| Error::Codec(err.to_string()))?,
+    ))
+}
+
+/// 「本轮看见了，但内容没算出来」的行：把旧记录的 `scanned_at` 续期后原样写回。
+///
+/// 不返回错误是刻意的：这一条读不了已经记在 `deferred` 上了，续期失败不该让整个扫描停。
+/// 真失败的结果是那一行在下一次 `commit` 里显示成删除，而 FR-10 的熔断正是给这种情况准备的。
+fn refresh_liveness(
     tx: &dyn storage_engines::KvTxn,
     key: &[u8],
-    kind: Kind,
-    len: u64,
-    mtime_ns: i64,
-) -> Option<WtEntry> {
-    let raw = tx.get(key)?;
-    let prev: WtEntry = keys::strip(&raw)
-        .ok()
-        .and_then(|b| postcard::from_bytes(b).ok())?;
-    (prev.kind == kind && prev.size == len && prev.mtime_ns == mtime_ns).then_some(prev)
+    now: i64,
+    pending: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    let Some(mut prev) = prev_entry(tx, key) else {
+        return;
+    };
+    prev.scanned_at = now;
+    if let Ok(encoded) = encode(&prev) {
+        pending.push((key.to_vec(), encoded));
+    }
 }
 
 /// 流式 hash：常数内存。返回 (内容 hash, 字节数, symlink 目标)。
@@ -272,7 +307,9 @@ fn flush(tx: &mut dyn storage_engines::KvTxn, pending: &mut Vec<(Vec<u8>, Vec<u8
     Ok(())
 }
 
-fn now_ns() -> i64 {
+/// 本轮的"现在"。**一次扫描只取一次**：同一个 epoch 是 `commit` 判删除的依据，
+/// 中途重新取会让一批行带着两个不同的时间戳。命令层也用它，所以只有这一处定义。
+pub fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)

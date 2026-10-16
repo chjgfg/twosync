@@ -36,6 +36,19 @@ pub enum Cmd {
         #[arg(long, default_value_t = 2000)]
         batch: usize,
     },
+
+    /// 把上一次 `scan` 的结果固化成一个 commit：落块 → 建树 → 比对 → 移 head（FR-4）
+    ///
+    /// 吃的是 `W` 表，**不重新扫描**：`scan` 与 `commit` 分开是刻意的，扫描负责"看见"，
+    /// commit 负责"成为历史"，中间那段时间工作树又变了的话会撞 `StaleScan` 而不是静默入库。
+    Commit {
+        /// 提交说明；省略时写占位串（与 git 一样不拦空说明，但会照样显示出来）
+        #[arg(short, long)]
+        msg: Option<String>,
+        /// 越过 FR-10 删除熔断（删除条目 > 已知的 20% 或 > 2 GiB）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync

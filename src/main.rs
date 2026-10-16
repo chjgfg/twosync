@@ -28,5 +28,9 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Cmd::Doctor => m0::doctor(cli),
         Cmd::Project(cmd) => m0::project(cli, cmd),
         Cmd::Scan { force, batch } => m0::scan(cli, *force, *batch),
+        Cmd::Commit {
+            msg,
+            allow_mass_delete,
+        } => m0::commit(cli, msg.as_deref(), *allow_mass_delete),
     }
 }
