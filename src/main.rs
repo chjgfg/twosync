@@ -18,12 +18,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// `Cmd: Copy`，所以这里能一边按值取 `cli.cmd`、一边把 `&cli` 传下去。
+/// 必须 `match &cli.cmd`：`Cmd` 装了带 `String`/`PathBuf` 的变体（`Project`）之后就不再是
+/// `Copy`，按值匹配会报 E0507「cannot move out of ... behind a shared reference」。
 /// 加一条命令要动三处：`cmd.rs` 的枚举变体 + 批次文件里的函数 + 这里一个分支。
 fn dispatch(cli: &Cli) -> Result<()> {
-    match cli.cmd {
+    match &cli.cmd {
         // ── M0 ──
         Cmd::Init => m0::init(cli),
-        Cmd::Doctor { engine } => m0::doctor(cli, engine),
+        Cmd::Doctor { engine } => m0::doctor(cli, *engine),
+        Cmd::Project(cmd) => m0::project(cli, cmd),
     }
 }

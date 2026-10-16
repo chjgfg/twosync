@@ -11,6 +11,9 @@ pub enum Error {
     /// FR-21：画像三要件不全 = 拒绝启动。缺口必须逐项列出来。
     #[error("引擎 {engine} 未通过启动自检，缺口：{gaps}")]
     DurabilityGate { engine: String, gaps: String },
+    /// 项目注册表的问题：重名、未知项目、文件损坏。消息里必须带路径或项目名。
+    #[error("注册表：{0}")]
+    Registry(String),
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。

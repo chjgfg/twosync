@@ -8,7 +8,10 @@ use std::fs;
 use storage_engines::EngineKind;
 
 use crate::cli::Cli;
+use crate::cli::cmd::ProjectCmd;
+use crate::cli::registry::Registry;
 use crate::error::Result;
+use crate::store::keys;
 use crate::utils::{
     db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
 };
@@ -60,5 +63,48 @@ pub fn doctor(cli: &Cli, engine: EngineKind) -> Result<()> {
     println!("max_chain   = {}", h.max_chain);
     println!("rows_above  = {}", h.rows_above_one);
     println!("active_txns = {}", h.active_txns);
+    Ok(())
+}
+
+/// `project add|list|use`。注册表是所有键的前置：`project_id` 由名字派生。
+pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
+    let mut reg = Registry::load(&cli.root)?;
+    match cmd {
+        ProjectCmd::Add { name, path } => {
+            // 存成 `/` 分隔的相对路径（§8）；不给 --path 就按 root/<name> 约定放。
+            let rel = match path {
+                Some(p) => p.to_string_lossy().replace('\\', "/"),
+                None => name.clone(),
+            };
+            reg.add(name, &rel)?;
+            reg.save(&cli.root)?;
+            println!(
+                "已注册 {name} → {rel}  (id={:#010x})",
+                keys::project_id(name)
+            );
+        }
+        ProjectCmd::List => {
+            if reg.projects.is_empty() {
+                println!("（还没有项目：twosync project add <name>）");
+            }
+            for (name, p) in &reg.projects {
+                let mark = if reg.current.as_deref() == Some(name.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                println!(
+                    "{mark} {name:20} id={:#010x}  {}",
+                    keys::project_id(name),
+                    p.path
+                );
+            }
+        }
+        ProjectCmd::Use { name } => {
+            reg.select(name)?;
+            reg.save(&cli.root)?;
+            println!("当前项目 = {name}");
+        }
+    }
     Ok(())
 }

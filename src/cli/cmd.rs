@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Subcommand;
 use storage_engines::EngineKind;
 
@@ -10,7 +12,7 @@ pub fn engine_parser(s: &str) -> Result<EngineKind, String> {
 /// 全部子命令的清单。加一条命令 = 这里加一个变体 + 对应批次文件加一个函数 + `main` 加一个分支。
 ///
 /// 只加**已经能实现**的变体：变体进了枚举，`main` 的 match 就必须接得住，别提前铺空壳。
-#[derive(Subcommand, Clone, Copy)]
+#[derive(Subcommand, Clone)]
 pub enum Cmd {
     // ── M0 ─────────────────────────────────────────────────────────
     /// 建站点目录布局（幂等，§13）
@@ -21,8 +23,26 @@ pub enum Cmd {
         #[arg(long, default_value_t = EngineKind::LsmTree, value_parser = engine_parser)]
         engine: EngineKind,
     },
+
+    /// 项目注册表（§16.1）
+    #[command(subcommand)]
+    Project(ProjectCmd),
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync
     // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ProjectCmd {
+    /// 注册一个项目；省略 --path 时用 root/<name>
+    Add {
+        name: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// 列出全部项目，`*` 标当前
+    List,
+    /// 切换后续命令默认作用的项目
+    Use { name: String },
 }
