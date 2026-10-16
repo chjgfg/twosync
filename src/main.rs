@@ -34,5 +34,11 @@ fn dispatch(cli: &Cli) -> Result<()> {
         } => m0::commit(cli, msg.as_deref(), *allow_mass_delete),
         Cmd::Log { max_count } => m0::log(cli, *max_count),
         Cmd::Show { rev, path } => m0::show(cli, rev, path.as_deref()),
+        Cmd::Restore {
+            at,
+            path,
+            to,
+            force,
+        } => m0::restore(cli, at, path, to.as_deref(), *force),
     }
 }

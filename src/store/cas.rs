@@ -42,6 +42,15 @@ const ZERO_HASH: Hash = [0u8; 32];
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// 临时文件名里的 pid：两个进程不会撞同一个 tmp；同一进程内再叠一个自增序号。
+fn tmp_tag() -> String {
+    format!(
+        "{}.{:08x}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRef {
     pub hash: Hash,
@@ -102,6 +111,12 @@ impl Cas {
 
     pub fn contains(&self, hash: &Hash) -> bool {
         *hash == ZERO_HASH || self.dir.join(Self::path_of(hash)).exists()
+    }
+
+    /// 在块仓目录里占一个临时文件名。**同一目录**才有原子 `rename` 的保证，
+    /// 所以外部（`restore` 读符号链接目标）要写临时文件也用它，不许自己拼名字。
+    pub fn temp_for(&self, tag: &str) -> PathBuf {
+        self.dir.join(format!(".tmp.{}.{tag}", tmp_tag()))
     }
 
     /// 第一遍：流式切块 + 算 hash，**不写任何字节**。
@@ -217,8 +232,70 @@ impl Cas {
         Ok(n)
     }
 
-    /// 把一个块从源文件的 `offset` 拷进库：tmp → fsync → 自证 hash → rename。
-    fn copy_block(&self, src: &mut File, offset: u64, b: &BlockRef) -> Result<()> {
+    /// 把一小段字节当 blob 入库。**只用于路径级别的小对象**——现在唯一的用户是符号链接的
+    /// 目标文本（§17 补记三：`TreeEntry` 对链接只存 hash，若不把目标本身当 blob 落盘，
+    /// 那个 hash 就永远解不回文本，历史里就重建不出链接）。
+    ///
+    /// 它一次物化整段字节，所以拿它存文件等于作废 NFR-1 的常数内存承诺。
+    /// 与 `put_file` 共用 `copy_block`：同一套"tmp → fsync → 自证 → rename"。
+    pub fn put_bytes(&self, bytes: &[u8]) -> Result<PutOutcome> {
+        let mut out = PutOutcome {
+            blob: Blob {
+                hash: keys::hash_of(bytes),
+                size: bytes.len() as u64,
+                block_size: self.block_size,
+                blocks: Vec::new(),
+            },
+            stored: 0,
+            stored_bytes: 0,
+            reused: 0,
+            zero: 0,
+        };
+        let mut src = std::io::Cursor::new(bytes);
+        for (i, chunk) in bytes.chunks(self.block_size as usize).enumerate() {
+            let zero = chunk.iter().all(|b| *b == 0);
+            let hash = if zero {
+                ZERO_HASH
+            } else {
+                keys::hash_of(chunk)
+            };
+            let b = BlockRef {
+                hash,
+                size: chunk.len() as u32,
+                zero,
+            };
+            if b.zero {
+                out.zero += 1;
+            } else if self.contains(&b.hash) {
+                out.reused += 1;
+            } else {
+                self.copy_block(&mut src, i as u64 * self.block_size, &b)?;
+                out.stored += 1;
+                out.stored_bytes += b.size as u64;
+            }
+            out.blob.blocks.push(b);
+        }
+        Ok(out)
+    }
+
+    /// 清单里**磁盘上已经不在了**的块。§7.3 的"块已在 CAS"检查用它：
+    /// 逐块 `stat` 而不是逐块重算 hash——后者是 `verify` 的活，属于 `gc --fsck`，
+    /// 不该出现在一次 `restore` 的路上（10 GB 文件会把它变成分钟级）。
+    pub fn missing(&self, blob: &Blob) -> Vec<Hash> {
+        blob.blocks
+            .iter()
+            .filter(|b| !b.zero)
+            .map(|b| b.hash)
+            .filter(|h| !self.contains(h))
+            .collect()
+    }
+
+    /// 把一个块从源reader的 `offset` 拷进库：tmp → fsync → 自证 hash → rename。
+    ///
+    /// 泛型而不是写死 `File`：`put_file` 传 `File`、`put_bytes` 传 `Cursor<&[u8]>`，
+    /// 两边共用这**同一份**落盘代码。这里要是复制两份，"忘了 fsync 就 rename"这类事故
+    /// 只会修好一半——而 FR-13 要的是全中。
+    fn copy_block<R: Read + Seek>(&self, src: &mut R, offset: u64, b: &BlockRef) -> Result<()> {
         src.seek(SeekFrom::Start(offset))?;
         let final_path = self.dir.join(Self::path_of(&b.hash));
         if let Some(parent) = final_path.parent() {
@@ -353,8 +430,7 @@ fn write_zeros(dst: &mut impl Write, hasher: &mut blake3::Hasher, size: u32) -> 
 }
 
 fn temp_in(dir: &Path) -> PathBuf {
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".tmp.{}.{seq:08x}", std::process::id()))
+    dir.join(format!(".tmp.{}", tmp_tag()))
 }
 
 fn src_path_note(offset: u64) -> PathBuf {

@@ -5,4 +5,5 @@ pub mod cas;
 pub mod history;
 pub mod keys;
 pub mod object;
+pub mod restore;
 pub mod worktree;

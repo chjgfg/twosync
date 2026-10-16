@@ -211,7 +211,10 @@ fn kind_of(md: &Metadata) -> Kind {
 /// 这不是洁癖：NTFS 上条目多的目录会报告非 0 的 `nFileSize`，而 `digest` 给目录存的
 /// 是 0 —— 两边定义不一致，粗筛就永远不命中，那个目录每轮白算一次 hash。实测 ts3 语料
 /// 每轮 `hashed=1`、样本正是 `data`（5001 个孩子的目录），而 3 个孩子的同名目录是 0 所以没暴露。
-fn logical_size(md: &Metadata, kind: Kind) -> u64 {
+///
+/// `pub` 是给 `restore` 的 §7.3 门用的：**"变没变"这件事全站只能有一把尺**，多一处定义
+/// 就是多一处上面那个 bug 的候选产地。
+pub fn logical_size(md: &Metadata, kind: Kind) -> u64 {
     match kind {
         // symlink 也一样：它的身份是"目标路径的 hash"，`md.len()` 是重解析点的大小，
         // 存进去的是 0 ⇒ 两边定义必须一致，否则同一个 bug 换个马甲又来一次。
@@ -220,7 +223,8 @@ fn logical_size(md: &Metadata, kind: Kind) -> u64 {
     }
 }
 
-fn mtime_of(md: &Metadata) -> i64 {
+/// 与 `logical_size` 同理：`pub` 出去给 §7.3 的门复用，"mtime 怎么算"也只许有一处定义。
+pub fn mtime_of(md: &Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

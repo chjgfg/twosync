@@ -67,6 +67,24 @@ pub enum Cmd {
         /// 仓库内路径（`/` 分隔）；省略 = 提交本身 + 根目录一层
         path: Option<String>,
     },
+
+    /// 把历史里的一个路径写回工作树（M0 验收项「`restore --at` 取回任意历史版本」）
+    ///
+    /// 默认**不覆盖**已存在的本地文件；加 `--force` 也仍然过 §7.3 铁律：被覆盖的那一版
+    /// 必须已经在历史里（有 `B` 清单且块都在磁盘上），否则拒绝并让你先 commit。
+    Restore {
+        /// 从哪个版本取：`HEAD` / ref 名 / commit hash 前缀
+        #[arg(long, default_value = "HEAD")]
+        at: String,
+        /// 仓库内路径（`/` 分隔）
+        path: String,
+        /// 写到别处而不是工作树里（不碰本地文件，因此也不需要 §7.3 的门）
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// 允许覆盖工作树里已存在的文件
+        #[arg(long)]
+        force: bool,
+    },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync

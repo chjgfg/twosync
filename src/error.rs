@@ -53,6 +53,22 @@ pub enum Error {
     /// 混在一起就会把"用户打错路径"报成"磁盘坏了"。
     #[error("{path} 在 {rev} 这个版本里不存在")]
     NoSuchPath { rev: String, path: String },
+    /// 目标已存在而不肯覆盖。这是**默认行为**：`restore` 不带 `--force` 就该拒绝，
+    /// 否则一次打错参数的恢复会静默吃掉本地未备份的修改。
+    #[error("{path} 已经存在：加 --force 才覆盖")]
+    LocalExists { path: std::path::PathBuf },
+    /// §7.3 铁律：本地这一版还没进过历史 ⇒ 不许覆盖。"进过历史"= 有 `B` 清单**且**块都在。
+    #[error("拒绝覆盖 {path}：{why}。先 scan + commit 把本地这一版存进历史，再 --force")]
+    NotInHistory {
+        path: std::path::PathBuf,
+        why: String,
+    },
+    /// 设计上明确留给后面某个里程碑的行为。**不是**"忘了做"，报出来要能看出归谁。
+    #[error("{what}：还没做，{milestone}")]
+    NotYet {
+        what: String,
+        milestone: &'static str,
+    },
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。

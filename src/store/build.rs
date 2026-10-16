@@ -158,16 +158,32 @@ pub fn build(
                         mode: e.mode,
                     });
             }
-            Kind::Symlink => dirs
-                .entry(dir.to_string())
-                .or_default()
-                .push(object::TreeEntry {
-                    name: name.to_string(),
-                    kind: Kind::Symlink,
-                    hash: e.blob_hash,
-                    size: 0,
-                    mode: e.mode,
-                }),
+            Kind::Symlink => {
+                // 目标文本本身必须进 CAS，否则树里那个 hash 永远解不回文本（§17 补记三）。
+                // 走 blob 而不是给 TreeEntry 加字段：git 也是这么做的，且**不动编码** ⇒
+                // 已存的历史不会作废。链接目标很短，`put_bytes` 的物化代价可以忽略。
+                let target = e.symlink_target.as_deref().ok_or_else(|| {
+                    Error::Codec(format!(
+                        "{path} 标成符号链接却没有目标文本：W 记录不完整，拒绝写进历史"
+                    ))
+                })?;
+                let outcome = store.put_bytes(target.as_bytes())?;
+                if outcome.blob.hash != e.blob_hash {
+                    return Err(Error::StaleScan {
+                        path: path.to_string(),
+                    });
+                }
+                record_blob(db, pid, &outcome, path, &mut built)?;
+                dirs.entry(dir.to_string())
+                    .or_default()
+                    .push(object::TreeEntry {
+                        name: name.to_string(),
+                        kind: Kind::Symlink,
+                        hash: e.blob_hash,
+                        size: 0,
+                        mode: e.mode,
+                    });
+            }
         }
     }
 
@@ -303,8 +319,23 @@ fn put_blob(
             path: path.to_string(),
         });
     }
+    record_blob(db, pid, &outcome, path, built)?;
+    Ok(e.blob_hash)
+}
 
-    let key = keys::blob_key(pid, &e.blob_hash);
+/// 把一个已经落盘的 blob 记进库：`B` 清单 + 每块引用数。**文件和符号链接共用这一条**。
+///
+/// 已存在的 blob 直接返回：清单是内容寻址的，重写一遍只会多长一个版本行（§9.6.2），
+/// 而引用数再加一次就会凭空虚高——虚高的 refcnt 让 GC 永远删不掉那块（不变量 (b) 的
+/// 反面），所以这个"先看后写"不是优化，是正确性。
+fn record_blob(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    outcome: &cas::PutOutcome,
+    what: &str,
+    built: &mut Built,
+) -> Result<()> {
+    let key = keys::blob_key(pid, &outcome.blob.hash);
     let is_new_blob = {
         let tx = db.begin();
         let missing = tx.get(&key).is_none();
@@ -312,7 +343,7 @@ fn put_blob(
         missing
     };
     if !is_new_blob {
-        return Ok(e.blob_hash); // 清单已在库里，块引用数不该再加一次
+        return Ok(()); // 清单已在库里，块引用数不该再加一次
     }
 
     built.blobs_new += 1;
@@ -321,7 +352,7 @@ fn put_blob(
 
     let tx = db.begin();
     if !tx.set(&key, keys::wrap(enc(&outcome.blob, "Blob")?)) {
-        return Err(Error::WriteConflict(path.to_string()));
+        return Err(Error::WriteConflict(what.to_string()));
     }
     tx.commit();
 
@@ -330,7 +361,7 @@ fn put_blob(
     for b in outcome.blob.blocks.iter().filter(|b| !b.zero) {
         bump_block(db, pid, b.hash, b.size)?;
     }
-    Ok(e.blob_hash)
+    Ok(())
 }
 
 /// 一个块被新 blob 引用一次：`K.refcnt += 1`，并同步 `k` 排序索引（不变量 (g)）。

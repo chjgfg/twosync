@@ -4,7 +4,7 @@
 //! ls-files restore checkout plan apply config doctor
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use storage_engines::KvEngine;
@@ -15,7 +15,7 @@ use crate::cli::cmd::ProjectCmd;
 use crate::cli::registry::Registry;
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
-use crate::store::{build, cas, history, object, worktree};
+use crate::store::{build, cas, history, object, restore, worktree};
 use crate::utils::{
     db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
 };
@@ -290,16 +290,10 @@ pub fn show(cli: &Cli, rev: &str, path: Option<&str>) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
     let db = open_store(&cli.root, cli.engine)?;
     let pid = keys::project_id(&name);
+    // 只有符号链接那一支会真去读字节（目标文本存在 CAS 里，不在引擎里）。
+    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
     let heads = history::resolve_rev(&*db, pid, rev)?;
-    let hash = match heads.as_slice() {
-        [one] => *one,
-        many => {
-            return Err(Error::Codec(format!(
-                "{rev} 指向 {} 个 commit：多 head 还没做 union（M3），请指定具体 commit",
-                many.len()
-            )));
-        }
-    };
+    let hash = one_commit(heads, rev)?;
     let c = object::read_commit(&*db, pid, &hash)?;
 
     println!("project   = {name}  (id={pid:#010x})");
@@ -346,9 +340,16 @@ pub fn show(cli: &Cli, rev: &str, path: Option<&str>) -> Result<()> {
             print_entry(&e);
             match e.kind {
                 Kind::File => print_blob(&*db, pid, &e.hash)?,
-                Kind::Symlink => println!(
-                    "  注意：清单里只有目标的 hash，没有目标文本 ⇒ 现在还**不能**从历史重建符号链接"
-                ),
+                Kind::Symlink => {
+                    // 目标文本本身就在 CAS 里（§17 补记三），所以这里能直接答"指向哪儿"。
+                    let blob = build::read_blob(&*db, pid, &e.hash)?;
+                    let target = restore::link_target(&blob, &store)?;
+                    println!(
+                        "  链接目标  = {target}  ({} B / {} 块)",
+                        blob.size,
+                        blob.blocks.len()
+                    );
+                }
                 Kind::Dir => {
                     let kids = object::read_tree(&*db, pid, &e.hash)?;
                     println!("目录 {} 条：", kids.len());
@@ -398,4 +399,59 @@ fn print_entry(e: &object::TreeEntry) {
         keys::short(&e.hash),
         e.name
     );
+}
+
+/// `show` 与 `restore` 共用：rev 解析出来的集合必须恰好一个。
+///
+/// 多 head 在这里**报错而不是取第一个**：取第一个 = 静默挑一个版本给用户看/写回工作树，
+/// 而 union 与 collision 判定是 M3 的活。宁可在 M3 之前拒绝服务，也不做一个"看起来成功、
+/// 内容却是随机一条链"的恢复。
+fn one_commit(heads: Vec<Hash>, rev: &str) -> Result<Hash> {
+    match heads.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(Error::MissingObject {
+            hash: rev.to_string(),
+            kind: "commit".to_string(),
+        }),
+        many => Err(Error::Codec(format!(
+            "{rev} 指向 {} 个 commit：多 head 的 union 还没做（M3），请指定具体 commit",
+            many.len()
+        ))),
+    }
+}
+
+/// `restore`：从某个版本取一个路径回工作树（或取到别处）。
+pub fn restore(cli: &Cli, at: &str, path: &str, to: Option<&Path>, force: bool) -> Result<()> {
+    let (name, root) = resolve_project(cli)?;
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&name);
+    let store = cas::Cas::new(&objects_dir(&cli.root), cas::DEFAULT_BLOCK)?;
+    let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
+
+    let r = restore::restore(&*db, pid, &store, &root, &commit, path, to, force)?;
+    println!("project   = {name}  (id={pid:#010x})");
+    println!("from      = {}", keys::hex(&commit));
+    println!("path      = {path}  ({})", kind_word(r.kind));
+    println!("dest      = {}", r.dest.display());
+    println!("bytes     = {} / {} 块", r.bytes, r.blocks);
+    if let Some(t) = &r.target {
+        println!("链接目标  = {t}");
+    }
+    println!(
+        "§7.3      = {}",
+        if r.gate_checked {
+            "目标已存在，已确认被覆盖的那一版在历史里"
+        } else {
+            "目标不存在，不需要门"
+        }
+    );
+    Ok(())
+}
+
+fn kind_word(k: Kind) -> &'static str {
+    match k {
+        Kind::File => "文件",
+        Kind::Dir => "目录",
+        Kind::Symlink => "符号链接",
+    }
 }
