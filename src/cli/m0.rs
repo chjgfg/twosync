@@ -5,13 +5,12 @@
 
 use std::fs;
 
-use storage_engines::EngineKind;
-
+use crate::allocstats;
 use crate::cli::Cli;
 use crate::cli::cmd::ProjectCmd;
 use crate::cli::registry::Registry;
-use crate::error::Result;
-use crate::store::keys;
+use crate::error::{Error, Result};
+use crate::store::{keys, worktree};
 use crate::utils::{
     db_dir, journal_dir, log_dir, objects_dir, open_store, projects_file, site_dir,
 };
@@ -47,8 +46,8 @@ pub fn init(cli: &Cli) -> Result<()> {
 }
 
 /// 打开基座 → FR-21 自检 → 打印健康度。句柄用完即弃，不跨命令持有（§9.6.2）。
-pub fn doctor(cli: &Cli, engine: EngineKind) -> Result<()> {
-    let db = open_store(&cli.root, engine)?;
+pub fn doctor(cli: &Cli) -> Result<()> {
+    let db = open_store(&cli.root, cli.engine)?;
     // NFR-8：`health()` 是 O(物理行数)，只允许出现在这种人工触发的诊断路径上。
     let h = db.health();
     println!("engine      = {}", db.name());
@@ -105,6 +104,67 @@ pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
             reg.save(&cli.root)?;
             println!("当前项目 = {name}");
         }
+    }
+    Ok(())
+}
+
+pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
+    let reg = Registry::load(&cli.root)?;
+    let project = match &cli.project {
+        Some(name) => reg
+            .projects
+            .get(name)
+            .ok_or_else(|| Error::Registry(format!("没有项目 {name}")))?,
+        None => reg.current()?,
+    };
+    let root = cli.root.join(&project.path);
+    if !root.is_dir() {
+        return Err(Error::Registry(format!(
+            "项目目录不存在：{}",
+            root.display()
+        )));
+    }
+
+    let db = open_store(&cli.root, cli.engine)?;
+    let pid = keys::project_id(&project.name);
+    let wm = allocstats::watermark();
+    let rep = worktree::scan(&*db, pid, &root, force, batch)?;
+    let peak = wm.peak_growth();
+
+    let secs = rep.elapsed_ms as f64 / 1000.0;
+    println!(
+        "project     = {name}  (id={pid:#010x})",
+        name = project.name
+    );
+    println!("root        = {}", root.display());
+    println!("walked      = {}", rep.walked);
+    println!(
+        "hashed      = {}  (skipped {} / deferred {})",
+        rep.hashed, rep.skipped, rep.deferred
+    );
+    println!(
+        "bytes       = {:.1} MiB  (本轮重算 {:.1} MiB)",
+        rep.bytes as f64 / 1048576.0,
+        rep.hashed_bytes as f64 / 1048576.0
+    );
+    println!("elapsed     = {secs:.3} s");
+    // 吞吐只按**实际 hash 的字节**算：拿 rep.bytes 当分子会把 skipped 的字节也算进去，
+    // 于是"全都跳过了"反而显示成 0 MiB/s。
+    println!(
+        "throughput  = {:.1} MiB/s",
+        rep.hashed_bytes as f64 / 1048576.0 / secs.max(0.001)
+    );
+    // §9.6.1 的量尺：常数内存 ⇒ 这个数与文件数、最大文件都无关，只与 batch/HASH_BUF 有关。
+    println!("peak heap   = {:.1} MiB", peak as f64 / 1048576.0);
+    // 第二轮本该 hashed=0；不为 0 时得能问出"是哪一个"。样本本身有界（≤10 条）。
+    if rep.hashed > 0 && rep.hashed <= rep.sample.len() {
+        println!("重算的是：{}", rep.sample.join(", "));
+    }
+    if rep.deferred > 0 {
+        println!(
+            "注意：{n} 项读不了，已 deferred（不是删除）",
+            n = rep.deferred
+        );
     }
     Ok(())
 }

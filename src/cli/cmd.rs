@@ -18,15 +18,24 @@ pub enum Cmd {
     /// 建站点目录布局（幂等，§13）
     Init,
     /// 打开存储基座，跑 FR-21 启动自检并打印引擎健康度
-    Doctor {
-        /// 引擎：lsm_tree / bplus_tree / bitcask / memory（后两个应被自检闸拦下）
-        #[arg(long, default_value_t = EngineKind::LsmTree, value_parser = engine_parser)]
-        engine: EngineKind,
-    },
+    ///
+    /// 引擎由全局 `--engine` 决定（`cli/mod.rs`），不在这里重复声明：全局参数会传播进
+    /// 子命令，同名再来一次就是自己跟自己撞。
+    Doctor,
 
     /// 项目注册表（§16.1）
     #[command(subcommand)]
     Project(ProjectCmd),
+
+    /// 扫描工作树，把每个路径的当前状态写进 `W` 前缀（FR-2）
+    Scan {
+        /// 忽略 size+mtime 粗筛，全部重算 hash
+        #[arg(long)]
+        force: bool,
+        /// 一个事务写多少条（§9.6.2：事务不许跨全树）
+        #[arg(long, default_value_t = 2000)]
+        batch: usize,
+    },
     // ── M1 ── push / agent / gc / peer add|list|trust
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync

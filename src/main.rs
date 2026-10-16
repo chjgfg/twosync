@@ -25,7 +25,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         // ── M0 ──
         Cmd::Init => m0::init(cli),
-        Cmd::Doctor { engine } => m0::doctor(cli, *engine),
+        Cmd::Doctor => m0::doctor(cli),
         Cmd::Project(cmd) => m0::project(cli, cmd),
+        Cmd::Scan { force, batch } => m0::scan(cli, *force, *batch),
     }
 }

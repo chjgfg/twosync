@@ -13,7 +13,9 @@ pub mod m3;
 pub mod m4;
 pub mod registry;
 
+use crate::cli::cmd::engine_parser;
 pub use cmd::Cmd;
+use storage_engines::EngineKind;
 
 /// 全局参数。`Cli` 直接住在本模块，不另开 `cli.rs`——那会撞 `clippy::module_inception`
 /// （`cli::cli`），而且它只有这一个结构体，单独成文件没有省下任何东西。
@@ -27,6 +29,14 @@ pub struct Cli {
     /// 站点级同步根目录（下面挂多个 project，§13）
     #[arg(long, default_value = ".", global = true)]
     pub root: PathBuf,
+
+    /// 作用的项目；省略时用 `project use` 选中的那个
+    #[arg(long, global = true)]
+    pub project: Option<String>,
+
+    /// 存储基座引擎（§10.8 换引擎跑同一套验证）
+    #[arg(long, global = true, default_value_t = EngineKind::LsmTree, value_parser = engine_parser)]
+    pub engine: EngineKind,
 
     #[command(subcommand)]
     pub cmd: Cmd,

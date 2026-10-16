@@ -7,7 +7,13 @@
 //!
 //! 引擎行为的实机验证在 `tests/engine_smoke.rs`。
 
+pub mod allocstats;
 pub mod cli;
 pub mod error;
 pub mod store;
 pub mod utils;
+
+/// 装在 lib 而不是 `main.rs`，这样测试二进制也带着它——§9.6.1 的上界是靠用例断言的，
+/// 不是靠人跑一遍看输出。
+#[global_allocator]
+static ALLOC: allocstats::Counting = allocstats::Counting;
