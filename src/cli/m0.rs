@@ -11,7 +11,7 @@ use storage_engines::KvEngine;
 
 use crate::allocstats;
 use crate::cli::Cli;
-use crate::cli::cmd::{ConfigCmd, ProjectCmd};
+use crate::cli::cmd::{ConfigCmd, Import, ProjectCmd};
 use crate::cli::config::Config;
 use crate::cli::registry::{self, Registry};
 use crate::error::{Error, Result};
@@ -290,7 +290,8 @@ fn db_or_open(cli: &Cli) -> Result<Box<dyn KvEngine>> {
 
 /// 项目作用域：`--project` 显式指定 > `project use` 选中的那个。
 /// 返回 (项目名, 项目绝对路径)。名字要单独拿出去，因为 `project_id` 是**从名字派生**的。
-fn resolve_project(cli: &Cli) -> Result<(String, PathBuf)> {
+/// "你指哪个项目"这条判断只有一份（`m1::push` 也调它，别在别处再写一遍注册表查询）。
+pub(crate) fn resolve_project(cli: &Cli) -> Result<(String, PathBuf)> {
     let reg = Registry::load(&cli.root)?;
     let project = match &cli.project {
         Some(name) => reg
@@ -356,12 +357,14 @@ pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
 ///
 /// 这一条**不重新扫描**，只吃上一次 `scan` 的结果——所以刚改完文件没 scan 就 commit，
 /// 提交的是上一次扫描看见的状态。中间文件又变了的话会撞 `StaleScan`，不会静默用新内容。
-pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<()> {
+pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Import) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
     // 块仓是**站点级**的一份（挂在 `--root` 下），不是每项目一份：跨项目去重靠这个。
-    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
+        .with_fsync(!import.fast)
+        .with_rate_limit(import.rate_bytes_per_sec());
 
     let started = Instant::now();
     let wm = allocstats::watermark();
@@ -403,6 +406,18 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<(
         b.block_bytes as f64 / 1048576.0
     );
     println!("entries     = {}  (库里 W 行 {})", b.entries, b.known);
+    // 这两枚旋钮各自放弃了点什么，必须打出来——不许静默生效（§14 Q11）。
+    if import.fast {
+        println!(
+            "落盘        = --fast-import：**没有**等块 fsync。断电可能留下与清单不符的块；              读回会按 hash 报 CorruptBlock（不会静默给错数据），恢复办法是把这一版重新导入。"
+        );
+    }
+    if import.max_mbps > 0.0 {
+        println!(
+            "落盘        = 写块仓限速 {:.1} MiB/s（平均速率，漏桶；不削瞬时突发）",
+            import.max_mbps
+        );
+    }
     if b.entries == 0 && b.known > 0 {
         println!(
             "注意：本轮快照一条都没有而库里有 {n} 行 ⇒ 上一次 scan 可能中断过，先重跑 scan",
@@ -1097,9 +1112,9 @@ pub fn plan(cli: &Cli) -> Result<()> {
 
 /// `apply`：FR-7 的执行那一半。**与 `commit` 同一份实现**，不是第二份代码——
 /// "怎么提交"这件事有两份实现迟早会在其中一份里漏掉一道闸（本项目为这事记过不止一条）。
-pub fn apply(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<()> {
+pub fn apply(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Import) -> Result<()> {
     println!("apply     = commit 的执行侧（FR-7 的命名对），走的是同一个函数");
-    commit(cli, msg, allow_mass_delete)
+    commit(cli, msg, allow_mass_delete, import)
 }
 
 /// `diff --at REV`：同一份变更表，只是比较对象换成任意一个版本。

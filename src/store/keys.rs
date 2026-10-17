@@ -207,6 +207,30 @@ pub fn nfc(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// 一个**仓库内条目名**（不是路径）合不合法。M1 的接收侧在把对端清单落库之前先过这一关：
+/// "名字里带 `/`"或"`..`"这种东西一旦进了树对象，等到 M3 检出时才发现就太晚了——那时它已经是
+/// 某个合法 commit 的一部分，撤回来要动 head。
+///
+/// **两个分隔符都查，且与本机无关**：Linux 上跑的服务端必须拒掉带 `\` 的名字，
+/// 否则那份历史推到 Windows 上就写不出来了（§8 的非法字符表是跨端的）。
+///
+/// 规则只有一份：将来 `checkout`/`restore` 落地时也该调它。现在 `history::resolve` 是"按段查表"，
+/// 这类名字**查不到**——但"查不到"与"拒收"是两件事，别混（§10.3 的教训）。
+pub fn legal_name(name: &str) -> crate::error::Result<()> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\u{0}');
+    if bad {
+        return Err(crate::error::Error::BadInput(format!(
+            "对端给的条目名 {name:?} 不合法：不许是空、`.`、`..`，也不许含分隔符或 NUL"
+        )));
+    }
+    Ok(())
+}
+
 /// §8：折叠键 = **NFC** + `/` 分隔 + 小写。只用于比较/唯一性，不参与任何 hash 身份。
 ///
 /// 折叠这一路的用途只有一个：回答"这两个名字放到大小写不敏感的盘上是不是同一个格子"。

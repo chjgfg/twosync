@@ -1,4 +1,299 @@
-//! M1 批次：联网单向。push / agent / gc / peer add|list|trust
+//! M1 批次：联网单向。`push` / `agent` / `gc`（本文件已实现）· `peer add|list|trust`
+//! 与块级配额淘汰（还没做，见下面"现在还缺的两件事"）。
 //!
-//! 占位：本批命令还没开工。实现一条就在这里加 `pub fn <命令>(cli: &Cli, ...) -> Result<()>`，
-//! 并在 `cmd.rs` 的 `Cmd` 与 `main.rs` 的 match 各加一处。
+//! # 传输为什么是"一根子进程的管子"
+//!
+//! §9.5 定的就是这条：不开新端口、复用系统 `sshd`。所以 `push` 做的全部事情是起一条
+//! `ssh <peer> "<远端 twosync> agent --root <远端站点根>"`，把它的 stdout/stdin 拼成
+//! [`session::Io`] 交给会话层——**协议不关心管子那头是 ssh 还是别的进程**，
+//! 测试里塞一对内存管道跑的是同一份代码（`tests/net_session.rs`）。
+//! 也因此不引入 `russh`/异步运行时：单核 6 G 的机器上少一个常驻 runtime 就是少一份预算，
+//! 而 SSH 本来就在那台机器上跑着。
+//!
+//! # `agent` 的输出纪律
+//!
+//! **stdout 只能有帧**，给人看的一律走 stderr。多往 stdout 写一行，对端就把那一行当帧解，
+//! 报出来是"协议走样"——看起来像对面在攻击，其实是我们自己污染了通道。
+//!
+//! # 现在还缺的两件事（如实标，别当 M1 已完成）
+//!
+//! - §9.5 的 **TOFU 指纹表**（`peer add|list|trust`）没做：现在的 `peer_id` 只是"对端自报的
+//!   名字"，任何人都能冒充。M1 的判据列的是通道 + 熔断 + 配额，所以这格可以晚一步，
+//!   但**接真机之前必须补**。
+//! - **块级配额淘汰（FR-9 的"超出配额按最老且不可达优先"）还没做**：`gc` 现在只压引擎的
+//!   版本链，不删任何块。所以 `push` 只保证"对端缺什么才传什么"，不保证对端磁盘装得下。
+//!
+//! # `gc` 为什么排在这三条里
+//!
+//! 它不是网络活儿，是**记账活儿**：10 GiB 基线上"0 变更的空转提交 45.2 s → 246.8 s"
+//! （§11.1 复验表）就是"没人调用过 vacuum"这一条的账单。细节与那条能力边界
+//! （门面没有分片 `vacuum_bounded`）写在 [`gc`] 的文档里。
+
+use std::io::{self, Read, Write};
+use std::process::{Child, Command, Stdio};
+
+use crate::cli::Cli;
+use crate::cli::m0;
+use crate::error::{Error, Result};
+use crate::net::frame::caps;
+use crate::net::session::{self, PushOpts};
+use crate::store::build;
+use crate::store::cas::Cas;
+use crate::store::keys;
+use crate::utils::objects_dir;
+
+/// 一根管子：读一头、写一头。会话层只认 `Read + Write` 这个形状，所以子进程的 stdio
+/// 与进程自己的 stdio（`agent`）共用同一份会话代码。
+///
+/// `child` 只有在发起端才有——它的退出码是"对端 agent 有没有非零退出"的唯一信号。
+pub struct Duplex {
+    r: Box<dyn Read>,
+    w: Box<dyn Write>,
+    child: Option<Child>,
+}
+
+impl Read for Duplex {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.r.read(buf)
+    }
+}
+
+impl Write for Duplex {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.w.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+impl Duplex {
+    /// 关掉写端并等子进程退出。`push` 用完必须调：不关 stdin，远端 `agent` 会一直等在管子上。
+    fn finish(mut self) -> Result<()> {
+        drop(self.w);
+        match self.child.as_mut() {
+            Some(c) => {
+                let status = c.wait()?;
+                if !status.success() {
+                    return Err(Error::BadInput(format!(
+                        "ssh 退出码 {status}：会话帧已经报完，但对端进程非零退出 ⇒ \
+                         真实原因在**远端**的 stderr 里（agent 的诊断都写那一侧）"
+                    )));
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// `push` 的一次会话：起 ssh、握手、协商、传块与清单、等对端 verdict。
+pub fn push(
+    cli: &Cli,
+    peer: &str,
+    agent_bin: &str,
+    remote_root: Option<&str>,
+    project: Option<&str>,
+    max_send_mib: f64,
+    allow_mass_delete: bool,
+) -> Result<()> {
+    let (name, _) = match project {
+        Some(p) => (p.to_string(), cli.root.clone()),
+        None => m0::resolve_project(cli)?,
+    };
+    let db = cli.store()?;
+    let pid = keys::project_id(&name);
+    let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    if heads.is_empty() {
+        return Err(Error::BadInput(format!(
+            "项目 {name:?} 还没有任何 head：先 scan + commit 再推"
+        )));
+    }
+
+    let remote_root = remote_root.unwrap_or(".");
+    // 远端命令整体交给对端的 shell 解析，所以路径自己带引号。
+    let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
+    let mut child = Command::new("ssh")
+        .arg(peer)
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            Error::BadInput(format!(
+                "起不了 `ssh {peer} {remote_cmd}`：{e}\n  \
+                 对端要能免密登录，且那边装了 twosync（或换个能用的 ssh 客户端）"
+            ))
+        })?;
+    let mut io = Duplex {
+        r: Box::new(child.stdout.take().expect("piped stdout")),
+        w: Box::new(child.stdin.take().expect("piped stdin")),
+        child: Some(child),
+    };
+
+    let opts = PushOpts {
+        project: &name,
+        peer_id: name.as_bytes(),
+        caps: caps::FIXED_CHUNK | caps::SPARSE | caps::XATTR_MODE,
+        max_block_bytes: if max_send_mib > 0.0 {
+            (max_send_mib * 1048576.0) as u64
+        } else {
+            u64::MAX
+        },
+        allow_mass_delete,
+    };
+    let rep = session::push(&mut io, &*db, &cas, &opts)?;
+
+    println!("project     = {name}");
+    println!("peer        = {peer}  (经 ssh 起的 agent；未验指纹，TOFU 表还没做)");
+    println!(
+        "commits     = {}，清单 blobs {} 份 / tree {} 份",
+        rep.commits, rep.blobs_sent, rep.trees_sent
+    );
+    println!(
+        "blocks      = 上线 {} 个 / {:.1} MiB；跳过 {} 个（对端已有）",
+        rep.blocks_sent,
+        rep.bytes_sent as f64 / 1048576.0,
+        rep.blocks_skipped
+    );
+    println!(
+        "head(对端)  = {}",
+        rep.accepted
+            .iter()
+            .map(|h| keys::short(h))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    io.finish()
+}
+
+/// 服务端：stdin 读帧、stdout 写帧。**给人用 `ssh` 调，不是给人敲的**。
+///
+/// 一条连接上连续服务多场会话 ⇒ FR-19 的"20 个 project 一轮只 1 次认证"。管子 EOF
+/// 就是"对端挂了"，正常退出（不是错误，别报成会话失败）。
+pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
+    let db = cli.store()?;
+    let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let allowed: Vec<String> = match only {
+        Some(n) => vec![n.to_string()],
+        None => {
+            let reg = crate::cli::registry::Registry::load(&cli.root)?;
+            reg.projects.keys().cloned().collect()
+        }
+    };
+    let peer = std::env::var("TWOSYNC_PEER_ID").unwrap_or_else(|_| "local".to_string());
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut io = Duplex {
+        r: Box::new(stdin.lock()),
+        w: Box::new(stdout.lock()),
+        child: None,
+    };
+
+    let mut sessions = 0usize;
+    loop {
+        let mut resolve = |name: &str| -> Option<u32> {
+            allowed.iter().any(|n| n == name).then(|| keys::project_id(name))
+        };
+        match session::serve(&mut io, &*db, &cas, peer.as_bytes(), !0, &mut resolve, false) {
+            Ok(rep) => {
+                sessions += 1;
+                eprintln!(
+                    "agent #{sessions}: project={} 收块 {} 个 / {:.1} MiB，清单 {} 份，tree {} 份 ⇒ {}；head = {}",
+                    rep.project,
+                    rep.blocks_written,
+                    rep.bytes_in as f64 / 1048576.0,
+                    rep.blobs_in,
+                    rep.trees_in,
+                    if rep.accepted { "接受" } else { "拒绝" },
+                    rep.heads_after
+                        .iter()
+                        .map(|h| keys::short(h))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                if !rep.accepted {
+                    eprintln!("agent:   原因 = {}", rep.reason);
+                }
+            }
+            Err(e) => {
+                if matches!(&e, Error::Io(io) if io.kind() == io_kind_eof()) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// `UnexpectedEof` 单独抽出来：管子读到尾与"对端把连接断了"在会话层是同一件事，
+/// 但不能跟其它 IO 错误混在一起——那样一填就写反了。
+fn io_kind_eof() -> std::io::ErrorKind {
+    std::io::ErrorKind::UnexpectedEof
+}
+
+
+/// `gc`：**引擎版本回收**（全库一轮 `vacuum()`，前后各读一次 §9.6.2 的 `health()`）。
+///
+/// 病根见模块头：`scan` 每轮都要给每一行盖新版本（活性判据的命根子，不能省），而回收这一步
+/// 在 M0 的流水线里从来没被调用过。
+///
+/// # 分片回收为什么不是这里做的（一条真实的能力边界）
+///
+/// `storage_engines` 的**具体** MVCC 类型上有 `vacuum_bounded(after, budget_rows)`（游标 +
+/// 每圈预算），但门面 `KvEngine` 只暴露 `vacuum()`（全库一轮）与
+/// `set_vacuum_auto_slice()`（引擎自己的小圈：每攒够 N 行新版本裁一片，默认 16 Ki 行）。
+/// 我们手里只有 `Box<dyn KvEngine>` ⇒ **这一版 `gc` 就是全库一刀**，不假装能分片。
+/// 两个后果与出路：
+/// - 想"不制造 IO 突发"就用 `--auto-slice` 把回收交给引擎的常流小圈（M2 的 agent 走这条），
+///   而不是在这里 sleep 假装限速；
+/// - 想让 `gc` 自己分片，需要门面把 `vacuum_bounded` 提上来 ⇒ 记进 §14 的引擎侧问题，
+///   **不在这里 downcast 凑**：凑出来的代码要在四个具体类型上各写一遍，等于把引擎的
+///   类型选择漏进 CLI 层。
+pub fn gc(cli: &Cli, auto_slice: Option<u64>) -> Result<()> {
+    let db = cli.store()?;
+    let before = db.health();
+    println!("engine      = {}", db.name());
+    println!(
+        "回收前      = rows {} / live {} / max_chain {} / rows_above_one {} / active_txns {}",
+        before.total_rows, before.live_keys, before.max_chain, before.rows_above_one, before.active_txns
+    );
+    println!("自动回收切片 = {} 行（0 = 关闭，版本行只增不减）", db.vacuum_auto_slice());
+
+    if let Some(rows) = auto_slice {
+        db.set_vacuum_auto_slice(rows);
+        println!(
+            "改为        = {} 行（已生效，下一次提交起按这个切片自裁）",
+            db.vacuum_auto_slice()
+        );
+    }
+
+    let stats = db.vacuum()?;
+    println!(
+        "本轮        = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
+        stats.rows_scanned, stats.versions_removed, stats.xmin
+    );
+    if matches!(stats.blob_rewritten, Some(true)) {
+        println!("blob 文件   = 已重写（外置 value 被压实过）");
+    }
+    if stats.skipped_active_txn {
+        println!(
+            "注意        = 有活跃事务 ⇒ **整轮跳过，一个版本都没裁**（`versions_removed = 0` \
+             不等于「没垃圾」，是「没开工」，§9.6.2）"
+        );
+    }
+
+    let after = db.health();
+    println!(
+        "回收后      = rows {} / live {} / max_chain {} / rows_above_one {} / active_txns {}",
+        after.total_rows, after.live_keys, after.max_chain, after.rows_above_one, after.active_txns
+    );
+    println!(
+        "净减        = {} 行（{} → {}）",
+        before.total_rows.saturating_sub(after.total_rows),
+        before.total_rows,
+        after.total_rows
+    );
+    Ok(())
+}

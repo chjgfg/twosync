@@ -3,8 +3,8 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use twosync::cli::m0;
-use twosync::cli::{Cli, Cmd};
+use twosync::cli::{m0, m1};
+use twosync::cli::{Cli, Cmd, Import};
 use twosync::error::Result;
 
 fn main() -> ExitCode {
@@ -32,12 +32,50 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Cmd::Apply {
             msg,
             allow_mass_delete,
-        } => m0::apply(cli, msg.as_deref(), *allow_mass_delete),
+            fast_import,
+            max_mbps,
+        } => m0::apply(
+            cli,
+            msg.as_deref(),
+            *allow_mass_delete,
+            Import {
+                fast: *fast_import,
+                max_mbps: *max_mbps,
+            },
+        ),
         Cmd::Scan { force, batch } => m0::scan(cli, *force, *batch),
         Cmd::Commit {
             msg,
             allow_mass_delete,
-        } => m0::commit(cli, msg.as_deref(), *allow_mass_delete),
+            fast_import,
+            max_mbps,
+        } => m0::commit(
+            cli,
+            msg.as_deref(),
+            *allow_mass_delete,
+            Import {
+                fast: *fast_import,
+                max_mbps: *max_mbps,
+            },
+        ),
+        Cmd::Push {
+            peer,
+            agent_bin,
+            remote_root,
+            project,
+            max_send_mib,
+            allow_mass_delete,
+        } => m1::push(
+            cli,
+            peer,
+            agent_bin,
+            remote_root.as_deref(),
+            project.as_deref(),
+            *max_send_mib,
+            *allow_mass_delete,
+        ),
+        Cmd::Agent { project } => m1::agent(cli, project.as_deref()),
+        Cmd::Gc { auto_slice } => m1::gc(cli, *auto_slice),
         Cmd::Log { max_count } => m0::log(cli, *max_count),
         Cmd::Show { rev, path } => m0::show(cli, rev, path.as_deref()),
         Cmd::Restore {

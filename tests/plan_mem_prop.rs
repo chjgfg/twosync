@@ -116,7 +116,7 @@ impl Site {
         while last < target {
             // 一行占的字节：键 = 标签 1 + pid 4 + 序号 8，值 = `PAD_BODY`。
             let per = 13 + PAD_BODY;
-            let want = (target - last).div_ceil(per).min(2000).max(1);
+            let want = (target - last).div_ceil(per).clamp(1, 2000);
             let tx = self.db.begin();
             for _ in 0..want {
                 let mut key = vec![PAD_TAG];

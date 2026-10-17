@@ -53,6 +53,16 @@ pub enum Cmd {
         /// 越过 FR-10 删除熔断（删除条目 > 已知的 20% 且 > 20 条，或 > 2 GiB）
         #[arg(long)]
         allow_mass_delete: bool,
+        /// 落块**不等 fsync**（§14 Q11）。10 GiB 首建库的 84 分钟几乎全是等 fsync（§11.1）。
+        /// 放弃的不是写序（仍是 `tmp → rename`），而是"清单落盘前块已持久"这一半：
+        /// 断电可能留下与清单不符的块，读回时按 hash 必报错，恢复办法是重新导入那一版。
+        /// 用不用会在输出里打印出来，不许静默生效。
+        #[arg(long)]
+        fast_import: bool,
+        /// 写块仓的平均速率上限，单位 MiB/s（0 = 不限速）。NFR-2 明写首建库"必须可限速"，
+        /// NFR-3 要的是别把同机策略进程的延迟拖走
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
     },
 
     /// 列出 head 可达的 commit，时间倒序（FR-4 的历史视图）
@@ -124,6 +134,12 @@ pub enum Cmd {
         /// 越过 FR-10 删除熔断
         #[arg(long)]
         allow_mass_delete: bool,
+        /// 同 `commit --fast-import`（这两个命令是同一份实现，开关也必须一样）
+        #[arg(long)]
+        fast_import: bool,
+        /// 同 `commit --max-mbps`
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
     },
     /// 不在这里（要先 `scan`）。这一条与 git 的 `status` 语义相同，代价也相同。
     Status,
@@ -171,10 +187,82 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    // ── M1 ── push / agent / gc / peer add|list|trust
+    /// 把这个项目推给一个对端（M1）。传输 = `ssh <peer> "<远端 twosync> agent"`：
+    /// 不开新端口、复用系统 sshd（§9.5），本端只把它的 stdin/stdout 当一根双向管。
+    /// 单向推送：**只让历史过去，不动对端的工作树**（那是 M3 的 `pull`/检出）。
+    Push {
+        /// 对端标识，直接交给 ssh：`[user@]host[:port]`（端口要用 `-p` 就写进 `~/.ssh/config`）
+        peer: String,
+        /// 远端的 twosync 可执行文件（在远端 PATH 里时给个名字就够）
+        #[arg(long, default_value = "twosync")]
+        agent_bin: String,
+        /// 远端的站点根（它自己的 `--root`）
+        #[arg(long)]
+        remote_root: Option<String>,
+        /// 只推这一个项目；省略 = 当前项目
+        #[arg(long)]
+        project: Option<String>,
+        /// 本次会话最多发多少 MiB 的块（§9.4.5 的配额）。0 = 不限
+        #[arg(long, default_value_t = 0.0)]
+        max_send_mib: f64,
+        /// 本端越过 FR-10 熔断。**注意对端仍然按它自己的闸判**——这条旗标不跨机器传
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
+    /// 会话的服务端：从 stdin 读帧、往 stdout 写帧。**给 `ssh` 调，不是给人敲的**
+    ///
+    /// stdout 只能有帧，诊断一律走 stderr（多写一行到 stdout，对端就把它当帧解，
+    /// 报出来像"对面在攻击"，其实是我们自己污染通道）。
+    Agent {
+        /// 只服务这一个项目（白名单）。省略 = 本端注册表里的全部项目
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// 回收：现在只做**引擎版本链**那一半（全库一轮 `vacuum`）；块级配额淘汰（FR-9）还没做
+    ///
+    /// 为什么需要它：10 GiB 基线里"0 变更的空转提交 45.2 s → 246.8 s"，同期 `rows_above_one`
+    /// 20 215 → 82 704。每轮 `scan` 都要给每一行盖新版本（活性判据的命根子），
+    /// 而**没人调用过 vacuum** —— 这一条补的就是那半个调用。
+    Gc {
+        /// 顺手把引擎的自动回收切片宽度设成 N 行（0 = 关闭）
+        ///
+        /// 门面（`storage_engines::KvEngine`）没有暴露分片 `vacuum_bounded`，所以 `gc` 的
+        /// 回收是全库一刀；要"不制造 IO 突发"就把这条交给引擎的小圈（§14 记了引擎侧的缺口）。
+        #[arg(long)]
+        auto_slice: Option<u64>,
+    },
+
+    // ── M1 剩下的 ── peer add|list|trust / 块级 gc
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync
     // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
+    // ── M2 ── daemon / watch
+    // ── M3 ── pull / sync
+    // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
+}
+
+/// 首次导入的两枚旋钮（§14 Q11）。它们**不改变历史内容**，只改变落盘的等待方式与速率，
+/// 所以不进对象编码、不进 commit。收成一对而不是散在函数签名里：`apply` 与 `commit`
+/// 必须拿到同一对值，两个 `bool` 挨着摆是会被传反的（本项目已经为"两份参数表"买过两次单）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Import {
+    /// true = 落块不等 fsync
+    pub fast: bool,
+    /// 平均写速率上限，MiB/s；0 = 不限速
+    pub max_mbps: f64,
+}
+
+impl Import {
+    /// 命令行给的是 MiB/s，块仓要的是字节/秒。`0`/负数一律当"不限速"。
+    pub fn rate_bytes_per_sec(&self) -> u64 {
+        if self.max_mbps <= 0.0 {
+            0
+        } else {
+            (self.max_mbps * 1048576.0) as u64
+        }
+    }
 }
 
 #[derive(Subcommand, Clone)]

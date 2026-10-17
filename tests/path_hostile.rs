@@ -508,6 +508,6 @@ fn export_refuses_case_twins_on_an_insensitive_destination() {
     assert!(msg.contains("大小写碰撞"), "报错不对：{msg}");
     assert!(msg.contains("NOTE.md") && msg.contains("Note.md"), "没报出是哪两个名字：{msg}");
     // 停下必须发生在**写任何东西之前**：被拒之后目标里不该有一半的导出物。
-    let left = fs::read_dir(&dest).map(|mut d| d.count()).unwrap_or(0);
+    let left = fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0);
     assert_eq!(left, 0, "被拒却留下了 {left} 个文件");
 }

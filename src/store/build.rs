@@ -1065,7 +1065,21 @@ fn record_blob(
     what: &str,
     built: &mut Built,
 ) -> Result<()> {
-    let key = keys::blob_key(pid, &outcome.blob.hash);
+    if adopt_blob(db, pid, &outcome.blob, what)? {
+        built.blobs_new += 1;
+        built.blocks_stored += outcome.stored;
+        built.block_bytes += outcome.stored_bytes;
+    }
+    Ok(())
+}
+
+/// **一份**"清单落库 + 每块引用数"的实现：本地提交（[`record_blob`]）与 M1 接收对端推送
+/// （[`adopt_blob`]）都走这里。分成两份迟早会出现"接收侧忘了给某类块记引用数"，
+/// 而那种账只有 GC 删错块的那天才会暴露（不变量 (b)/(g)）。
+///
+/// 返回 `true` = 这条清单是新的（引用数已按块记上）；`false` = 库里已有，**一字未改**。
+pub fn adopt_blob(db: &dyn KvEngine, pid: ProjectId, blob: &cas::Blob, what: &str) -> Result<bool> {
+    let key = keys::blob_key(pid, &blob.hash);
     let is_new_blob = {
         let tx = db.begin();
         let missing = tx.get(&key).is_none();
@@ -1073,25 +1087,21 @@ fn record_blob(
         missing
     };
     if !is_new_blob {
-        return Ok(()); // 清单已在库里，块引用数不该再加一次
+        return Ok(false); // 清单已在库里，块引用数不该再加一次
     }
 
-    built.blobs_new += 1;
-    built.blocks_stored += outcome.stored;
-    built.block_bytes += outcome.stored_bytes;
-
     let tx = db.begin();
-    if !tx.set(&key, keys::wrap(enc(&outcome.blob, "Blob")?)) {
+    if !tx.set(&key, keys::wrap(enc(blob, "Blob")?)) {
         return Err(Error::WriteConflict(what.to_string()));
     }
     tx.commit();
 
     // 全零块不落盘，所以也不记引用数：给 `[00;32]` 记一条 `K` 会让 GC 去找一个永不存在的文件。
     // 同一文件里重复出现的块各记一次——GC 也是按清单里的引用逐条减的。
-    for b in outcome.blob.blocks.iter().filter(|b| !b.zero) {
+    for b in blob.blocks.iter().filter(|b| !b.zero) {
         bump_block(db, pid, b.hash, b.size)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// 一个块被新 blob 引用一次：`K.refcnt += 1`，并同步 `k` 排序索引（不变量 (g)）。

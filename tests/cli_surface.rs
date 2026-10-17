@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use storage_engines::EngineKind;
-use twosync::cli::Cli;
+use twosync::cli::{Cli, Import};
 use twosync::cli::m0;
 use twosync::store::build;
 use twosync::store::keys;
@@ -79,7 +79,7 @@ fn plan_reads_everything_and_writes_nothing() {
     assert_eq!(site.rows(), before, "plan 是只读的：一行都不许多");
 
     // 而 `apply` 会真的动库 —— 同一条路，两个名字，一份实现。
-    m0::apply(&site.cli(), Some("起点"), false).expect("apply 该成功");
+    m0::apply(&site.cli(), Some("起点"), false, Import::default()).expect("apply 该成功");
     let after = site.rows();
     assert!(
         after > before,
@@ -100,9 +100,9 @@ fn apply_and_commit_are_the_same_handler() {
     // 两次做同一件事：第二次必须"无改动"，因为两边用的是同一份判定（`changes.is_empty()`）。
     let site = Site::new(&[("a.txt", b"one")]);
     site.scan();
-    m0::apply(&site.cli(), Some("第一次"), false).unwrap();
+    m0::apply(&site.cli(), Some("第一次"), false, Import::default()).unwrap();
     let rows = site.rows();
-    m0::commit(&site.cli(), Some("第二次"), false).unwrap();
+    m0::commit(&site.cli(), Some("第二次"), false, Import::default()).unwrap();
     assert_eq!(
         site.rows(),
         rows,

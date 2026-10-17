@@ -4,12 +4,14 @@
 //! - [`utils`]：站点级目录布局 + 存储基座接入点（FR-3 / FR-21），**要复用的东西都在这**
 //! - [`error`]：唯一的错误类型 [`Error`](error::Error) 与 `Result<T>` 别名
 //! - [`cli`]：命令清单与按里程碑分批的实现；分发在 `main.rs`
+//! - [`net`]：线格式（M1 起，目前只有 `frame`；会话状态机还没写）
 //!
 //! 引擎行为的实机验证在 `tests/engine_smoke.rs`。
 
 pub mod allocstats;
 pub mod cli;
 pub mod error;
+pub mod net;
 pub mod store;
 pub mod utils;
 
