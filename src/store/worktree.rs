@@ -46,6 +46,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::format;
 use std::fs::{self, File, Metadata};
 use std::io::Read as _;
 use std::path::Path;
@@ -150,7 +151,14 @@ pub fn scan(
         rep.walked += 1;
         let kind = kind_of(&md);
         let mtime_ns = mtime_of(&md);
-        let key = keys::worktree_key(pid, &rel);
+        // 目录行的键尾带一个 `/`（见 `keys::worktree_dir_key`）：`W` 的键序就是字节序，
+        // 不带这个斜杠时 `src` < `src.rs` < `src/main.rs`，一个目录的子树会被同名前缀的兄弟
+        // 文件切开，流式建树的栈就会提前结算再重开 ⇒ 父层出现两条 `src`（§17 补记十五）。
+        let key = if kind == Kind::Dir {
+            keys::worktree_dir_key(pid, &rel)
+        } else {
+            keys::worktree_key(pid, &rel)
+        };
         // size + mtime 都没变 ⇒ 不重算 hash（§8 允许粗筛，正确性仍由 hash 兜底）。
         // let 链（edition 2024）：比嵌套 if 少一层缩进，也不会触发 collapsible_if。
         let size = logical_size(&md, kind);
@@ -234,12 +242,25 @@ fn walk_builder(dir: &Path) -> ignore::WalkBuilder {
 }
 
 fn forced_excluded(name: &str) -> bool {
-    name == ".git" || name == ".twosync" || name == ".twosync-project"
+    // `.tsprobe-` 是大小写探针（`utils::dest_case_insensitive`）写的临时文件：它必须落在
+    // **被测的那个目录里**才有意义（同一次挂载才同一套规矩），所以反过来要在扫描器这一侧
+    // 永久排除——进程在 create 与 remove 之间被杀的话，留下的探针会被下一轮 `scan`
+    // 当成项目内容，一个只读探针就成了污染源。
+    name == ".git"
+        || name == ".twosync"
+        || name == ".twosync-project"
+        || name.starts_with(".tsprobe-")
 }
 
 fn rel_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     let s = rel.to_string_lossy().replace('\\', "/");
+    // §8 想做的 NFC 归一化**这里故意不做**，原因不是偷懒：磁盘名字与仓库名字必须是同一份字节，
+    // 否则 `commit` 拿 NFC 形式去 `open` 一个 NFD 名字的文件就找不到它（ext4/NTFS 都不做
+    // 查找期归一化，只有 APFS 做）。要真归一化，就得连带把**原始磁盘名**存进 `W`/清单，
+    // 那是格式层面的改动 ⇒ 挂在 §14 Q13 等人拍板。
+    // 现在做的是不需要改格式的那一半：**比较**用 NFC + 小写（`keys::fold_path`），
+    // 所以 `é`(单个码点) 与 `é`(e+组合音标) 在大小写门上会被当成同一个名字拒掉。
     (!s.is_empty()).then_some(s)
 }
 

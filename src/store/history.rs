@@ -180,6 +180,47 @@ fn descend(
     }
     Ok(())
 }
+/// 把**每一层的整份清单**交给回调（回调报错就中断）。给"这一层内部有没有折叠碰撞"这类
+/// **按层**判定用（§8 的大小写门）。
+///
+/// 与 [`walk_tree`] 的区别只是交付粒度：这里一层一次，条目对象不复制。
+/// 内存 = 手上这一层 + 递归栈上各祖先层（层数被路径长度钉住），**与文件总数无关**（§9.6.1）。
+/// 代价说清：它要**每层一次 `get`**，也就是 O(目录数) 次引擎调用——所以只在真要落盘的
+/// 命令上跑（`checkout` / `restore --to`），`ls-files` 那种看一眼的活儿不查。
+pub fn walk_levels(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Hash,
+    on_level: &mut dyn FnMut(&str, &[object::TreeEntry]) -> Result<()>,
+) -> Result<()> {
+    let list = object::read_tree(db, pid, root)?;
+    on_level("", &list)?;
+    descend_levels(db, pid, "", &list, on_level)
+}
+
+fn descend_levels(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    prefix: &str,
+    list: &[object::TreeEntry],
+    on_level: &mut dyn FnMut(&str, &[object::TreeEntry]) -> Result<()>,
+) -> Result<()> {
+    for e in list {
+        if e.kind != Kind::Dir {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        let inner = object::read_tree(db, pid, &e.hash)?;
+        on_level(&path, &inner)?;
+        descend_levels(db, pid, &path, &inner, on_level)?;
+    }
+    Ok(())
+}
+
 /// 把用户写的 rev 解析成 commit 集合。语法三档：
 /// - `HEAD` / ref 名 → 该 ref 的 head 集合（多 head 就返回多个）
 /// - 十六进制前缀（偶数长度）→ 唯一匹配的那个 commit

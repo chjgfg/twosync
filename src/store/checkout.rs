@@ -63,6 +63,7 @@ use storage_engines::KvEngine;
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::{build, cas, history, object, restore};
+use crate::utils;
 
 /// 一次 `checkout` 的三个开关。它们全是"敢不敢动手"的档位，拆成三个位置参数迟早会被
 /// 调用方传反，所以收成一个结构体。
@@ -149,9 +150,62 @@ pub fn checkout(
     if !opts.apply {
         return Ok(rep);
     }
+    // §8 的大小写门：真要落盘了才查（查询本身是 O(目录数) 次引擎调用，不该花在"看一眼"上）。
+    if !rep.is_noop() {
+        check_case_collisions(
+            db,
+            pid,
+            &old_root,
+            clean,
+            utils::dest_case_insensitive(work_root),
+        )?;
+    }
     rep = run(&ctx, true, old_root, clean)?;
     rep.applied = true;
     Ok(rep)
+}
+
+/// **要落的树里任何一层都不许有两个折叠相等的名字**（`README.md` 与 `Readme.md`），
+/// 前提是目标盘不区分大小写——那时候它们就是同一个格子，后写的把先写的静默吃掉。
+///
+/// `insensitive` 由调用方给（`utils::dest_case_insensitive` 现测），**不是**内部常量：
+/// 一是在大小写敏感的开发机上也能把这条门测到（所以这个函数是 `pub`），二是换盘/换挂载点
+/// 时结论跟着变——同一个仓库在 ext4 上检出没问题、搬到 NTFS 上就该拒。
+///
+/// 为什么不在扫描/提交时就拦：那两个名字在 ext4 上是**合法的两个文件**，历史必须容得下
+/// 它们（拦了就把人家的仓库写坏了）。这条门管的是"落到装不下的盘上"那一刻。
+///
+/// 为什么不用 §9.2 里那张 `A` 折叠索引：写一行 `A` = 每行多一次引擎调用，而在 0.4.0 上
+/// 每次调用都要折一遍全库（§9.6.1）——那笔账比这一趟 O(目录数) 的预检贵一个数量级。
+/// 内存也不会因此变大：`walk_levels` 一次只握着一层的清单，与 `read_tree` 本来就握的一样。
+pub fn check_case_collisions(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Hash,
+    at: &str,
+    insensitive: bool,
+) -> Result<()> {
+    if !insensitive {
+        return Ok(());
+    }
+    let show = |dir: &str| -> String {
+        match (at.is_empty(), dir.is_empty()) {
+            (true, true) => ".".to_string(),
+            (true, false) => dir.to_string(),
+            (false, true) => at.to_string(),
+            (false, false) => format!("{at}/{dir}"),
+        }
+    };
+    history::walk_levels(db, pid, root, &mut |dir, list| {
+        match object::fold_collision(list) {
+            Some((a, b)) => Err(Error::CaseCollision {
+                dir: show(dir),
+                a,
+                b,
+            }),
+            None => Ok(()),
+        }
+    })
 }
 
 /// 两趟遍历共用的坐标。收成一个结构体不只是躲 `too_many_arguments`：
@@ -484,6 +538,17 @@ pub fn export(
             })?;
         dir_only(&want, clean)?
     };
+
+    // §8 的大小写门。导出的**只报**那一趟也查：导出本身就是逐层读清单（O(目录数) 次），
+    // 再走一层预检只是把同一份工作做两遍，而"预告能导、真导才被拒"是最难解释的一种意外。
+    let probe_at = nearest_existing(o.dest)?;
+    check_case_collisions(
+        db,
+        pid,
+        &root,
+        clean,
+        utils::dest_case_insensitive(&probe_at),
+    )?;
 
     let mut rep = Export::default();
     history::walk_tree(db, pid, &root, &mut |path, e| {

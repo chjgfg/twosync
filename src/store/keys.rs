@@ -141,8 +141,22 @@ pub fn refcnt_key(pid: ProjectId, refcnt: u64, hash: &Hash) -> Vec<u8> {
 }
 
 /// path 在键尾 ⇒ `prefix_scan(W|p|"src/")` 就是一棵子树（§8 的"只扫脏子树"靠它）。
+///
+/// **目录行是例外，键尾多一个 `/`**（见 [`worktree_dir_key`]）。理由不是美观：`W` 的键序
+/// 就是字节序，而 `'/'`(0x2F) 夹在 `.`(0x2E) 与 `0`(0x30) 之间 ⇒ 目录行若叫 `src`，它的子项
+/// `src/main.rs` 就会被兄弟文件 `src.rs` 隔开，而流式建树的栈只认"上一层走完没有"——
+/// 结果是同一个目录被建两次帧、父层出现两条同名条目、`commit` 直接失败（§17 补记十五，
+/// 由 §10.1(b) 的随机用例抓到）。键成 `src/` 之后"目录自己 + 它全部子项"共享同一个前缀，
+/// 在字节序里**必然连续**，栈式遍历的前提才成立。git 的 tree 排序是同一条规矩。
 pub fn worktree_key(pid: ProjectId, path: &str) -> Vec<u8> {
     keyed(TAG_WORKTREE, pid, path.as_bytes())
+}
+
+/// 目录行。读回来时由 `build::LiveRows` 去掉尾随的 `/`，所以下游看到的路径形状不变。
+pub fn worktree_dir_key(pid: ProjectId, path: &str) -> Vec<u8> {
+    let mut tail = path.as_bytes().to_vec();
+    tail.push(b'/');
+    keyed(TAG_WORKTREE, pid, &tail)
 }
 
 /// 扫描标记键。`Z|p` 定长 5 字节、无尾段，所以 `project_prefix(TAG_SCAN, pid)` 就是它本身。
@@ -176,12 +190,30 @@ pub fn peer_key(peer_id: &[u8]) -> Vec<u8> {
     k
 }
 
-/// §8：清单键与折叠索引都用 NFC + `/` 分隔 + 小写。
+/// NFC 归一化助手。**目前只服务于比较**（`fold_path`），还没有用于"仓库内路径的身份"——
+/// 那一半要连带把原始磁盘名存进 `W`/清单才安全（在不自动归一化的文件系统上，NFC 形式
+/// 找不回 NFD 名字的文件），属格式决定 ⇒ §14 Q13。
+///
+/// 背景：macOS 把名字存成 **NFD**（`é` = `e` + 组合音标），Linux 存原始字节 ⇒ 同一张脸
+/// 两串字节。至少要让她在**比较**上相等，否则大小写/唯一性这类门形同虚设。
+///
+/// 已经是 NFC 的名字（绝大多数）返回 `Borrowed`，不多分配一次。
+pub fn nfc(path: &str) -> std::borrow::Cow<'_, str> {
+    if unicode_normalization::is_nfc(path) {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        use unicode_normalization::UnicodeNormalization;
+        std::borrow::Cow::Owned(path.nfc().collect())
+    }
+}
+
+/// §8：折叠键 = **NFC** + `/` 分隔 + 小写。只用于比较/唯一性，不参与任何 hash 身份。
+///
+/// 折叠这一路的用途只有一个：回答"这两个名字放到大小写不敏感的盘上是不是同一个格子"。
 pub fn fold_path(path: &str) -> String {
-    path.replace('\\', "/")
+    nfc(path)
+        .replace('\\', "/")
         .to_lowercase()
-        .chars()
-        .collect::<String>()
 }
 
 /// 前缀的**上界** = 字典序里第一个不以它开头的键。给 `scan(Some(lo), Some(hi))` 当 `hi`。
@@ -307,6 +339,44 @@ mod tests {
         let upper = prefix_upper_bound(&worktree_key(1, "a")).unwrap();
         let window: Vec<_> = keys.range(cursor..upper).cloned().collect();
         assert_eq!(window, vec![worktree_key(1, "ab"), worktree_key(1, "ac")]);
+    }
+
+    /// 目录行的键尾带 `/` ⇒ "目录自己 + 它全部子项"在字节序里**连续**。
+    /// 这是流式建树的栈唯一成立的前提：不连续时一个目录会被结算两次，父层就出现两条同名条目
+    /// （§17 补记十五那个真 bug）。这里把"谁排在谁前面"逐位钉死，改排序规则立刻红。
+    #[test]
+    fn dir_keys_keep_a_subtree_contiguous() {
+        let pid = project_id("p");
+        // (显示名, 键)：`src` 是目录，其余是文件/目录混排，专门挑 `'.'` `'/'` `'0'` 这三个字节。
+        let rows = [
+            ("f:main.rs", worktree_key(pid, "main.rs")),
+            ("f:src.rs", worktree_key(pid, "src.rs")),
+            ("d:src", worktree_dir_key(pid, "src")),
+            ("f:src/a", worktree_key(pid, "src/a")),
+            ("d:src/n", worktree_dir_key(pid, "src/n")),
+            ("f:src/n/x", worktree_key(pid, "src/n/x")),
+            ("f:src0", worktree_key(pid, "src0")),
+        ];
+        let mut sorted = rows.clone();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+        let order: Vec<&str> = sorted.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            order,
+            vec![
+                "f:main.rs",
+                "f:src.rs",
+                "d:src",
+                "f:src/a",
+                "d:src/n",
+                "f:src/n/x",
+                "f:src0",
+            ],
+            "`src` 这一层必须自己开个头、子项紧跟其后，中间不许插进任何别的条目"
+        );
+        // 子树前缀扫的边界也一并钉住：`src/` 的上界正好把 `src0` 挡在外面。
+        let lo = worktree_dir_key(pid, "src");
+        let hi = prefix_upper_bound(&lo).unwrap();
+        assert!(worktree_key(pid, "src0") >= hi, "兄弟 `src0` 不该落在 src 的子树窗里");
     }
 
     /// path 在尾段 ⇒ 子树前缀扫成立，且不会误吞同目录名的兄弟。

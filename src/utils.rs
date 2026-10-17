@@ -5,6 +5,30 @@ use storage_engines::{EngineConfig, EngineKind, KvEngine, StorageConfig};
 
 use crate::error::{Error, Result};
 
+/// 目标目录所在的文件系统**是否大小写不敏感**。§8「折叠碰撞必须拒」那道门要有它才知道该不该拦。
+///
+/// 只有一条可靠的路：**在那个目录里**造一个探针文件，再看它另一种大小写的写法是不是同一个东西。
+/// 换目录就是换规矩（同一次挂载才同一套），所以探针不能放在别处测。写完立刻删。
+///
+/// 探不了（只读盘、没权限、目录还不存在）就退回 `cfg!(windows)`：NTFS 默认不敏感，其余按敏感
+/// 处理。这是**猜**，不是测——调用方拒了要能说清为什么拒。
+pub fn dest_case_insensitive(dir: &Path) -> bool {
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 两个名字只差一个字母的大小写 ⇒ 折叠之后相同。带上 pid + 自增序号：并发进程与同一进程
+    // 的多次调用都不撞（本机 `SystemTime` 粒度约 15.6 ms，光靠时间戳会撞名）。
+    let tag = format!("{}.{seq}", std::process::id());
+    let lower = dir.join(format!(".tsprobe-a{tag}"));
+    let upper = dir.join(format!(".tsprobe-A{tag}"));
+    let Ok(handle) = fs::File::create(&lower) else {
+        return cfg!(windows);
+    };
+    drop(handle);
+    let hit = fs::symlink_metadata(&upper).is_ok();
+    let _ = fs::remove_file(&lower);
+    hit
+}
+
 /// 站点级数据根：`<root>/.twosync`。FR-12 的强制排除以它为准，扫描器永不进这里。
 pub fn site_dir(root: &Path) -> PathBuf {
     root.join(".twosync")

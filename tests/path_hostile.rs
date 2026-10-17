@@ -335,3 +335,179 @@ fn case_only_differing_names_stay_distinct() {
     .unwrap();
     assert_eq!(n, 2, "两个都是独立条目：折叠就等于把一份历史塞给两个路径");
 }
+
+// ── §8 的大小写门：折叠相等的名字，落到不区分大小写的盘上必须拒 ────────────
+
+/// 一条最小清单条目（门只看名字，hash 是真块无所谓——检出门不读字节）。
+fn entry(name: &str, body: &[u8]) -> object::TreeEntry {
+    object::TreeEntry {
+        name: name.to_string(),
+        kind: Kind::File,
+        hash: keys::hash_of(body),
+        size: body.len() as u64,
+        mode: 0o100644,
+    }
+}
+
+/// 检测器本身：只有"折叠之后相等、字节不同"才算碰撞。
+#[test]
+fn fold_detector_pairs_case_twins_only() {
+    let twins = vec![entry("README.md", b"a"), entry("Readme.md", b"b")];
+    assert_eq!(
+        object::fold_collision(&twins),
+        Some(("README.md".to_string(), "Readme.md".to_string())),
+        "这一对在不敏感的目标盘上是同一个格子"
+    );
+    let distinct = vec![entry("readme.md", b"a"), entry("notes.md", b"b")];
+    assert_eq!(object::fold_collision(&distinct), None);
+    // 完全同名是另一件事（`put_tree` 自己就拒），不该混进"折叠碰撞"这一类。
+    let same = vec![entry("x.md", b"a"), entry("x.md", b"b")];
+    assert_eq!(object::fold_collision(&same), None, "同名同字不算折叠碰撞");
+}
+
+/// 门随目标盘变：**同一条历史**在大小写敏感的盘上合法、搬到不敏感的盘上就该拒。
+/// 树是手工造的（`put_tree`），所以这条在 Windows 开发机上也测得到——盘上根本建不出
+/// 一对仅大小写不同的文件（§10.3 例外①），只有绕开磁盘才测得动这条门。
+#[test]
+fn case_gate_refuses_only_when_the_target_folds() {
+    let site = Site::new(&[("keep.txt", b"keep")]);
+    let list = vec![
+        entry("README.md", b"one"),
+        entry("Readme.md", b"two"),
+        entry("notes.md", b"n"),
+    ];
+    let tree = object::put_tree(&*site.db, site.pid, &list).unwrap();
+
+    checkout::check_case_collisions(&*site.db, site.pid, &tree, "", false)
+        .expect("区分大小写的盘上这是两个合法文件，不该拦");
+    let err = checkout::check_case_collisions(&*site.db, site.pid, &tree, "", true)
+        .expect_err("不敏感的目标盘上这对名字会落到同一个格子");
+    match err {
+        Error::CaseCollision { dir, a, b } => {
+            assert_eq!(dir, ".", "根层的显示名该是 `.`，不是空串");
+            assert_eq!((a.as_str(), b.as_str()), ("README.md", "Readme.md"));
+        }
+        other => panic!("报错类型不对：{other}"),
+    }
+
+    // 子树作用域：报错要说清是**哪一层**碰撞，否则用户不知道该动哪个目录。
+    let dir_entry = object::TreeEntry {
+        name: "docs".to_string(),
+        kind: Kind::Dir,
+        hash: tree,
+        size: 0,
+        mode: 0o40755,
+    };
+    let root = object::put_tree(&*site.db, site.pid, &[dir_entry]).unwrap();
+    let e = checkout::check_case_collisions(&*site.db, site.pid, &root, "", true)
+        .expect_err("子树里的碰撞也要被 walk_levels 走到");
+    assert!(
+        format!("{e}").contains("docs"),
+        "报错没带目录名：{e}"
+    );
+}
+
+/// 折叠比"仅大小写"严一点：NFC 的 `é` 与 NFD 的 `é` 也算同一个名字。
+/// NTFS 上它们其实是两个文件，但 APFS 会把两种写法当成同一个 ⇒ 宁可多拒一次
+/// （拒绝可恢复），不静默吃掉文件（不可恢复）。
+/// **身份那一半没归一化**（`case_only_differing_names_stay_distinct` 钉着），
+/// 那一半要连带存原始磁盘名 ⇒ §14 Q13。
+#[test]
+fn fold_also_collapses_normalization_forms() {
+    let nfc = "\u{e9}.md"; // 单个码点 é
+    let nfd = "e\u{301}.md"; // e + 组合音标
+    assert_ne!(nfc, nfd, "两串字节本来就不同，测的就是折叠把它收成同一个");
+    let list = vec![entry(nfc, b"a"), entry(nfd, b"b")];
+    assert_eq!(
+        object::fold_collision(&list),
+        Some((nfc.to_string(), nfd.to_string()))
+    );
+}
+
+/// 探针必须**自己收尾**：它是唯一落在用户工作树里的临时文件，留下残骸就等于一个只读命令
+/// 污染了项目内容。同时扫描器永久排除这个名字前缀，防"create 与 remove 之间被杀"。
+#[test]
+fn case_probe_is_self_cleaning_and_excluded() {
+    let dir = tempfile::tempdir().unwrap();
+    let _ = twosync::utils::dest_case_insensitive(dir.path());
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "探针文件没删干净"
+    );
+
+    let site = Site::new(&[("keep.txt", b"keep")]);
+    fs::write(site.proj().join(".tsprobe-a1234.5"), b"x").unwrap();
+    worktree::scan(&*site.db, site.pid, &site.proj(), false, 100).unwrap();
+    let tx = site.db.begin();
+    let keys: Vec<String> = tx
+        .prefix_scan(&keys::project_prefix(keys::TAG_WORKTREE, site.pid))
+        .into_iter()
+        .map(|r| String::from_utf8_lossy(&r.key).to_string())
+        .collect();
+    tx.commit();
+    assert_eq!(
+        keys.len(),
+        1,
+        "只该有 keep.txt 一行：{keys:?}"
+    );
+    assert!(keys[0].ends_with("keep.txt"), "{keys:?}");
+}
+
+/// 端到端：**不区分大小写的目标盘**上导出这一对名字必须被拒。
+///
+/// 挂 `#[cfg(windows)]` 是如实标注而不是想办法凑条件：NTFS 给探针的答案是"不敏感"，
+/// Linux 的 tempdir 是"敏感"，那条门在那边本来就不该拦（`case_gate_refuses_only_when_the_target_folds`
+/// 已经用手工传参把 `true` 与 `false` 两侧都测过了）。这条测的是**接线**：
+/// 命令真的会去探针、真的在写任何东西之前就停下。
+///
+/// 树是手工 `put_tree` + `put_commit` 造的——盘上根本建不出这对名字，绕开磁盘才测得动。
+#[cfg(windows)]
+#[test]
+fn export_refuses_case_twins_on_an_insensitive_destination() {
+    let site = Site::new(&[("keep.txt", b"keep")]);
+    let list = vec![entry("NOTE.md", b"one"), entry("Note.md", b"two")];
+    let tree = object::put_tree(&*site.db, site.pid, &list).unwrap();
+    let target = object::put_commit(
+        &*site.db,
+        site.pid,
+        &object::Commit {
+            parents: vec![],
+            tree,
+            peer: "t".to_string(),
+            ts: 9,
+            msg: "手工造的树".to_string(),
+            stats: object::Stats {
+                add: 2,
+                modify: 0,
+                delete: 0,
+                rename: 0,
+                bytes: 0,
+            },
+        },
+    )
+    .unwrap();
+
+    let dest = site.root().join("out");
+    let store = site.store();
+    let err = checkout::export(
+        &*site.db,
+        site.pid,
+        &store,
+        &ExportOpts {
+            target: &target,
+            prefix: None,
+            dest: &dest,
+            work_root: &site.proj(),
+            force: false,
+            apply: true,
+        },
+    )
+    .expect_err("NTFS 上 NOTE.md 与 Note.md 是同一个格子，必须拒");
+    let msg = err.to_string();
+    assert!(msg.contains("大小写碰撞"), "报错不对：{msg}");
+    assert!(msg.contains("NOTE.md") && msg.contains("Note.md"), "没报出是哪两个名字：{msg}");
+    // 停下必须发生在**写任何东西之前**：被拒之后目标里不该有一半的导出物。
+    let left = fs::read_dir(&dest).map(|mut d| d.count()).unwrap_or(0);
+    assert_eq!(left, 0, "被拒却留下了 {left} 个文件");
+}

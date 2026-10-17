@@ -178,6 +178,93 @@ fn no_change_build_makes_no_commit() {
     assert_eq!(site.head(), vec![first], "head 不许动");
 }
 
+/// §17 补记十五（2026-10-17，由 §10.1(b) 的随机用例抓出来的真 bug）。
+///
+/// `src`（目录）与 `src.rs`（兄弟文件）这一对名字在 `W` 的**字节序**里排成
+/// `src` < `src.rs` < `src/main.rs`——目录自己那一行与它的子项被隔开了。流式建树的栈只问
+/// "上一层走完没有"，于是把 `src` 结算两次，父层出现两条同名条目，`commit` 报
+/// "目录清单里有重名条目"。修法是**目录行的键尾带 `/`**（`keys::worktree_dir_key`），
+/// 让"目录自己 + 它全部子项"共享前缀、在字节序里必然连续。
+///
+/// 这条用例钉的是结果：这种形状必须提得动，而且 `src` 在父层只许有一条。
+#[test]
+fn prefix_colliding_sibling_builds_exactly_one_dir_entry() {
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("src/main.rs"), b"fn main() {}");
+    write(&proj.join("src.rs"), b"stub");
+    write(&proj.join("src/util/cmp.rs"), b"cmp"); // 第二层也要被隔开一次才算数
+    write(&proj.join("src0"), b"other"); // '/'(0x2F) < '0'(0x30)：另一头的邻居
+
+    let built = site.commit(cas::DEFAULT_BLOCK, false);
+    assert!(built.commit.is_some(), "这一串名字必须提得动");
+    let root = object::read_tree(&*site.db, site.pid, &built.tree).unwrap();
+    let named = |n: &str| root.iter().filter(|e| e.name == n).count();
+    assert_eq!(named("src"), 1, "目录 src 只许有一条：{:?}", root);
+    assert_eq!(named("src.rs"), 1, "4 个文件 + 2 个目录都在账上");
+    assert_eq!(named("src0"), 1);
+    assert_eq!(built.entries, 6, "4 文件 + src + src/util");
+
+    // 而且不是一条"空目录"：子项必须真的在里面。
+    let src = root.iter().find(|e| e.name == "src").expect("src 该在根层");
+    assert_eq!(src.kind, Kind::Dir);
+    let inner = object::read_tree(&*site.db, site.pid, &src.hash).unwrap();
+    assert!(
+        inner.iter().any(|e| e.name == "main.rs" && e.kind == Kind::File),
+        "src 层内容不对：{:?}",
+        inner
+    );
+    let util = inner.iter().find(|e| e.name == "util").expect("util 该在 src 里");
+    assert_eq!(util.kind, Kind::Dir);
+    let deep = object::read_tree(&*site.db, site.pid, &util.hash).unwrap();
+    assert_eq!(deep.len(), 1, "src/util 只该有 cmp.rs：{:?}", deep);
+    assert_eq!(deep[0].name, "cmp.rs");
+}
+
+/// 同一族形状，走**只读**那条路：`plan` 与 `commit` 共用同一个遍历，重名条目不该只出现在写侧。
+#[test]
+fn plan_tolerates_the_same_shape() {
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("data/x.bin"), b"x");
+    write(&proj.join("data.bin/y.bin"), b"y");
+    write(&proj.join("data.bin/y.bin.z"), b"z");
+    site.scan();
+    let built = build::plan(&*site.db, site.pid).expect("plan 不许因为名字撞前缀就报错");
+    assert_eq!(built.entries, 5, "3 文件 + data + data.bin");
+}
+
+/// 限定子树那一趟**不许把子树自己的目录行也算成一个子项**。
+///
+/// `LiveRows::with_prefix("d")` 的键前缀就是 `W|p|d/`，而目录行 `d` 的键（补记十五之后带
+/// 尾随斜杠）**正好等于前缀** ⇒ 尾巴是空串。收进来会得到一个尾随斜杠的路径 `d/`，
+/// 下游 `align` 的补帧能转成死循环（2026-10-17 键序改动第一版就把 `checkout --prefix` 挂住了）。
+#[test]
+fn subtree_scan_excludes_the_subtrees_own_dir_row() {
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("a.txt"), b"a");
+    write(&proj.join("d/b.txt"), b"b");
+    write(&proj.join("d/e/c.txt"), b"c");
+
+    let built = site.commit(cas::DEFAULT_BLOCK, false);
+    assert_eq!(built.entries, 5, "a.txt + d + d/b.txt + d/e + d/e/c.txt");
+
+    let root = object::read_tree(&*site.db, site.pid, &built.tree).unwrap();
+    let d = root.iter().find(|e| e.name == "d").expect("根层该有 d");
+    assert_eq!(d.kind, Kind::Dir);
+
+    let sub = build::compare_subtree(&*site.db, site.pid, None, "d").unwrap();
+    assert_eq!(
+        sub.entries, 3,
+        "子树那趟只该看见 d 的子项：b.txt + e + e/c.txt"
+    );
+    assert_eq!(
+        sub.tree, d.hash,
+        "单独走一棵子树必须得到与全树里那一格**同一个** hash"
+    );
+}
+
 #[test]
 fn deleted_file_counts_as_delete_and_keeps_its_blob() {
     let site = Site::new();

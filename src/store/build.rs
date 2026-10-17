@@ -665,9 +665,20 @@ impl<'a> LiveRows<'a> {
         let mut keep = Vec::with_capacity(found.items.len());
         for r in found.items {
             self.seen_rows += 1;
-            let Some((_, path)) = r.key.split_at_checked(self.prefix.len()) else {
+            let Some((_, tail)) = r.key.split_at_checked(self.prefix.len()) else {
                 continue;
             };
+            // 限定子树时前缀就是 `at + "/"`，于是 **`at` 自己的目录行尾巴是空串**（键 == 前缀本身）。
+            // 它不许进这趟流：根帧已经由 `Walk::at` 给出，再当子项就是自我嵌套；更坏的是
+            // `path_of("")` 会拼出带尾随斜杠的路径 `d/`，下游拿它去补帧会**转成死循环**
+            // （2026-10-17 键序改动的第一版就是这样把 `checkout --prefix` 挂住的）。
+            if tail.is_empty() {
+                continue;
+            }
+            // 目录行的键尾带尾随 `/`（§9.2 的键序规矩，见 `keys::worktree_dir_key`）。
+            // **在这里**剥掉，所以下游（帧、observe、打印、对账）看到的路径形状和以前一样——
+            // 键序的事只属于键，不许泄漏成"到处都是带斜杠的路径"。
+            let path = tail.strip_suffix(b"/").unwrap_or(tail);
             // `value` 只在 `include_deleted(true)` 时才是 None（tombstone），我们没开。
             let Some(raw) = r.value else { continue };
             let e: WtEntry = dec(&raw, "WtEntry")?;
@@ -724,17 +735,19 @@ fn is_ancestor(d: &str, p: &str) -> bool {
 }
 
 /// 从 `cur` 往 `parent` 方向再下一层。`cur` 必须是 `parent` 的祖先。
-fn next_ancestor(cur: &str, parent: &str) -> String {
-    let rest = parent
-        .strip_prefix(cur)
-        .unwrap_or(parent)
-        .trim_start_matches('/');
-    let seg = rest.split('/').next().unwrap_or(rest);
-    if cur.is_empty() {
+/// 沿 `parent` 的方向往下走**一段**。返回 `None` = `cur` 根本不是 `parent` 的祖先，
+/// 或者抠出来的那一段是空的（畸形路径，比如尾随斜杠）。
+///
+/// 老写法在这里 `unwrap_or(parent)` 兜了一手"不是前缀就当相对路径"，于是给一个畸形
+/// `parent` 就能一直拼出 `d/d/d/…`——`align` 的补帧循环永远不会结束（挂死过一次，见 align）。
+fn next_ancestor(cur: &str, parent: &str) -> Option<String> {
+    let rest = parent.strip_prefix(cur)?.trim_start_matches('/');
+    let seg = rest.split('/').next().filter(|s| !s.is_empty())?;
+    Some(if cur.is_empty() {
         seg.to_string()
     } else {
         format!("{cur}/{seg}")
-    }
+    })
 }
 
 /// 融合遍历的坐标：跟哪个版本比、从哪个目录开始、单层的内存盖子多大。
@@ -897,9 +910,15 @@ impl<'a, 'w> Builder<'a, 'w> {
         }
         // 中间层没有 `W` 行（比如手工塞进一条深层路径）⇒ 按段序补空帧。少了这一步，
         // 那条路径会挂到错误的父目录上去。老实现的 `ensure_dir` 干的是同一件事。
+        // 每一轮都必须**严格更深**（`next_ancestor` 给 None 就是补不下去），所以这个循环
+        // 最多走 `parent` 的层数次；挂死的那一次就是没有这条保证。
         while self.top().dir != parent {
             let cur = self.top().dir.clone();
-            let next = next_ancestor(&cur, parent);
+            let Some(next) = next_ancestor(&cur, parent) else {
+                return Err(Error::Codec(format!(
+                    "补帧补不动：当前层 {cur} 不是目标父层 {parent} 的祖先（路径畸形？）"
+                )));
+            };
             self.push(&next, 0o40755)?;
         }
         Ok(())

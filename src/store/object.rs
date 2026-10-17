@@ -15,6 +15,8 @@
 //! 10 万目录 × 1000 个 commit 就是 1 亿行垃圾。所以 `put_*` 先查后写；这一跳 `get` 在
 //! diff 层会被"已知集合"替代（引擎点查目前 0.86 ms/次，见 §17 补记）。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use storage_engines::KvEngine;
 
@@ -91,8 +93,16 @@ pub fn tree_hash(entries: &[TreeEntry]) -> Hash {
 fn canonical(entries: &[TreeEntry]) -> Result<Vec<u8>> {
     let mut sorted = entries.to_vec();
     sorted.sort();
-    if sorted.windows(2).any(|w| w[0].name == w[1].name) {
-        return Err(Error::Codec("目录清单里有重名条目".to_string()));
+    // 重名时报出**是哪个名字**：只说"有重名"的话，下一个人只能从头把遍历打印一遍
+    // （2026-10-17 定位一条随机序列里的重名条目就是这样）。
+    if let Some(w) = sorted.windows(2).find(|w| w[0].name == w[1].name) {
+        return Err(Error::Codec(format!(
+            "目录清单里有重名条目：{}（该层 {} 条，两条分别是 {:?} 与 {:?}）",
+            w[0].name,
+            sorted.len(),
+            w[0].kind,
+            w[1].kind
+        )));
     }
     enc(&sorted)
 }
@@ -201,4 +211,25 @@ pub fn parents_of(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Vec<
         out.push(dec::<Hash>(&r.value.unwrap_or_default(), "parent")?);
     }
     Ok(out)
+}
+
+/// 同一层里**折叠后相等**的两个名字（`README.md` 与 `Readme.md`）。给第一对，按字节序确定。
+///
+/// 只在目标盘大小写不敏感时才是错误（§8：报错拒绝，绝不静默覆盖）。在大小写敏感的文件系统
+/// 上这两个名字是合法的两个文件，**历史必须容得下它们**——所以这一条不是扫描/提交的门，
+/// 而是**检出的门**（见 `checkout::assert_fold_safe`）。
+///
+/// 内存 = 一层的条目数：清单本来就在手里（`read_tree` 返回的就是整层），没有多留一份。
+pub fn fold_collision(entries: &[TreeEntry]) -> Option<(String, String)> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for e in entries {
+        let folded = keys::fold_path(&e.name);
+        let hit = seen.insert(folded, e.name.as_str());
+        if let Some(prev) = hit
+            && prev != e.name
+        {
+            return Some((prev.to_string(), e.name.clone()));
+        }
+    }
+    None
 }

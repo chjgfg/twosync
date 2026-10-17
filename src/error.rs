@@ -74,6 +74,15 @@ pub enum Error {
         path: std::path::PathBuf,
         why: String,
     },
+    /// §8：目标盘**不区分大小写**，而这一层的两个名字折叠后落到同一个格子（`README.md` 与
+    /// `Readme.md`）。历史里它们是合法的两个文件（在 ext4 上就是这么存的），检出到 NTFS 上
+    /// 就是后写的把先写的静默吃掉 ⇒ **报错拒绝**，不许覆盖、也不许改名瞎猜。
+    #[error("大小写碰撞：{dir} 这一层的 {a} 与 {b} 在目标盘上是同一个格子。请去掉其中一个，或检出到区分大小写的文件系统")]
+    CaseCollision {
+        dir: String,
+        a: String,
+        b: String,
+    },
     /// 设计上明确留给后面某个里程碑的行为。**不是**"忘了做"，报出来要能看出归谁。
     #[error("{what}：还没做，{milestone}")]
     NotYet {
