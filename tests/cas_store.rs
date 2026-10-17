@@ -208,3 +208,88 @@ fn corrupted_block_is_reported_not_silently_returned() {
     assert!(err2.to_string().contains("块校验失败"), "{err2}");
     assert!(!dest.exists(), "校验失败时不许留下半文件");
 }
+
+// ── 首次导入的两枚旋钮（§14 Q11）：不等 fsync / 限速 ──────────────────────
+
+/// 默认值必须是**安全**的那一档：不传任何开关就等 fsync、不限速。
+/// 这条断言看着像废话，但它是 `--fast-import` 唯一的存在理由——默认没变过。
+#[test]
+fn defaults_are_the_safe_slow_pair() {
+    let site = tmpdir();
+    let store = cas(site.path());
+    assert!(store.fsync_blocks(), "默认必须等 fsync");
+    assert_eq!(store.rate_limit_bps(), None, "默认不限速");
+}
+
+/// `--fast-import` 改的是**等待**，不是内容：块数、字节、读回来的 hash 都必须一样。
+/// 要是它让哪一块没落盘，`missing()`/`verify()` 会立刻说话，所以这条断言是有牙齿的。
+#[test]
+fn fast_import_changes_the_wait_not_the_bytes() {
+    let site = tmpdir();
+    let store = Cas::new(&site.path().join("objects"), DEFAULT_BLOCK)
+        .unwrap()
+        .with_fsync(false);
+    assert!(!store.fsync_blocks());
+
+    let body = distinct_body(2 * DEFAULT_BLOCK as usize - 1000); // 两块，末块短
+    let src = site.path().join("in.bin");
+    fs::write(&src, &body).unwrap();
+
+    let out = store.put_file(&src).unwrap();
+    assert_eq!(out.stored, 2, "两个块都该落盘");
+    assert_eq!(out.zero, 0);
+    assert!(out.blob.blocks[1].size < DEFAULT_BLOCK as u32, "末块该是短的");
+    assert_eq!(count_blocks(&site.path().join("objects")), 2);
+
+    let back = site.path().join("out.bin");
+    store.read_blob(&out.blob, &back).unwrap();
+    assert_eq!(fs::read(&back).unwrap(), body, "不等 fsync 不许改变一个字节");
+}
+
+/// 限速闸要真的把写盘拖慢到指定的平均速率附近。
+///
+/// 断言写成**下界**（不许比设定值快）+ 一个很宽的上界（防止它睡死）。
+/// 本机墙钟 run 间能飘 ±2 倍（§17 补记九那条），所以上界放到 8 倍：
+/// 这里要钉的是"闸门有效"，不是"睡得多准"。
+#[test]
+fn rate_limit_slows_the_write_down_to_the_configured_average() {
+    let site = tmpdir();
+    let block = 1u64 << 20; // 1 MiB
+    let limit = 1u64 << 20; // 1 MiB/s
+    let store = Cas::new(&site.path().join("objects"), block)
+        .unwrap()
+        .with_rate_limit(limit);
+    assert_eq!(store.rate_limit_bps(), Some(limit));
+
+    let body = distinct_body((3 * block) as usize); // 3 块 = 3 MiB ⇒ 至少要 ~3 s
+    let src = site.path().join("in.bin");
+    fs::write(&src, &body).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = store.put_file(&src).unwrap();
+    let took = started.elapsed();
+    assert_eq!(out.stored, 3);
+    assert!(
+        took.as_secs_f64() >= 2.0,
+        "限速 {limit} B/s 写完 3 MiB 只用了 {took:?}：闸没生效"
+    );
+    assert!(
+        took.as_secs_f64() < 24.0,
+        "用了 {took:?}，超出 8 倍预算 ⇒ 限速睡过了头（那是另一个 bug）"
+    );
+}
+
+/// `0` 当"不限速"，不许变成除零或"永远睡"。
+#[test]
+fn zero_limit_means_no_limit_at_all() {
+    let site = tmpdir();
+    let store = Cas::new(&site.path().join("objects"), DEFAULT_BLOCK)
+        .unwrap()
+        .with_rate_limit(0);
+    assert_eq!(store.rate_limit_bps(), None, "0 必须被当成不限速");
+    let src = site.path().join("in.bin");
+    fs::write(&src, distinct_body(4096)).unwrap();
+    let started = std::time::Instant::now();
+    store.put_file(&src).unwrap();
+    assert!(started.elapsed().as_secs() < 2, "不该有任何等待");
+}

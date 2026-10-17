@@ -22,12 +22,32 @@
 //!
 //! 顺带修正一处我先前说错的：第二遍**不需要**重算 hash——第一遍的清单已经给出每块
 //! 的 hash 和偏移，第二遍只是"照单搬运缺的那几段"。所以代价是 1 次全读 + 1 次脏块读。
+//!
+//! # 两个开关：`--fast-import` 与限速（§14 Q11，2026-10-17 定案）
+//!
+//! 10 GiB 首建库实测 5 071 s，而归因表（§11.1）说明那 84 分钟**几乎全在等 fsync**：
+//! 同一块机械盘上 fsync 单价 85.8 ms，不 fsync 快 33 倍。所以：
+//!
+//! - [`Cas::with_fsync(false)`]：落块**不等** fsync。**注意它放弃的是什么**——
+//!   不是顺序（仍是 `tmp → rename`，规矩 1 的顺序没动），而是"清单落盘之前块已经持久"这一半。
+//!   于是断电可能留下"清单说有、盘上其实是半截"的块。这种情况**不会静默**：
+//!   读回时按 hash 校验必失败（规矩 3 报 `CorruptBlock`），恢复办法是把那一版重新导入，
+//!   而不是假装它还在。默认 `true`；只有显式 `--fast-import` 才关，且命令行会打印放弃了什么。
+//! - [`Cas::with_rate_limit`]：往 CAS 写盘的平均速率闸（漏桶）。NFR-2 明写首建库"必须可限速"，
+//!   NFR-3 要的是"同步启动不许把同机策略进程的延迟拖走"——限速对象是写字节，不是 CPU。
+//!
+//! 这两个开关合起来就是"首次导入是磁盘速度的函数"这一事实的**可操作形式**：
+//! 想要快就 `--fast-import`，想要稳就默认，想要不打扰同机进程就 `--max-mbps`。
 
 use std::format;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +113,42 @@ impl PutOutcome {
 pub struct Cas {
     dir: PathBuf,
     block_size: u64,
+    /// 落块要不要等 fsync（默认 `true`）。关掉放弃了什么，见模块头。
+    fsync_blocks: bool,
+    /// CAS 写字节的平均速率闸。`None` = 不限速。放在 `Mutex` 里是因为 `Cas` 全程按
+    /// `&self` 传（`put_file`/`read_blob` 都是），而限速需要累计已写字节。
+    pacer: Mutex<Option<Pacer>>,
+}
+
+/// 漏桶限速：**只保证平均速率**，不削瞬时突发。
+///
+/// 为什么用"从第一次写开始的累计期望时间"而不是"每秒令牌数"：要防的是**长时间占着磁盘**
+/// （NFR-3 的延迟抖动），不是"某一个 64 KiB 写太快"。累计式写法不需要后台任务，
+/// 也就不会自己变成一个新的 IO/CPU 突发源。
+pub struct Pacer {
+    max_bps: u64,
+    start: Instant,
+    written: u64,
+}
+
+impl Pacer {
+    fn new(max_bps: u64) -> Self {
+        Self {
+            max_bps,
+            start: Instant::now(),
+            written: 0,
+        }
+    }
+
+    /// 记 `n` 字节；如果按平均速率还没到该写完的时间就睡一会儿。
+    fn charge(&mut self, n: u64) {
+        self.written += n;
+        let want = Duration::from_secs_f64(self.written as f64 / self.max_bps as f64);
+        let gone = self.start.elapsed();
+        if want > gone {
+            std::thread::sleep(want - gone);
+        }
+    }
 }
 
 impl Cas {
@@ -101,7 +157,40 @@ impl Cas {
         Ok(Self {
             dir: objects_dir.to_path_buf(),
             block_size,
+            fsync_blocks: true,
+            pacer: Mutex::new(None),
         })
+    }
+
+    /// `false` = 落块不等 fsync（`--fast-import`）。放弃的东西与恢复办法见模块头，
+    /// **调用方必须把它打印出来**，不许静默生效。
+    pub fn with_fsync(mut self, on: bool) -> Self {
+        self.fsync_blocks = on;
+        self
+    }
+
+    /// 限制写 CAS 的平均字节/秒；`0` 当"不限速"处理（省得调用方传个 0 变成除零）。
+    pub fn with_rate_limit(mut self, max_bps: u64) -> Self {
+        let pacer = if max_bps == 0 {
+            None
+        } else {
+            Some(Pacer::new(max_bps))
+        };
+        self.pacer = Mutex::new(pacer);
+        self
+    }
+
+    /// 命令层用它把"放弃了什么"如实印出来。
+    pub fn fsync_blocks(&self) -> bool {
+        self.fsync_blocks
+    }
+
+    pub fn rate_limit_bps(&self) -> Option<u64> {
+        self.pacer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|p| p.max_bps)
     }
 
     /// 块在库内的相对路径：`<hash[0:2]>/<hash[2:]>`，两级目录避免单目录爆十万文件。
@@ -219,6 +308,16 @@ impl Cas {
         Ok(())
     }
 
+    /// 把一个块读进内存。**M1 的发送侧与 `verify` 用**：`read_blob` 是"整块写到目的地"，
+    /// 而网络要的是字节本身，所以这里给一份带自证的读取（`copy_out` 会比对块名）。
+    /// 内存代价 = 一个块：4 MiB 是默认块大小的上限，超过它（`--block-size` 最大 64 MiB）
+    /// 调用方要自己考虑 §9.6.1 的预算，别在这里偷偷物化整库。
+    pub fn read_block(&self, hash: &Hash, size: u32) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(size as usize);
+        self.copy_out(hash, size, &mut buf, &mut blake3::Hasher::new())?;
+        Ok(buf)
+    }
+
     /// 逐块校验（`gc --fsck` 与 §10.2 用）。返回校验过的块数。
     pub fn verify(&self, blob: &Blob) -> Result<usize> {
         let mut n = 0;
@@ -321,7 +420,9 @@ impl Cas {
                 left -= n;
             }
             out.flush()?;
-            out.sync_all()?; // ← 先 fsync 再 rename（FR-13）
+            if self.fsync_blocks {
+                out.sync_all()?; // ← 先 fsync 再 rename（FR-13）；`--fast-import` 关的就是这一行
+            }
             drop(out);
             // 自证：源文件在这一会儿里被人改过的话，这里就会不符，而不是存进一个错块。
             if check.finalize().as_bytes() != &b.hash {
@@ -338,6 +439,7 @@ impl Cas {
             Ok(()) => match fs::rename(&tmp, &final_path) {
                 Ok(()) => {
                     sync_dir(final_path.parent().unwrap_or(&self.dir));
+                    self.pace(b.size as u64);
                     Ok(())
                 }
                 // 同名块已存在（并发或重跑）：内容 hash 相同 ⇒ 谁赢都一样，清掉自己的 tmp。
@@ -358,6 +460,14 @@ impl Cas {
         }
     }
 
+    /// 把刚写进 CAS 的字节数记进速率闸。放在 `rename` **之后**：被拒/重名复用的那次不该扣预算。
+    fn pace(&self, n: u64) {
+        let mut guard = self.pacer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = guard.as_mut() {
+            p.charge(n);
+        }
+    }
+
     /// 把库里一个块流式拷进 `dst`。**两个 hasher 各管各的**：
     /// - `block_hasher` 只装这一块，用来验块名（规矩 3）；
     /// - `whole` 累积整个文件，供 `read_blob` 末尾对清单 hash。
@@ -373,7 +483,19 @@ impl Cas {
     ) -> Result<()> {
         let mut block_hasher = blake3::Hasher::new();
         let path = self.dir.join(Self::path_of(hash));
-        let mut f = File::open(&path)?;
+        // **缺失与损坏是两件事**（§9.4.7）：缺失可以合法（那一块还没同步到），损坏永远不合法。
+        // 让 `NotFound` 裸穿出去，调用方就分不清"我这端没这东西"和"盘出事了"——
+        // `push` 会把它报成一次 IO 故障，而它其实是"先同步过来再说"。
+        let mut f = File::open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::MissingObject {
+                    hash: keys::short(hash),
+                    kind: "块".to_string(),
+                }
+            } else {
+                Error::Io(e)
+            }
+        })?;
         let mut buf = vec![0u8; CHUNK];
         let mut left = size as usize;
         while left > 0 {
