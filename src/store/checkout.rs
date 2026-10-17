@@ -5,8 +5,17 @@
 //! # 默认只报不动手
 //!
 //! 这就是 FR-8 层一里 `plan` / `apply` 那一对命令的形状：先看要干什么，再决定干不干。
-//! 实现上是**两趟遍历**：第一趟只数数（并过熔断闸），第二趟才执行。一趟遍历的代价是
-//! O(变更目录数)（未变子树整块跳过，NFR-6），跑两遍换来"动手之前已经看过全貌"，划算。
+//! 实现上是**两趟融合遍历**：第一趟只数数（并过熔断闸），第二趟才执行。每一趟都是
+//! `build::Walk`——工作树那一侧的树从来没进过库，只有流式遍历能给它的每一层清单。
+//! 跑两遍换来"动手之前已经看过全貌"，划算。
+//!
+//! # 方向是反的（这一条最容易读错）
+//!
+//! 融合遍历流式走的是**工作树**，参照侧是**要落地的版本**，所以回调里的
+//! `Add` = "工作树多出来的" ⇒ 磁盘上要**删**，`Delete` = "目标多出来的" ⇒ 要**建**。
+//! 老写法 `walk_pair(工作树, 目标)` 的参数顺序恰好相反。所以 [`Job::on`] 里两个端点
+//! 显式命名成 `reference` / `worktree`，不再用 `oe`/`ne`——靠位置猜方向就是下一个
+//! "把删读成建"的产地。
 //!
 //! # 三道闸，顺序固定
 //!
@@ -36,7 +45,7 @@
 //!
 //! - **类型互换**（同一路径上一边是文件、一边是目录）：记 `skipped` 并原样保留，
 //!   不做"先删后建"。这种路径多半是用户或某个 bug 搞出来的，静默二选一太贵。
-//! - **目录的 mode 变化**：`walk_pair` 对两侧同为目录的情况是直接递归，不看 mode；
+//! - **目录的 mode 变化**：`diff_level` 对两侧同为目录的情况是直接跳过/递归，不看 mode；
 //!   而 Windows 侧 mode 恒 0（§17 补记三），所以现在恢复目录权限位没有意义。
 
 use std::fs;
@@ -102,22 +111,32 @@ pub fn checkout(
     prefix: Option<&str>,
     opts: Opts,
 ) -> Result<Report> {
-    // 工作树那一侧来自 `plan`：它算出的树**没落盘**，所以清单必须跟着一起传下去。
-    let cur = build::plan(db, pid)?;
     let commit = object::read_commit(db, pid, target)?;
-    let (old, new, root) = roots(db, pid, &cur, &commit.tree, prefix)?;
+    let clean = prefix.unwrap_or("").trim_matches('/');
+    // 参照侧 = 目标版本里 `prefix` 那一层的 tree。目标里没有这一层 = 用户打错路径，必须报错。
+    let old_root = if clean.is_empty() {
+        commit.tree
+    } else {
+        let want =
+            history::resolve(db, pid, &commit.tree, clean)?.ok_or_else(|| Error::NoSuchPath {
+                rev: keys::short(target),
+                path: clean.to_string(),
+            })?;
+        dir_only(&want, clean)?
+    };
+
+    // 工作树现状要**另外**算一遍：FR-10 的分母与 `dirty` 都是"整个工作树"的口径，
+    // 而下面那趟遍历只在 `prefix` 那棵子树里走。这一趟不白跑——`plan` 现在也是常数内存。
+    let cur = build::plan(db, pid)?;
     let ctx = Ctx {
         db,
         pid,
         store,
         work_root,
-        cur: &cur,
-        root: &root,
-        old: &old,
-        new: &new,
+        dirty: cur.changes.add + cur.changes.modify + cur.changes.delete,
     };
 
-    let mut rep = run(&ctx, false)?;
+    let mut rep = run(&ctx, false, old_root, clean)?;
     build::check_mass_delete(
         rep.delete as u32,
         rep.deleted_bytes,
@@ -127,46 +146,51 @@ pub fn checkout(
     if !opts.apply {
         return Ok(rep);
     }
-    rep = run(&ctx, true)?;
+    rep = run(&ctx, true, old_root, clean)?;
     rep.applied = true;
     Ok(rep)
 }
 
 /// 两趟遍历共用的坐标。收成一个结构体不只是躲 `too_many_arguments`：
-/// "只报"和"真干"必须看**同一份**树、写到**同一个** `work_root` 下——少一个参数就会
+/// "只报"和"真干"必须看**同一个**参照版本、写到**同一个** `work_root` 下——少一个参数就会
 /// 出现"预告的是 A，干的是 B"。这个约束现在写在类型上。
 struct Ctx<'a> {
     db: &'a dyn KvEngine,
     pid: ProjectId,
     store: &'a cas::Cas,
     work_root: &'a Path,
-    cur: &'a build::Built,
-    root: &'a str,
-    old: &'a [object::TreeEntry],
-    new: &'a [object::TreeEntry],
+    /// 工作树相对 HEAD 的未提交改动数。**只告知，不拦**（理由见模块头"脏闸那一条"）。
+    dirty: u32,
 }
 
 /// 一趟遍历。`apply = false` 只记账，`true` 边记账边落地。
 ///
 /// 两趟共用同一个 `Job::on`：**分类只有一份**。早先"只数"和"真干"是两个函数，
 /// 于是 `skipped` 的判定条件写了两遍——那是下一个静默偏差的产地。
-fn run(ctx: &Ctx<'_>, apply: bool) -> Result<Report> {
+fn run(ctx: &Ctx<'_>, apply: bool, old_root: Hash, at: &str) -> Result<Report> {
     let mut job = Job {
         ctx,
         apply,
         rep: Report::default(),
     };
-    build::walk_pair(
-        ctx.db,
-        ctx.pid,
-        &ctx.cur.trees,
-        ctx.root,
-        ctx.old,
-        ctx.new,
-        &mut |kind, path, oe, ne| job.on(kind, path, oe, ne),
+    let mut rows = build::LiveRows::with_prefix(ctx.db, ctx.pid, at);
+    let mut built = build::Built::default();
+    let walk = build::Walk {
+        db: ctx.db,
+        pid: ctx.pid,
+        // 参照侧恒在：没有目标版本这件事在 `read_commit` 就已经报过了。
+        old_root: Some(old_root),
+        at,
+        dir_cap: build::MAX_DIR_ENTRIES,
+    };
+    // `HashOnly` 那一路只算 hash 不落盘——这一趟不许写库，写库的是 `commit`。
+    walk.run(
+        &mut rows,
+        &mut build::HashOnly,
+        &mut built,
+        &mut |kind, path, reference, worktree| job.on(kind, path, reference, worktree),
     )?;
-    // 只告知，不拦：见模块头"曾经有的那道脏闸"。数字来自 `plan`，与 `status` 同一个口径。
-    job.rep.dirty = ctx.cur.changes.add + ctx.cur.changes.modify + ctx.cur.changes.delete;
+    job.rep.dirty = ctx.dirty;
     Ok(job.rep)
 }
 
@@ -178,47 +202,61 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
+    /// **注意方向**（模块头那条）：`Add` = 工作树多出来的 ⇒ 要删；`Delete` = 目标多出来的 ⇒ 要建。
+    /// 所以这里按动作取名，样本里的 `+`/`-` 说的是磁盘上会发生什么，不是树差的正负号。
     fn on(
         &mut self,
         kind: build::ChangeKind,
         path: &str,
-        oe: Option<&object::TreeEntry>,
-        ne: Option<&object::TreeEntry>,
+        reference: Option<&object::TreeEntry>,
+        worktree: Option<&object::TreeEntry>,
     ) -> Result<()> {
-        let entry = ne.or(oe).expect("walk_pair 至少给一侧");
-        self.rep.note(format!("{} {path}", kind.sign()));
         match kind {
-            build::ChangeKind::Add => match entry.kind {
-                Kind::Dir => {
-                    self.rep.mkdir += 1;
-                    self.mkdir(path)
+            // 目标里有、工作树没有 ⇒ 建。内容取参照侧。
+            build::ChangeKind::Delete => {
+                let to = reference.expect("目标侧那一条一定在");
+                self.rep.note(format!("+ {path}"));
+                match to.kind {
+                    Kind::Dir => {
+                        self.rep.mkdir += 1;
+                        self.mkdir(path)
+                    }
+                    _ => {
+                        self.rep.create += 1;
+                        self.write(path, to)
+                    }
                 }
-                _ => {
-                    self.rep.create += 1;
-                    self.write(path, entry)
+            }
+            // 工作树有、目标没有 ⇒ 删。字节数按工作树那一份算（那是真要腾出来的空间）。
+            build::ChangeKind::Add => {
+                let e = worktree.expect("工作树那一条一定在");
+                self.rep.note(format!("- {path}"));
+                match e.kind {
+                    Kind::Dir => {
+                        self.rep.rmdir += 1;
+                        self.rmdir(path)
+                    }
+                    _ => {
+                        self.rep.delete += 1;
+                        self.rep.deleted_bytes += e.size;
+                        self.remove_file(path)
+                    }
                 }
-            },
+            }
             build::ChangeKind::Modify => {
-                let from = oe.expect("Modify 两侧都在");
-                if from.kind != entry.kind {
+                let (to, from) = (
+                    reference.expect("Modify 两侧都在"),
+                    worktree.expect("Modify 两侧都在"),
+                );
+                self.rep.note(format!("~ {path}"));
+                if from.kind != to.kind {
                     // 文件 ↔ 目录互换：v1 原样留着，不做"先删后建"。
                     self.rep.skipped += 1;
                     return Ok(());
                 }
                 self.rep.overwrite += 1;
-                self.overwrite(path, from, entry)
+                self.overwrite(path, to)
             }
-            build::ChangeKind::Delete => match entry.kind {
-                Kind::Dir => {
-                    self.rep.rmdir += 1;
-                    self.rmdir(path)
-                }
-                _ => {
-                    self.rep.delete += 1;
-                    self.rep.deleted_bytes += entry.size;
-                    self.remove_file(path)
-                }
-            },
         }
     }
 
@@ -236,6 +274,13 @@ impl Job<'_> {
             return Ok(());
         }
         let abs = self.dest(path);
+        // 融合遍历是**自底向上**结算的：新目录里的文件会比目录自己先报出来（老写法自顶
+        // 向下，父目录先建）。既然顺序反了，写入前就必须自己保证父目录存在，否则新目录里
+        // 的第一个文件会直接写着写着失败。`create_dir_all` 幂等，随后那条 `mkdir` 只是把
+        // 账记上——所以两个计数仍然各自准确。
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)?;
+        }
         // "新增"的路径上可能已经有个**扫描器没见过**的文件（未跟踪内容）。直接 rename 盖过去
         // 就是静默删除，所以只要那儿有东西，就照 §7.3 一样先问一遍。
         if std::fs::symlink_metadata(&abs).is_ok() {
@@ -250,14 +295,10 @@ impl Job<'_> {
         create(self.ctx.db, self.ctx.pid, self.ctx.store, to, &abs)
     }
 
-    fn overwrite(
-        &mut self,
-        path: &str,
-        from: &object::TreeEntry,
-        to: &object::TreeEntry,
-    ) -> Result<()> {
-        if !self.apply || from.kind == Kind::Dir {
-            // 两侧都是目录且内容不同：子项会在递归里各自处理，这里不需要动目录本身。
+    fn overwrite(&mut self, path: &str, to: &object::TreeEntry) -> Result<()> {
+        // 走到这里两侧 kind 必然相同且都不是目录：目录↔文件的互换在 `on` 里已经记
+        // `skipped` 返掉了，而"两侧同为目录"根本不会有 Modify 回调（`diff_level` 直接跳过）。
+        if !self.apply {
             return Ok(());
         }
         let abs = self.dest(path);
@@ -350,48 +391,9 @@ fn remove_existing(abs: &Path) -> Result<()> {
     }
 }
 
-/// 解析出要比对的两份**根清单**，以及样本里路径的起始前缀。
-fn roots(
-    db: &dyn KvEngine,
-    pid: ProjectId,
-    cur: &build::Built,
-    target_tree: &Hash,
-    prefix: Option<&str>,
-) -> Result<(Vec<object::TreeEntry>, Vec<object::TreeEntry>, String)> {
-    let clean = prefix.unwrap_or("").trim_matches('/');
-    if clean.is_empty() {
-        return Ok((
-            cur.trees.entries(db, pid, &cur.tree)?,
-            object::read_tree(db, pid, target_tree)?,
-            String::new(),
-        ));
-    }
-    // 目标侧没有这一层 = 用户打错路径，必须报错。
-    let want = history::resolve(db, pid, target_tree, clean)?.ok_or_else(|| Error::NoSuchPath {
-        rev: keys::short(target_tree),
-        path: clean.to_string(),
-    })?;
-    let new = dir_kids(db, pid, &history::TreeStore::default(), &want, clean)?;
-    // 工作树侧没有 = 正常，那一棵子树全是新增。
-    let Some(have) = history::resolve_in(db, pid, &cur.trees, &cur.tree, clean)? else {
-        return Ok((Vec::new(), new, clean.to_string()));
-    };
-    Ok((
-        dir_kids(db, pid, &cur.trees, &have, clean)?,
-        new,
-        clean.to_string(),
-    ))
-}
-
-/// `--prefix` 只接受目录：`checkout` 的比对单位是"一层目录"，单文件那是 `restore` 的活。
+/// `--prefix` 只接受目录：落地时的比对单位是"一层目录"，单文件那是 `restore` 的活。
 /// 允许文件前缀的话，就得给"路径根"再造一套第二语义，两条命令的边界会糊掉。
-fn dir_kids(
-    db: &dyn KvEngine,
-    pid: ProjectId,
-    trees: &history::TreeStore,
-    e: &object::TreeEntry,
-    path: &str,
-) -> Result<Vec<object::TreeEntry>> {
+fn dir_only(e: &object::TreeEntry, path: &str) -> Result<Hash> {
     if e.kind != Kind::Dir {
         return Err(Error::NotYet {
             what: format!(
@@ -401,7 +403,7 @@ fn dir_kids(
             milestone: "单个文件请用 `restore`，它一次处理一个路径",
         });
     }
-    trees.entries(db, pid, &e.hash)
+    Ok(e.hash)
 }
 
 fn kind_word(k: Kind) -> &'static str {

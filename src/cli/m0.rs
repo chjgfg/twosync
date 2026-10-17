@@ -408,8 +408,8 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<(
         );
     }
     println!("elapsed     = {:.3} s", started.elapsed().as_secs_f64());
-    // 与 scan 同一把尺：这一条要物化条目表（O(文件数)），所以它**不是**常数内存，
-    // 上限由 MAX_ENTRIES 显式兜着。这里打印是为了让那次权衡可见。
+    // 与 scan 同一把尺：融合遍历之后内存只跟**单个目录**挂钩，所以这里的峰值应当在
+    // 「最大单层目录 × 深度」这一档，与文件总数无关。打印是为了让那次权衡可核对。
     println!("peak heap   = {:.1} MiB", peak as f64 / 1048576.0);
     Ok(())
 }
@@ -829,7 +829,13 @@ pub fn status(cli: &Cli) -> Result<()> {
     let (name, _) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
+    // 与 scan/commit 同一把尺：融合遍历之后 NFR-1 的"内存与文件数无关"要能在**这条命令**
+    // 上被读出来，否则那句承诺只是注释。耗时也一起给——比对是 O(目录数) 次点查，
+    // 那一侧的代价必须同样可见。
+    let started = Instant::now();
+    let wm = allocstats::watermark();
     let p = build::plan(&*db, pid)?;
+    let peak = wm.peak_growth();
 
     println!("project   = {name}  (id={pid:#010x})");
     let heads = build::ref_heads(&*db, pid, build::MAIN)?;
@@ -851,6 +857,11 @@ pub fn status(cli: &Cli) -> Result<()> {
         ),
     }
     print_changes(&p.changes);
+    println!(
+        "耗时        = {:.3} s   peak heap = {:.1} MiB",
+        started.elapsed().as_secs_f64(),
+        peak as f64 / 1048576.0
+    );
     println!("注意：比的是「最后一次扫描」与 HEAD；扫描之后又改的文件不在这里，先 scan。");
     Ok(())
 }
@@ -862,15 +873,16 @@ pub fn diff(cli: &Cli, at: &str) -> Result<()> {
     let pid = keys::project_id(&name);
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
     let want = object::read_commit(&*db, pid, &commit)?;
-    let p = build::plan(&*db, pid)?;
-    let c = build::diff(&*db, pid, Some(&want.tree), &p.tree, &p.trees)?;
+    // 与 `status` 同一趟融合遍历，只是参照版本从 HEAD 换成 `at`。工作树那一侧的树从来没
+    // 进过库，所以"跟任意版本比"能用的就是这棵树——融合之前它还得先被 `plan` 攒进内存。
+    let p = build::compare(&*db, pid, Some(want.tree))?;
 
     println!("project   = {name}  (id={pid:#010x})");
     println!(
         "对比      = 工作树(按最后扫描) vs {}  ({at})",
         keys::short(&commit)
     );
-    print_changes(&c);
+    print_changes(&p.changes);
     Ok(())
 }
 
@@ -888,7 +900,12 @@ fn print_changes(c: &build::ChangeSet) {
         c.bytes as f64 / 1024.0,
         c.deleted_bytes as f64 / 1024.0
     );
-    for ch in &c.sample {
+    // 样本按路径排完再列：融合遍历是**自底向上**结算的，深层目录的变更会比同层的浅路径
+    // 先出来（`d007/sub/deep.bin` 排在 `d007/f0.bin` 前面），人读着跳。
+    // 排序只发生在这 30 条的副本上——`ChangeSet` 本身保持遍历序，`checkout` 依赖它。
+    let mut sample = c.sample.clone();
+    sample.sort_by(|a, b| a.path.cmp(&b.path));
+    for ch in &sample {
         println!("  {} {:>10} B  {}", ch.what.sign(), ch.size, ch.path);
     }
     if c.sample_more > 0 {

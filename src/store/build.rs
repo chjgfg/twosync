@@ -1,10 +1,24 @@
-//! 从工作树快照构建一个 commit：落块 → 写清单 → 自底向上建树 → 比对 → 移 head。
+//! 从工作树快照构建一个 commit：落块 → 写清单 → 自底向上建树 → **边结算边比对** → 移 head。
 //!
-//! # 内存
+//! # 内存：一趟，不是两趟
 //!
-//! 条目表是 O(文件数)，所以有 `MAX_ENTRIES` **显式上限**：超了就报错拒绝，绝不 OOM
-//! （OOM 会把同机的策略进程一起拖下水，那是 NFR-3 的红线）。流式栈式聚合是下一步，
-//! 到时候这个上限应该消失而不是调大。
+//! 融合之前是「先把新树攒出来（`plan` 攒在内存、`commit` 落进库），再自顶向下 diff」。
+//! 那条路的代价是 `plan` 必须留着 O(文件数) 的清单给 diff 递归，于是有 `MAX_ENTRIES`
+//! 那个**项目级**上限——它意味着"项目大到一定程度就提不了交、连看一眼都不行"。
+//!
+//! 现在每层目录结算时顺手与参照版本对应层比掉，清单出栈即丢，所以栈上同时只有
+//! **一条祖先链的新旧两份清单**：内存尺度是「最大单个目录 × 深度」，与文件总数无关。
+//! 上限也因此改成 [`MAX_DIR_ENTRIES`]——收的是**一个目录的条目数**，兜的是"某一层大到
+//! 装不下"这一种形状；超了照样报错拒绝，绝不 OOM（OOM 会把同机的策略进程一起拖下水，
+//! 那是 NFR-3 的红线）。
+//!
+//! # 换来的是什么代价（这是权衡，不是免费午餐）
+//!
+//! 比对自底向上，而"这一层变了没有"要到结算时才第一次知道 ⇒ 想知道就得先拿到这一层的旧
+//! 清单 ⇒ 参照版本那一侧的读只能压在**下栈时**。于是 `plan`/`commit` 每有一个目录就点查
+//! 一次它的旧清单：**O(目录数) 次 `get`**，不是 O(文件数)。"hash 相同整块子树跳过"那条
+//! NFR-6 的快路径现在只活在 [`walk_pair`] 里（两棵树都在库上，可以自顶向下走，
+//! 也就是 `diff --from/--to` 那一类比对）。
 //!
 //! # 为什么 refcnt 必须在这里就记对
 //!
@@ -22,13 +36,15 @@ use storage_engines::KvEngine;
 use storage_engines::SearchQuery;
 
 use crate::error::{Error, Result};
-use crate::store::history::TreeStore;
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::worktree::WtEntry;
 use crate::store::{cas, object, worktree};
 
-/// 一次最多聚合多少条目。超过就拒绝，不 OOM。
-pub const MAX_ENTRIES: usize = 200_000;
+/// **一个目录**最多攒多少条目。超过就拒绝，不 OOM。
+///
+/// 它替代了老的项目级上限：项目级的那一条意味着"文件多到一定程度连 `status` 都跑不动"，
+/// 而融合遍历之后内存只跟单层挂钩，所以盖子也该盖在单层上。
+pub const MAX_DIR_ENTRIES: usize = 200_000;
 /// 分页读引擎的窗口。
 pub const PAGE: usize = 2_000;
 /// v1 唯一参与同步的 ref。
@@ -143,8 +159,6 @@ pub struct Built {
     pub blocks_stored: usize,
     pub block_bytes: u64,
     pub blobs_new: usize,
-    /// `plan` 算出来但**没落盘**的那些目录清单，供 `diff` 递归（`build` 恒为空）。
-    pub trees: TreeStore,
 }
 
 /// 一次提交要带的外部信息。单独成结构体而不是一路摊成参数：`build` 已经有四个
@@ -179,25 +193,86 @@ fn head_tree(db: &dyn KvEngine, pid: ProjectId) -> Result<Option<Hash>> {
 /// 代价说清：`plan` 用 `W` 里现成的整文件 hash，**不复核磁盘**。所以它可能报出一个随后
 /// 被 `commit` 以 `StaleScan` 拒掉的改动。这是"按最后一次扫描说话"的定义，不是 bug。
 pub fn plan(db: &dyn KvEngine, pid: ProjectId) -> Result<Built> {
-    plan_capped(db, pid, MAX_ENTRIES)
+    plan_capped(db, pid, MAX_DIR_ENTRIES)
 }
 
-/// `plan` 的实现，但内存上限可注入——给用例留着"超限要报错、不许 OOM"这条可测性。
-pub fn plan_capped(db: &dyn KvEngine, pid: ProjectId, max_trees: usize) -> Result<Built> {
-    let prev_tree = head_tree(db, pid)?;
-    let mut rows = LiveRows::new(db, pid);
+/// `plan` 的实现，但**单层**内存上限可注入——给用例留着"超限要报错、不许 OOM"这条可测性。
+pub fn plan_capped(db: &dyn KvEngine, pid: ProjectId, dir_cap: usize) -> Result<Built> {
+    walk_readonly(db, pid, head_tree(db, pid)?, "", dir_cap)
+}
+
+/// 工作树（按最后一次扫描）与**任意一个版本**的差：`diff --at REV` 用的就是这一条。
+///
+/// 与 [`plan`] 同一个遍历、同一个口径，只是参照版本换了一个。`old_root = None` 的语义是
+/// "没有可比的历史"⇒ 全部按新增记，而且参照侧一次都不读。
+pub fn compare(db: &dyn KvEngine, pid: ProjectId, old_root: Option<Hash>) -> Result<Built> {
+    walk_readonly(db, pid, old_root, "", MAX_DIR_ENTRIES)
+}
+
+/// `compare` 的限定版：只比 `at` 那一棵子树（`checkout --prefix` 的坐标）。
+///
+/// 回调拿到的路径是**工作树里的完整路径**，不是相对 `at` 的——否则每一个落地动作都要
+/// 再把前缀拼回去，而拼错一次就是写到别的目录去。
+pub fn compare_subtree(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    old_root: Option<Hash>,
+    at: &str,
+) -> Result<Built> {
+    walk_readonly(db, pid, old_root, at, MAX_DIR_ENTRIES)
+}
+
+fn walk_readonly(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    old_root: Option<Hash>,
+    at: &str,
+    dir_cap: usize,
+) -> Result<Built> {
+    let mut rows = LiveRows::with_prefix(db, pid, at);
     let mut built = Built::default();
-    let mut sink = PlanSink {
-        trees: TreeStore::default(),
-        max: max_trees,
+    let mut changes = ChangeSet::default();
+    let walk = Walk {
+        db,
+        pid,
+        old_root,
+        at,
+        dir_cap,
     };
-    assemble(db, pid, &mut rows, &mut built, &mut sink)?;
+    walk.run(
+        &mut rows,
+        &mut HashOnly,
+        &mut built,
+        &mut |kind, path, oe, ne| {
+            note_change(&mut changes, kind, path, oe, ne);
+            Ok(())
+        },
+    )?;
+    // 这三个数只能在遍历**之后**读：迭代器是分页的，走完才是全量。
     built.entries = rows.live as usize;
     built.known = rows.seen_rows;
     built.epoch = rows.mark;
-    built.changes = diff(db, pid, prev_tree.as_ref(), &built.tree, &sink.trees)?;
-    built.trees = sink.trees;
+    built.changes = changes;
     Ok(built)
+}
+
+/// 变更回调 → `ChangeSet` 的那一笔账。**只有一份**：`plan`/`commit`/`checkout` 报的是
+/// 同一个数，口径才不会在第二处漂掉。
+fn note_change(
+    cs: &mut ChangeSet,
+    kind: ChangeKind,
+    path: &str,
+    oe: Option<&object::TreeEntry>,
+    ne: Option<&object::TreeEntry>,
+) {
+    // 只有文件有 blob：目录的 hash 是 tree，符号链接的 hash 是目标文本的 blob。
+    if kind == ChangeKind::Delete
+        && let Some(e) = oe
+        && e.kind == Kind::File
+    {
+        cs.deleted_blobs.push(e.hash);
+    }
+    cs.note(kind, path.to_string(), ne.or(oe).map_or(0, |e| e.size));
 }
 
 /// 构建并落库一个 commit。无改动时返回 `commit: None`，**不产生空提交也不移 head**。
@@ -211,29 +286,32 @@ pub fn build(
     let prev_heads = ref_heads(db, pid, MAIN)?;
     let prev_tree = head_tree(db, pid)?;
 
-    // `build` 这一侧**没有条目上限了**：树直接写进库，内存只剩"最大单个目录 + 深度"。
     let mut rows = LiveRows::new(db, pid);
     let mut built = Built::default();
-    assemble(
+    let mut changes = ChangeSet::default();
+    let walk = Walk {
         db,
         pid,
+        old_root: prev_tree,
+        at: "",
+        dir_cap: MAX_DIR_ENTRIES,
+    };
+    // 建树与比对是同一趟：每结算一层就顺手与参照版本比掉，清单出栈即丢。
+    // 融合之前这里要先攒树、再自顶向下读一遍库来 diff。
+    walk.run(
         &mut rows,
-        &mut built,
         &mut WriteSink { store, work_root },
+        &mut built,
+        &mut |kind, path, oe, ne| {
+            note_change(&mut changes, kind, path, oe, ne);
+            Ok(())
+        },
     )?;
     let known = rows.seen_rows;
     built.entries = rows.live as usize;
     built.known = known;
     built.epoch = rows.mark;
-
-    // build 已经把树写进库了，diff 直接读库，不必再带一份内存副本。
-    built.changes = diff(
-        db,
-        pid,
-        prev_tree.as_ref(),
-        &built.tree,
-        &TreeStore::default(),
-    )?;
+    built.changes = changes;
     if built.changes.is_empty() {
         return Ok(built); // 不产生空提交：碎 commit 会把引擎版本链白白撑大（§9.6.2）
     }
@@ -264,7 +342,7 @@ pub fn build(
     Ok(built)
 }
 
-/// 组装阶段"要不要落盘"的两个决策点。
+/// 组装阶段"要不要落盘"的决策点。
 ///
 /// 用 trait 而不是 `write: bool`：布尔参数会一路传到调用链上，谁传反了谁就静默产出半成品；
 /// 这里两个实现各自只有一条路可走，编译器替你记住。
@@ -287,16 +365,13 @@ pub trait Sink {
     ) -> Result<Hash>;
 }
 
-/// 只算不写，喂给 `plan`。算出来的清单留在 `trees` 里给 diff 递归用。
-struct PlanSink {
-    trees: TreeStore,
-    /// 攒在内存里的树条目上限。**退休掉的是"条目表 O(文件数)"那一项**，这里留着的是
-    /// `plan` 独有的代价：它要把算出来的树留给 `diff` 递归。解法是把 diff 融进建树
-    /// （每层结算时顺手与旧树对应层比掉），那是下一步，不是已经做完。
-    max: usize,
-}
+/// 只算 hash、不落盘，也不**留**任何清单：喂给 `plan` / `compare` / `checkout`。
+///
+/// 融合之后它连一个字段都没有了——老版本要往里塞 `TreeStore`，是因为 diff 得等整棵树
+/// 攒完才能自顶向下递归；现在比对压在每层结算的那一刻，清单用完就丢。
+pub struct HashOnly;
 
-impl Sink for PlanSink {
+impl Sink for HashOnly {
     fn blob_of(
         &mut self,
         _db: &dyn KvEngine,
@@ -314,19 +389,9 @@ impl Sink for PlanSink {
         _pid: ProjectId,
         entries: &[object::TreeEntry],
     ) -> Result<Hash> {
-        // 存**排好序的**那份：从库里读回来的是规范序，两边形状一样，diff 才不可能
-        // 因为顺序差异给出两种答案。
-        let mut sorted = entries.to_vec();
-        sorted.sort();
-        let hash = object::tree_hash(&sorted);
-        if self.trees.len() + sorted.len() > self.max {
-            return Err(Error::TooManyEntries {
-                n: self.trees.len() + sorted.len(),
-                max: self.max,
-            });
-        }
-        self.trees.remember(hash, sorted);
-        Ok(hash)
+        // `tree_hash` 内部就是"排序 + 重名校验 + 取 hash"，与落盘那份字节完全同一套规范序，
+        // 所以 `plan` 算出的树与随后 `commit` 落库的树必然同 hash（用例钉着这条）。
+        Ok(object::tree_hash(entries))
     }
 }
 
@@ -374,6 +439,9 @@ impl Sink for WriteSink<'_> {
 pub struct LiveRows<'a> {
     db: &'a dyn KvEngine,
     prefix: Vec<u8>,
+    /// 非空 = 只读这一棵子树的行（`checkout --prefix`）。键前缀多拼一个 `/`，
+    /// 于是 `W|p|a/b` 这一条（目录自己）落在窗外、不参与建树——根帧由 `Walk::at` 给出。
+    at: String,
     /// 活性线：`scanned_at >= epoch` 的行才算活着。
     epoch: i64,
     /// `Z` 缺失 = 从没完整扫描过 ⇒ 一律不算活（把活性线抬到 `i64::MAX` 让谁都对不上）。
@@ -391,10 +459,21 @@ pub struct LiveRows<'a> {
 
 impl<'a> LiveRows<'a> {
     pub fn new(db: &'a dyn KvEngine, pid: ProjectId) -> Self {
-        let prefix = keys::project_prefix(keys::TAG_WORKTREE, pid);
+        Self::with_prefix(db, pid, "")
+    }
+
+    /// 只读 `at` 那一棵子树。给出的路径仍然是**工作树完整路径**：
+    /// 每一层帧都按完整路径算父目录，相对路径会让根帧的子项挂到错误的层上去。
+    pub fn with_prefix(db: &'a dyn KvEngine, pid: ProjectId, at: &str) -> Self {
+        let mut prefix = keys::project_prefix(keys::TAG_WORKTREE, pid);
+        if !at.is_empty() {
+            prefix.extend_from_slice(at.as_bytes());
+            prefix.push(b'/');
+        }
         let mut me = Self {
             db,
             prefix,
+            at: at.to_string(),
             epoch: i64::MAX,
             complete: false,
             page: 0,
@@ -410,6 +489,16 @@ impl<'a> LiveRows<'a> {
             me.mark = m.epoch;
         }
         me
+    }
+
+    /// 键尾巴 → 路径。限定子树时尾巴是**相对 `at`** 的，必须拼回完整路径。
+    fn path_of(&self, tail: &[u8]) -> String {
+        let tail = String::from_utf8_lossy(tail);
+        if self.at.is_empty() {
+            tail.into_owned()
+        } else {
+            format!("{}/{}", self.at, tail)
+        }
     }
 
     /// 取下一页。返回 `false` = 已经没有更多页。
@@ -430,7 +519,7 @@ impl<'a> LiveRows<'a> {
             let Some(raw) = r.value else { continue };
             let e: WtEntry = dec(&raw, "WtEntry")?;
             if e.scanned_at >= self.epoch {
-                keep.push((String::from_utf8_lossy(path).into_owned(), e));
+                keep.push((self.path_of(path), e));
             }
         }
         self.buf = keep.into_iter();
@@ -471,6 +560,9 @@ struct Frame {
     dir: String,
     mode: u32,
     entries: Vec<object::TreeEntry>,
+    /// 这一层在**参照版本**里的清单。`None` = 参照里没有这一层（整棵都是新的），
+    /// 按空清单比 ⇒ 子项全记 Add。
+    old: Option<Vec<object::TreeEntry>>,
 }
 
 /// `d` 是 `p` 的**真**祖先（或根）。路径都是 `/` 分隔、无尾斜杠。
@@ -492,51 +584,113 @@ fn next_ancestor(cur: &str, parent: &str) -> String {
     }
 }
 
-/// 流式建树：吃 [`LiveRows`] 的升序路径，维护一条**祖先栈**。
+/// 融合遍历的坐标：跟哪个版本比、从哪个目录开始、单层的内存盖子多大。
 ///
-/// 内存 = O(最大单个目录的子项数 + 目录深度)，不再是 O(文件总数)。根那一帧仍然装着顶层
-/// 全部条目——树对象本身就是一层一份清单，要算它的 hash 就得把这一层拿在手里，这是格式的
+/// 收成一个结构体是因为这四样必须**一起**成立：比对参照、起点、上限三者散着传，
+/// 就会出现"`--prefix` 用了子树却拿整棵树当参照"这种只错一个参数的静默结果。
+pub struct Walk<'a> {
+    pub db: &'a dyn KvEngine,
+    pub pid: ProjectId,
+    /// 参照版本（通常是 HEAD，`checkout` 传目标版本）的根 tree。`None` = 库里还没有
+    /// 历史 ⇒ 全部按新增记，并且参照侧一次都不读。
+    pub old_root: Option<Hash>,
+    /// 根帧对应的工作树目录：`""` = 整个工作树，`checkout --prefix a/b` 传 `"a/b"`。
+    pub at: &'a str,
+    /// 单个目录的条目上限（[`MAX_DIR_ENTRIES`]）。
+    pub dir_cap: usize,
+}
+
+impl Walk<'_> {
+    /// 一趟做完：读 `rows` → 逐层建树（`sink` 决定落不落盘）→ 每层结算时与参照比掉。
+    ///
+    /// `rows` 必须是**升序路径流**（[`LiveRows`] 给的就是这个序）。返回时
+    /// `built.tree` = 结果根清单的 hash，`visit` 已经收到全部变更。
+    pub fn run<S: Sink>(
+        &self,
+        rows: &mut LiveRows<'_>,
+        sink: &mut S,
+        built: &mut Built,
+        visit: &mut Visit<'_>,
+    ) -> Result<()> {
+        let mut b = Builder::new(self, built)?;
+        for item in &mut *rows {
+            let (path, e) = item?;
+            b.row(&path, &e, sink, visit)?;
+        }
+        built.tree = b.finish(sink, visit)?;
+        Ok(())
+    }
+}
+
+/// 流式建树 + 逐层比对的**栈**。
+///
+/// 内存 = O(一条祖先链上各层的清单，新旧各一份)，与文件总数无关。根那一帧装着顶层全部
+/// 条目——树对象本身就是一层一份清单，要算它的 hash 就得把这一层拿在手里，这是格式的
 /// 固有代价，git 的 tree 也一样。
 ///
 /// 老实现是"先按目录把所有条目分桶，再按逆字典序自底向上收"。顶层目录静默丢失那个 bug
 /// （§17 补记二）就住在那套分桶 + `collect_children` 里，而它编译期防不住；栈式只需要问
-/// 一句"栈顶还是不是我的父目录"，收完立刻结算，没有第二份索引要维护。
-pub struct Builder<'a> {
-    db: &'a dyn KvEngine,
+/// 一句"栈顶还是不是我的父目录"，收完立刻结算并比对，没有第二份索引要维护。
+struct Builder<'a, 'w> {
+    db: &'w dyn KvEngine,
     pid: ProjectId,
+    dir_cap: usize,
     built: &'a mut Built,
     stack: Vec<Frame>,
 }
 
-impl<'a> Builder<'a> {
-    fn new(db: &'a dyn KvEngine, pid: ProjectId, built: &'a mut Built) -> Self {
-        Self {
-            db,
-            pid,
+impl<'a, 'w> Builder<'a, 'w> {
+    fn new(w: &Walk<'w>, built: &'a mut Built) -> Result<Self> {
+        // 根帧的参照清单只在"真有历史"时读一次；没有历史就连这一次都不读。
+        let old = match w.old_root {
+            Some(h) => Some(object::read_tree(w.db, w.pid, &h)?),
+            None => None,
+        };
+        Ok(Self {
+            db: w.db,
+            pid: w.pid,
             built,
+            dir_cap: w.dir_cap,
             stack: vec![Frame {
-                dir: String::new(),
+                dir: w.at.to_string(),
                 mode: 0o40755,
                 entries: Vec::new(),
+                old,
             }],
-        }
+        })
     }
 
-    fn row(&mut self, path: &str, e: &WtEntry, sink: &mut dyn Sink) -> Result<()> {
+    fn row(
+        &mut self,
+        path: &str,
+        e: &WtEntry,
+        sink: &mut dyn Sink,
+        visit: &mut Visit<'_>,
+    ) -> Result<()> {
         let (parent, name) = split(path);
-        self.align(parent, sink)?;
+        self.align(parent, sink, visit)?;
         if e.kind == Kind::Dir {
             // 目录自己也要成为父目录的一条条目，但它的 hash 要等结算完才知道 ⇒
             // 这里只压一帧，条目在 `close_top` 里补。
-            self.stack.push(Frame {
-                dir: path.to_string(),
-                mode: e.mode,
-                entries: Vec::new(),
-            });
+            self.push(path, e.mode)?;
             return Ok(());
         }
         let hash = sink.blob_of(self.db, self.pid, path, e, self.built)?;
-        self.top().entries.push(object::TreeEntry {
+        let cap = self.dir_cap;
+        let top = self.top();
+        if top.entries.len() + 1 > cap {
+            return Err(Error::TooManyEntries {
+                n: top.entries.len() + 1,
+                max: cap,
+                // 根目录的内部表示是空字符串，直接印出来是 `""`——用户看不懂该拆哪一层。
+                dir: if top.dir.is_empty() {
+                    ".".to_string()
+                } else {
+                    top.dir.clone()
+                },
+            });
+        }
+        top.entries.push(object::TreeEntry {
             name: name.to_string(),
             kind: e.kind,
             hash,
@@ -546,49 +700,67 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// 下一层目录：压栈，顺手把这一层的**参照清单**取出来。
+    ///
+    /// 只在父层参照清单存在、且里面同名条目确实是目录时才点查一次（O(目录数) 次 `get`
+    /// 的账记在模块头）。同名的参照条目是文件时按"参照里没有这一层"处理：新目录里的每个
+    /// 文件各记一次 Add，同名那一层在父层记 Modify——真实工作树里一个路径不可能同时是
+    /// 文件和目录，这一格是给"上游 bug 或手工塞记录"留的诚实答案。
+    fn push(&mut self, dir: &str, mode: u32) -> Result<()> {
+        let name = dir.rsplit_once('/').map_or(dir, |(_, n)| n);
+        let want = self
+            .stack
+            .last()
+            .and_then(|p| p.old.as_ref())
+            .and_then(|list| list.iter().find(|e| e.name == name))
+            .filter(|e| e.kind == Kind::Dir)
+            .map(|e| e.hash);
+        let old = match want {
+            Some(h) => Some(object::read_tree(self.db, self.pid, &h)?),
+            None => None,
+        };
+        self.stack.push(Frame {
+            dir: dir.to_string(),
+            mode,
+            entries: Vec::new(),
+            old,
+        });
+        Ok(())
+    }
+
     /// 把栈对齐到 `parent`：比它深的帧先结算出栈，比它浅的缺帧补上。
-    fn align(&mut self, parent: &str, sink: &mut dyn Sink) -> Result<()> {
+    fn align(&mut self, parent: &str, sink: &mut dyn Sink, visit: &mut Visit<'_>) -> Result<()> {
         while self.stack.len() > 1 {
             let top = self.top();
             if top.dir == parent || is_ancestor(&top.dir, parent) {
                 break;
             }
-            self.close_top(sink)?;
+            self.close_top(sink, visit)?;
         }
         // 中间层没有 `W` 行（比如手工塞进一条深层路径）⇒ 按段序补空帧。少了这一步，
         // 那条路径会挂到错误的父目录上去。老实现的 `ensure_dir` 干的是同一件事。
         while self.top().dir != parent {
             let cur = self.top().dir.clone();
             let next = next_ancestor(&cur, parent);
-            self.stack.push(Frame {
-                dir: next,
-                mode: 0o40755,
-                entries: Vec::new(),
-            });
+            self.push(&next, 0o40755)?;
         }
         Ok(())
     }
 
-    fn close_top(&mut self, sink: &mut dyn Sink) -> Result<()> {
+    /// 结算栈顶：算 hash → 与参照比掉 → 把目录条目补进父帧。
+    fn close_top(&mut self, sink: &mut dyn Sink, visit: &mut Visit<'_>) -> Result<()> {
         let f = self.stack.pop().expect("根帧不许结算");
-        let hash = sink.tree_of(self.db, self.pid, &f.entries)?;
-        let name = f.dir.rsplit_once('/').map_or(f.dir.as_str(), |(_, n)| n);
-        self.top().entries.push(object::TreeEntry {
-            name: name.to_string(),
-            kind: Kind::Dir,
-            hash,
-            size: 0,
-            mode: f.mode,
-        });
+        let e = settle(self.db, self.pid, &f, sink, visit)?;
+        self.top().entries.push(e);
         Ok(())
     }
 
-    fn finish(mut self, sink: &mut dyn Sink) -> Result<Hash> {
+    fn finish(mut self, sink: &mut dyn Sink, visit: &mut Visit<'_>) -> Result<Hash> {
         while self.stack.len() > 1 {
-            self.close_top(sink)?;
+            self.close_top(sink, visit)?;
         }
-        let entries = std::mem::take(&mut self.stack[0].entries);
-        sink.tree_of(self.db, self.pid, &entries)
+        let f = self.stack.pop().expect("根帧一直在");
+        Ok(settle(self.db, self.pid, &f, sink, visit)?.hash)
     }
 
     fn top(&mut self) -> &mut Frame {
@@ -596,25 +768,36 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// 流 → 一棵根 tree，写进 `built.tree`。
+/// **结算一层**：算出这一层的 hash、顺手与参照版本的同一层比掉、给出补进父帧的目录条目。
 ///
-/// **这段逻辑全站只有这一份**：`plan`（只算）与 `build`（真落盘）只差在 `Sink`，
-/// 其余共用。老写法里"分桶 + 逆序收"出过顶层目录静默丢失的 bug，而那份代码 `plan` 和
-/// `build` 是各抄一遍的——现在抄不动了。
-fn assemble<S: Sink>(
+/// 融合遍历的全部意义在这一条里：比对用的就是 `f.entries` 这份清单，而它出栈即丢，
+/// 所以内存里没有"整棵新树"这种东西。顺序也不能换——先比对再算 hash 或者反过来都行，
+/// 但**在结算里做**是唯一不用把清单留给第二趟的做法。
+fn settle(
     db: &dyn KvEngine,
     pid: ProjectId,
-    rows: &mut LiveRows<'_>,
-    built: &mut Built,
-    sink: &mut S,
-) -> Result<()> {
-    let mut b = Builder::new(db, pid, built);
-    for item in &mut *rows {
-        let (path, e) = item?;
-        b.row(&path, &e, sink)?;
-    }
-    built.tree = b.finish(sink)?;
-    Ok(())
+    f: &Frame,
+    sink: &mut dyn Sink,
+    visit: &mut Visit<'_>,
+) -> Result<object::TreeEntry> {
+    let hash = sink.tree_of(db, pid, &f.entries)?;
+    diff_level(
+        db,
+        pid,
+        &f.dir,
+        f.old.as_deref().unwrap_or(&[]),
+        &f.entries,
+        Nest::Settled,
+        visit,
+    )?;
+    let name = f.dir.rsplit_once('/').map_or(f.dir.as_str(), |(_, n)| n);
+    Ok(object::TreeEntry {
+        name: name.to_string(),
+        kind: Kind::Dir,
+        hash,
+        size: 0,
+        mode: f.mode,
+    })
 }
 
 /// FR-10：删除条目 > 已知条目的 20%，或删除字节 > 2 GB ⇒ 这个 commit 不算数。
@@ -780,24 +963,35 @@ fn bump_block(db: &dyn KvEngine, pid: ProjectId, hash: Hash, size: u32) -> Resul
 pub type Visit<'a> = dyn FnMut(ChangeKind, &str, Option<&object::TreeEntry>, Option<&object::TreeEntry>) -> Result<()>
     + 'a;
 
-/// 两棵树的**配对遍历**：全站只有这一份。
+/// 一层的比对里，"两侧同为目录且不同"该怎么办。**这是融合遍历与 `walk_pair` 唯一的区别**，
+/// 所以把它收成一个枚举而不是再抄一份分类代码。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    /// 立刻递归进子层（两棵树都在库里，自顶向下）：hash 相同的子树整块跳过，一次读都不发。
+    /// 这就是 NFR-6 的 O(变更目录数)。
+    Recurse,
+    /// 不递归：子层在**自己的结算点**已经比过了，这里再走一遍就是重复计数。
+    Settled,
+}
+
+/// **一层目录**里两份清单的分类规则——全站只有这一份。
 ///
-/// 为什么不各写一份：`diff`（只数数）和 `checkout`（要真落地）问的是同一个问题——这一层里
-/// 谁多了、谁少了、谁变了、哪些子树可以整块跳过。分两处写，"跳过未变子树"这类判断就会
-/// 在两处各错一次，而 `checkout` 错的那一次是**删文件**。
+/// 为什么不各写一份：`diff`（只数数）、融合遍历（`plan`/`commit`）和 `checkout`（要真落地）
+/// 问的是同一个问题——这一层里谁多了、谁少了、谁变了。分处写，"未变更就跳过"这类判断就会
+/// 在各处各错一次，而 `checkout` 错的那一次是**删文件**。
 ///
 /// 回调里 `old`/`new` 谁是 `None` 由 `kind` 决定：`Add` 没有 old，`Delete` 没有 new。
-/// 目录的 `Add`/`Delete` 先回调目录本身、再带着空的一侧递归进去，所以整棵子树的每个后代
-/// 都会被记一次——与 `ChangeSet` 的计数口径一致。
+/// 目录的 `Add`/`Delete` 会连带把整棵子树的每个后代各记一次——与 `ChangeSet` 的计数口径一致。
 ///
-/// `prefix` 是为了回调能拿到**可直接喂给 `restore`/`checkout` 的完整路径**。
-pub fn walk_pair(
+/// `prefix` 是这一层的**完整路径**（`Walk::at` 非空时也带前缀），回调因此可以直接给出
+/// 能喂给 `restore`/`checkout` 的路径，不必在每一处再拼一次。
+fn diff_level(
     db: &dyn KvEngine,
     pid: ProjectId,
-    trees: &TreeStore,
     prefix: &str,
     old: &[object::TreeEntry],
     new: &[object::TreeEntry],
+    nest: Nest,
     visit: &mut Visit<'_>,
 ) -> Result<()> {
     let o: BTreeMap<&str, &object::TreeEntry> = old.iter().map(|e| (e.name.as_str(), e)).collect();
@@ -807,9 +1001,10 @@ pub fn walk_pair(
         let full = join(prefix, name);
         let Some(oe) = o.get(*name) else {
             visit(ChangeKind::Add, &full, None, Some(ne))?;
-            if ne.kind == Kind::Dir {
-                let kids = trees.entries(db, pid, &ne.hash)?;
-                walk_pair(db, pid, trees, &full, &[], &kids, visit)?;
+            // `Settled` 时不递归：新目录里的子项在它自己结算时已经逐个报过 Add 了。
+            if ne.kind == Kind::Dir && nest == Nest::Recurse {
+                let kids = object::read_tree(db, pid, &ne.hash)?;
+                diff_level(db, pid, &full, &[], &kids, nest, visit)?;
             }
             continue;
         };
@@ -817,37 +1012,57 @@ pub fn walk_pair(
             continue; // 子树 hash 相同 ⇒ 整块跳过，一个条目都不读（NFR-6）
         }
         if oe.kind == Kind::Dir && ne.kind == Kind::Dir {
-            let kids_old = object::read_tree(db, pid, &oe.hash)?;
-            let kids_new = trees.entries(db, pid, &ne.hash)?;
-            walk_pair(db, pid, trees, &full, &kids_old, &kids_new, visit)?;
-        } else {
-            visit(ChangeKind::Modify, &full, Some(oe), Some(ne))?;
+            if nest == Nest::Recurse {
+                let kids_old = object::read_tree(db, pid, &oe.hash)?;
+                let kids_new = object::read_tree(db, pid, &ne.hash)?;
+                diff_level(db, pid, &full, &kids_old, &kids_new, nest, visit)?;
+            }
+            // 目录本身不算一条变更：它的变化全在子层里，子层各记各的。
+            continue;
         }
+        visit(ChangeKind::Modify, &full, Some(oe), Some(ne))?;
     }
     // 判删除只能问"这个名字还在不在新清单里"，不能问"刚才有没有被我碰过"：
     // 未变更的条目上一轮就 continue 了，拿那条线筛会把好文件报成删除。
     for oe in o.values().filter(|e| !n.contains_key(&e.name.as_str())) {
         let full = join(prefix, &oe.name);
-        // **先递归再回调自己**（后序）：`checkout` 要在同一趟流式遍历里 `remove_dir`，
-        // 而目录只有空了才删得掉。计数不受顺序影响，所以 `diff` 那边没有代价。
+        // **删除侧两种模式都必须递归**：只在参照里存在的那些目录，工作树侧根本没有帧，
+        // 不递归就永远数不到它的后代。
         if oe.kind == Kind::Dir {
             let kids = object::read_tree(db, pid, &oe.hash)?;
-            walk_pair(db, pid, trees, &full, &kids, &[], visit)?;
+            diff_level(db, pid, &full, &kids, &[], nest, visit)?;
         }
+        // 先递归再回调自己（后序）：`checkout` 要在同一趟遍历里 `remove_dir`，
+        // 而目录只有空了才删得掉。计数不受顺序影响，所以 `diff` 那边没有代价。
         visit(ChangeKind::Delete, &full, Some(oe), None)?;
     }
     Ok(())
 }
 
-/// 递归比对两棵树。**子树 hash 相同就整块跳过**——这就是 NFR-6 的 O(变更目录数)。
+/// 两棵**都在库里**的树的配对遍历，自顶向下、未变子树整块跳过。
+///
+/// `pub` 是给 `diff --at <rev>` 与 `checkout` 之外那类"任意两版相比"留的（M1/M2 的
+/// `--from/--to`）。工作树相对某个版本的差**不走这条**——那棵树没落盘，走 [`Walk::run`]。
+pub fn walk_pair(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    prefix: &str,
+    old: &[object::TreeEntry],
+    new: &[object::TreeEntry],
+    visit: &mut Visit<'_>,
+) -> Result<()> {
+    diff_level(db, pid, prefix, old, new, Nest::Recurse, visit)
+}
+
+/// 递归比对两棵库里树，产出一张变更表。**子树 hash 相同就整块跳过**。
 ///
 /// `pub` 是给 `diff --at <rev>` 用的：那条要拿任意两个版本比，不只是跟 HEAD 比。
+/// 工作树 vs 某个版本走 [`compare`]，因为工作树那侧的树从来没进过库。
 pub fn diff(
     db: &dyn KvEngine,
     pid: ProjectId,
     old: Option<&Hash>,
     new: &Hash,
-    new_trees: &TreeStore,
 ) -> Result<ChangeSet> {
     let mut out = ChangeSet::default();
     if old == Some(new) || (old.is_none() && *new == object::empty_tree()) {
@@ -857,24 +1072,16 @@ pub fn diff(
         Some(h) => object::read_tree(db, pid, h)?,
         None => Vec::new(),
     };
-    let new_list = new_trees.entries(db, pid, new)?;
+    let new_list = object::read_tree(db, pid, new)?;
     let mut collect = |kind: ChangeKind,
                        path: &str,
                        oe: Option<&object::TreeEntry>,
                        ne: Option<&object::TreeEntry>|
      -> Result<()> {
-        // 只有文件有 blob：目录的 hash 是 tree，符号链接的 hash 是目标文本的 blob。
-        if kind == ChangeKind::Delete
-            && let Some(e) = oe
-            && e.kind == Kind::File
-        {
-            out.deleted_blobs.push(e.hash);
-        }
-        let size = ne.or(oe).map_or(0, |e| e.size);
-        out.note(kind, path.to_string(), size);
+        note_change(&mut out, kind, path, oe, ne);
         Ok(())
     };
-    walk_pair(db, pid, new_trees, "", &old_list, &new_list, &mut collect)?;
+    walk_pair(db, pid, "", &old_list, &new_list, &mut collect)?;
     Ok(out)
 }
 

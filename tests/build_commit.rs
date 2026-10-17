@@ -15,7 +15,6 @@ use storage_engines::{EngineKind, KvEngine};
 use twosync::error::Error;
 use twosync::store::build::{self, BlockMeta};
 use twosync::store::cas::{self, Cas};
-use twosync::store::history;
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
 use twosync::store::object;
 use twosync::store::worktree;
@@ -403,30 +402,44 @@ fn live_rows_stream_and_count() {
     assert!(rows.mark > 0, "epoch 来自扫描标记");
 }
 
-/// 上限现在守在**真正还在攒内存的那一处**：`plan` 要把算出来的树留给 diff 递归。
-/// `commit` 这一侧已经没有条目上限了（树直接进库，内存只剩"最大单目录 + 深度"）。
+/// 上限盖在**单个目录**上，不再盖在项目总数上。
+///
+/// 这条是融合遍历的回归测试：老写法里 `plan` 要把整棵新树攒在内存中留给 diff 递归，
+/// 于是"项目文件多到一定程度就连 `status` 都跑不动"。现在比对压在每层结算时做完，
+/// 清单出栈即丢，所以只有"某一层大到装不下"才会撞线。
 #[test]
-fn plan_is_capped_where_it_still_accumulates() {
+fn the_cap_is_per_directory_not_per_project() {
     let site = Site::new();
-    for i in 0..5 {
-        write(&site.proj().join(format!("f{i}.txt")), b"x");
+    for d in 0..5 {
+        for i in 0..5 {
+            write(&site.proj().join(format!("dir{d}/f{i}.txt")), b"x");
+        }
     }
     site.scan();
-    match build::plan_capped(&*site.db, site.pid, 3) {
-        // 上限数的是"攒在内存里的条目总数"：先结算的是根目录那一层，5 个文件一次超掉。
-        Err(Error::TooManyEntries { n, max }) => assert_eq!((n, max), (5, 3)),
+    // 25 个文件（+ 5 个目录行 = 30 条 W）> 上限 6，但没有任何**一层**超过 6 ⇒ 必须能
+    // 正常算完（老写法在这里就报错，因为它攒的是全项目的条目表）。
+    assert_eq!(
+        build::plan_capped(&*site.db, site.pid, 6).unwrap().entries,
+        30
+    );
+
+    // 同一批数据挤在一层里就超限：报的是**拒绝**，不是把机器 OOM 掉（NFR-3 红线），
+    // 而且必须说清是哪一层——只报"超上限"用户不知道该拆哪个目录。
+    for i in 0..5 {
+        write(&site.proj().join(format!("flat{i}.txt")), b"x");
+    }
+    site.scan();
+    match build::plan_capped(&*site.db, site.pid, 6) {
+        // 根帧此时已有 5 个目录条目，`flat0..2` 依次进账，第 7 条越线。
+        Err(Error::TooManyEntries { n, max, dir }) => {
+            assert_eq!((n, max), (7, 6));
+            assert_eq!(dir, ".", "根目录的报错路径要写 `.`，不能是个空字符串");
+        }
         other => panic!(
             "超限该报 TooManyEntries，实际 {:?}",
             other.map(|b| b.entries)
         ),
     }
-    // 上限放宽之后就正常：报错必须是"拒绝"，不是把机器 OOM 掉（NFR-3 红线）。
-    assert_eq!(
-        build::plan_capped(&*site.db, site.pid, 1000)
-            .unwrap()
-            .entries,
-        5
-    );
 }
 
 /// 一轮扫描**中途被打断**不再伪装成大规模删除。
@@ -571,8 +584,8 @@ fn change_sample_lists_full_paths_and_stops_at_the_cap() {
     );
 }
 
-/// `diff --at <旧版本>` 走的是同一个 `diff`，但比较对象是任意两棵树。
-/// 顺序也钉一下：样本按目录内名字升序，输出才可比对。
+/// `diff --from/--to` 那一类比对走 `build::diff`：**两棵树都在库里**，自顶向下、
+/// 未变子树整块跳过。顺序也钉一下：样本按目录内名字升序，输出才可比对。
 #[test]
 fn diff_against_an_older_commit_lists_paths_in_order() {
     let site = Site::new();
@@ -584,14 +597,7 @@ fn diff_against_an_older_commit_lists_paths_in_order() {
 
     let t1 = object::read_commit(&*site.db, site.pid, &v1).unwrap().tree;
     let t2 = object::read_commit(&*site.db, site.pid, &v2).unwrap().tree;
-    let cs = build::diff(
-        &*site.db,
-        site.pid,
-        Some(&t1),
-        &t2,
-        &history::TreeStore::default(),
-    )
-    .unwrap();
+    let cs = build::diff(&*site.db, site.pid, Some(&t1), &t2).unwrap();
     assert_eq!((cs.add, cs.modify, cs.delete), (1, 1, 0));
     let got: Vec<(String, String)> = cs
         .sample
@@ -603,6 +609,47 @@ fn diff_against_an_older_commit_lists_paths_in_order() {
         vec![
             ("~".to_string(), "a.txt".to_string()),
             ("+".to_string(), "b.txt".to_string())
+        ]
+    );
+}
+
+/// `diff --at <rev>` 走的是融合遍历（工作树那侧的树从来没进过库），所以它必须与
+/// `plan`（同一趟、参照换成 HEAD）给出口径一致的结果。
+///
+/// 这一条盯的是新写法的两个静默失败面：`at` 前缀拼错会少一整棵子树，
+/// 参照侧选错版本会把"跟谁比"答错。
+#[test]
+fn compare_against_any_rev_matches_the_walk_that_reads_head() {
+    let site = Site::new();
+    write(&site.proj().join("keep/old.txt"), b"v1");
+    write(&site.proj().join("keep/new.txt"), b"only-in-later");
+    let v1 = site.commit(cas::DEFAULT_BLOCK, false).commit.unwrap();
+    fs::remove_file(site.proj().join("keep/new.txt")).unwrap();
+    fs::write(site.proj().join("keep/old.txt"), b"v2-longer").unwrap();
+    write(&site.proj().join("other/x.bin"), b"x");
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    // 工作树 == HEAD ⇒ `plan` 说没有变更。
+    assert!(build::plan(&*site.db, site.pid).unwrap().changes.is_empty());
+    // 同一份工作树跟 v1 比 ⇒ 一处改、一处删、一处新增（整个 other/ 子树各记一次）。
+    let t1 = object::read_commit(&*site.db, site.pid, &v1).unwrap().tree;
+    let cs = build::compare(&*site.db, site.pid, Some(t1))
+        .unwrap()
+        .changes;
+    assert_eq!((cs.add, cs.modify, cs.delete), (2, 1, 1), "{:?}", cs.sample);
+    let mut got: Vec<String> = cs
+        .sample
+        .iter()
+        .map(|c| format!("{} {}", c.what.sign(), c.path))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "+ other".to_string(),
+            "+ other/x.bin".to_string(),
+            "- keep/new.txt".to_string(),
+            "~ keep/old.txt".to_string(),
         ]
     );
 }
