@@ -3,7 +3,7 @@
 //! init project add/list/use/remove/status scan commit mv status log diff show
 //! ls-files restore checkout plan apply config doctor
 
-use std::fs;
+use std::{format, fs};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

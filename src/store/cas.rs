@@ -23,6 +23,7 @@
 //! 顺带修正一处我先前说错的：第二遍**不需要**重算 hash——第一遍的清单已经给出每块
 //! 的 hash 和偏移，第二遍只是"照单搬运缺的那几段"。所以代价是 1 次全读 + 1 次脏块读。
 
+use std::format;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
