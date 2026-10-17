@@ -41,6 +41,13 @@
 //! v1 只有一个 ref、没有分支，所以 `checkout` 改的是**工作树**，`main` 还在原地。
 //! 分支切换是 M4 `branch` 的活。执行完必须再 `scan`，否则 `W` 说的还是旧话。
 //!
+//! # 另一个入口：`export`（`--to`）
+//!
+//! [`export`] 干的是**另一件事**，不是"少做一点的 checkout"：把一个版本完整写到另一个目录，
+//! 不比对工作树、不删任何东西、不动 head。所以 §7.3 / FR-10 那两道闸在那里没有对象，
+//! 而它带来一道这里没有的新闸：**目标不许落在工作树里**（导出的副本会被下一轮 `scan`
+//! 当成项目内容，同一份字节在 CAS 里白占一倍）。
+//!
 //! # 已知不做的两件事
 //!
 //! - **类型互换**（同一路径上一边是文件、一边是目录）：记 `skipped` 并原样保留，
@@ -93,11 +100,7 @@ impl Report {
     }
 
     fn note(&mut self, line: String) {
-        if self.sample.len() < build::SAMPLE_MAX {
-            self.sample.push(line);
-        } else {
-            self.sample_more += 1;
-        }
+        note(&mut self.sample, &mut self.sample_more, line);
     }
 }
 
@@ -404,6 +407,180 @@ fn dir_only(e: &object::TreeEntry, path: &str) -> Result<Hash> {
         });
     }
     Ok(e.hash)
+}
+
+/// `checkout --to`：把一个版本导出到**另一个目录**的坐标与开关。
+///
+/// 它和 [`checkout`] 不是"同一件事少做一点"，是**另一件事**：不比对工作树、不删任何东西、
+/// 不动 head，所以 §7.3 与 FR-10 那两道闸在这里没有对象可保护。这里真正要防的是另一类
+/// 事故——**把版本导进项目工作树里面**：那等于往自己要同步的目录塞一份历史副本，
+/// 下一轮 `scan` 会把它当成项目内容提交，同一份字节在 CAS 里白占一倍。
+#[derive(Debug)]
+pub struct ExportOpts<'a> {
+    /// 要导出的 commit。
+    pub target: &'a Hash,
+    /// 只导这一棵子树（路径按仓库内 `/` 分隔）。
+    pub prefix: Option<&'a str>,
+    pub dest: &'a Path,
+    /// 项目工作树，只为"目标不许落在里面"这一条判据服务。
+    pub work_root: &'a Path,
+    /// 目标路径上已经有东西时覆盖。默认**不**覆盖：那是一份本项目历史里没有的内容，
+    /// 而 §7.3 在这里帮不上忙（它查的是工作树那一份，跟目标路径不是同一个文件）。
+    pub force: bool,
+    pub apply: bool,
+}
+
+/// 一次导出的账。口径与 [`Report`] 一样：**计数全量，样本有界**。
+#[derive(Debug, Default)]
+pub struct Export {
+    pub files: usize,
+    pub dirs: usize,
+    pub links: usize,
+    pub overwrite: usize,
+    /// 目标上已有同名路径且没给 `--force` ⇒ 原样留着。
+    pub skipped: usize,
+    pub bytes: u64,
+    pub sample: Vec<String>,
+    pub sample_more: usize,
+    pub applied: bool,
+}
+
+impl Export {
+    fn note(&mut self, line: String) {
+        note(&mut self.sample, &mut self.sample_more, line);
+    }
+}
+
+/// 两个报告共用的一行样本规则（上限就一个，别在第二处漂掉）。
+fn note(sample: &mut Vec<String>, more: &mut usize, line: String) {
+    if sample.len() < build::SAMPLE_MAX {
+        sample.push(line);
+    } else {
+        *more += 1;
+    }
+}
+
+/// 把 `--at` 版本（或 `prefix` 那一棵子树）完整写到 `dest`。**不碰工作树、不动 head。**
+///
+/// 遍历用的是 `history::walk_tree`：它是**前序**（先给目录自己、再进子项），所以父目录
+/// 永远在被引用之前建好；而它逐条回调、不物化路径表 ⇒ 导出一百万条也只有栈深那点内存。
+pub fn export(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    store: &cas::Cas,
+    o: &ExportOpts,
+) -> Result<Export> {
+    refuse_inside_worktree(o.dest, o.work_root)?;
+    let commit = object::read_commit(db, pid, o.target)?;
+    let clean = o.prefix.unwrap_or("").trim_matches('/');
+    let root = if clean.is_empty() {
+        commit.tree
+    } else {
+        let want =
+            history::resolve(db, pid, &commit.tree, clean)?.ok_or_else(|| Error::NoSuchPath {
+                rev: keys::short(o.target),
+                path: clean.to_string(),
+            })?;
+        dir_only(&want, clean)?
+    };
+
+    let mut rep = Export::default();
+    history::walk_tree(db, pid, &root, &mut |path, e| {
+        let abs = o
+            .dest
+            .join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        // 断链也算"存在"：`symlink_metadata` 不跟随链接，否则 `make_symlink` 会撞在
+        // 一个存在但指向空的路径上，报一个看起来像权限问题的错。
+        let exists = fs::symlink_metadata(&abs).is_ok();
+        match e.kind {
+            Kind::Dir => {
+                rep.dirs += 1;
+                rep.note(format!("+ {path}/"));
+                if o.apply {
+                    fs::create_dir_all(&abs)?;
+                }
+                Ok(())
+            }
+            _ if exists && !o.force => {
+                rep.skipped += 1;
+                rep.note(format!("! {path} 目标上已经有了，没覆盖"));
+                Ok(())
+            }
+            Kind::File => {
+                if exists {
+                    rep.overwrite += 1;
+                    rep.note(format!("~ {path}"));
+                } else {
+                    rep.files += 1;
+                    rep.note(format!("+ {path}"));
+                }
+                rep.bytes += e.size;
+                if o.apply {
+                    ensure_parent(&abs)?;
+                    let blob = build::read_blob(db, pid, &e.hash)?;
+                    store.read_blob(&blob, &abs)?;
+                    restore::apply_owner_exec(&abs, e.mode)?;
+                }
+                Ok(())
+            }
+            Kind::Symlink => {
+                if exists {
+                    rep.overwrite += 1;
+                    rep.note(format!("~ {path}"));
+                } else {
+                    rep.links += 1;
+                    rep.note(format!("+ {path}"));
+                }
+                if o.apply {
+                    ensure_parent(&abs)?;
+                    let blob = build::read_blob(db, pid, &e.hash)?;
+                    let link = restore::link_target(&blob, store)?;
+                    restore::make_symlink(&link, &abs)?;
+                }
+                Ok(())
+            }
+        }
+    })?;
+    rep.applied = o.apply;
+    Ok(rep)
+}
+
+/// 顶层文件的父目录就是 `dest` 自己，而它不是树里的一个条目 ⇒ 没人建过它。
+/// 前序遍历保证了**子**目录先来，这一条补的是最外面那层。
+fn ensure_parent(abs: &Path) -> Result<()> {
+    if let Some(p) = abs.parent() {
+        fs::create_dir_all(p)?;
+    }
+    Ok(())
+}
+
+/// 导出目标落在工作树里 ⇒ 拒。见 [`ExportOpts`] 上那段"另一类事故"。
+fn refuse_inside_worktree(dest: &Path, work_root: &Path) -> Result<()> {
+    let here = nearest_existing(dest)?;
+    let root = nearest_existing(work_root)?;
+    if here == root || here.starts_with(&root) {
+        return Err(Error::BadInput(format!(
+            "`--to` 的目标 {} 落在项目工作树 {} 里面：导出的副本会被下一轮 scan 当成项目内容。换个目录，或用不带 --to 的 `checkout`",
+            dest.display(),
+            work_root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// 目标往往还不存在（"导出到 `D:\out\release`"是常见用法），所以拿**最近一个存在的祖先**
+/// 去 `canonicalize`——否则跨 Windows 的 `\\?\` 长前缀与相对写法会把比较变成比字符串。
+fn nearest_existing(p: &Path) -> Result<PathBuf> {
+    let mut cur = p;
+    loop {
+        if cur.exists() {
+            return Ok(fs::canonicalize(cur)?);
+        }
+        match cur.parent() {
+            Some(up) => cur = up,
+            None => return Ok(p.to_path_buf()),
+        }
+    }
 }
 
 fn kind_word(k: Kind) -> &'static str {

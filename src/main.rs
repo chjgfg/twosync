@@ -50,6 +50,16 @@ fn dispatch(cli: &Cli) -> Result<()> {
             prefix,
             apply,
             allow_mass_delete,
-        } => m0::checkout(cli, at, prefix.as_deref(), *apply, *allow_mass_delete),
+            to,
+            force,
+        } => m0::checkout(
+            cli,
+            at,
+            prefix.as_deref(),
+            *apply,
+            *allow_mass_delete,
+            to.as_deref(),
+            *force,
+        ),
     }
 }

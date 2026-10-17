@@ -16,10 +16,12 @@
 //! $TS --root /tmp/ts7 checkout --at <v1 的前缀>          # 只报：覆盖 1 / 建 1 / 删 1
 //! $TS --root /tmp/ts7 checkout --at <v1 的前缀> --apply  # 真做
 //! cat /tmp/ts7/lab/a.txt                                 # 必须是 v1
+//! $TS --root /tmp/ts7 checkout --at <v1 的前缀> --to /tmp/ts7/out --apply  # 导出，工作树不动
+//! $TS --root /tmp/ts7 checkout --at <v1 的前缀> --to /tmp/ts7/lab/o # 必须被拒（目标在工作树里）
 //! ```
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use storage_engines::{EngineKind, KvEngine};
 use twosync::error::Error;
@@ -109,6 +111,35 @@ impl Site {
             target,
             prefix,
             opts,
+        )
+    }
+
+    /// `--to` 的落点：**必须在工作树外**（`tmp/out`，而工作树是 `tmp/p`）。
+    fn out(&self) -> PathBuf {
+        self.tmp.path().join("out")
+    }
+
+    fn export(
+        &self,
+        target: &Hash,
+        prefix: Option<&str>,
+        dest: &Path,
+        force: bool,
+        apply: bool,
+    ) -> twosync::error::Result<checkout::Export> {
+        let store = Cas::new(&objects_dir(self.tmp.path()), BLK).unwrap();
+        checkout::export(
+            &*self.db,
+            self.pid,
+            &store,
+            &checkout::ExportOpts {
+                target,
+                prefix,
+                dest,
+                work_root: &self.proj(),
+                force,
+                apply,
+            },
         )
     }
 }
@@ -346,4 +377,133 @@ fn an_untracked_file_keeps_its_directory_and_the_report_honest() {
     assert_eq!(r.skipped, 1, "要有一笔账交代它被留下：{r:?}");
     assert_eq!(site.read("d/keepme.txt"), "未跟踪");
     assert!(site.abs("d").is_dir());
+}
+
+// ── `checkout --to`：导出到另一个目录 ─────────────────────────────────
+//
+// 这批用例盯的是分工：`--to` **不碰工作树、不碰历史**，所以 §7.3 与 FR-10 在这里都没有
+// 对象，取而代之的是一道这里才有的闸——目标不许落在工作树里。
+
+/// 导出把版本写到别处，工作树与库**一个字节都不许多**。
+#[test]
+fn export_writes_elsewhere_and_leaves_worktree_and_history_alone() {
+    let (site, v1, _) = two_versions();
+    let out = site.out();
+    let rows = site.db.health().total_rows;
+
+    let dry = site.export(&v1, None, &out, false, false).unwrap();
+    assert_eq!(
+        (dry.files, dry.dirs),
+        (2, 1),
+        "v1 = a.txt + d/ + d/b.txt：{dry:?}"
+    );
+    assert!(!out.exists(), "只报模式连目录都不许建");
+
+    let done = site.export(&v1, None, &out, false, true).unwrap();
+    assert!(done.applied);
+    assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "v1");
+    assert_eq!(
+        fs::read_to_string(out.join("d").join("b.txt")).unwrap(),
+        "b"
+    );
+    // 磁盘：工作树还是 v2 那个样子。
+    assert_eq!(site.read("a.txt"), "v2-longer");
+    assert!(site.exists("c.txt") && !site.exists("d/b.txt"));
+    // 库：导出一行都不该写（head 也没动）。
+    assert_eq!(site.db.health().total_rows, rows, "导出不该进库一行");
+    assert_eq!(
+        build::ref_heads(&*site.db, site.pid, build::MAIN)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// 目标在工作树里 ⇒ 拒。防的是"下一轮 `scan` 把导出的副本当成项目内容"，
+/// 而它比字符串比较严：拼出来的 `..` 要按**规范路径**判，不然 `p/../out` 会被误拒、
+/// `p/./x` 会被误放。
+#[test]
+fn export_refuses_a_destination_inside_the_worktree() {
+    let (site, v1, _) = two_versions();
+    let inside = site.abs("exported");
+    let err = site
+        .export(&v1, None, &inside, false, true)
+        .expect_err("工作树里的目标必须被拒");
+    assert!(
+        matches!(err, Error::BadInput(_)),
+        "该是「你说错目录了」，不是某个 IO 错误：{err}"
+    );
+    assert!(!inside.exists(), "拒了就该什么都没建");
+    assert_eq!(site.read("a.txt"), "v2-longer");
+
+    // 同一句 `..` 写到工作树**外面**就得放行——判据是规范路径，不是字符串里有没有 `p`。
+    let up = site.proj().join("..").join("out2");
+    site.export(&v1, None, &up, false, true)
+        .expect("目标其实不在工作树里");
+    assert_eq!(fs::read_to_string(up.join("a.txt")).unwrap(), "v1");
+}
+
+/// 目标目录里已有的东西默认**不覆盖**，而且这笔账要看得见；`--force` 才盖。
+#[test]
+fn export_leaves_existing_paths_alone_unless_forced() {
+    let (site, v1, _) = two_versions();
+    let out = site.out();
+    site.export(&v1, None, &out, false, true).unwrap();
+    fs::write(out.join("a.txt"), "这是别的项目放在这儿的东西").unwrap();
+
+    let r = site.export(&v1, None, &out, false, true).unwrap();
+    assert_eq!(
+        (r.files, r.skipped),
+        (0, 2),
+        "两个文件都在 ⇒ 只跳不写：{r:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("a.txt")).unwrap(),
+        "这是别的项目放在这儿的东西",
+        "没给 --force 就是不许动"
+    );
+
+    let f = site.export(&v1, None, &out, true, true).unwrap();
+    assert_eq!(
+        (f.files, f.overwrite, f.skipped),
+        (0, 2, 0),
+        "--force 才覆盖，且算覆盖不算新增：{f:?}"
+    );
+    assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "v1");
+}
+
+/// `--prefix` 导出的是**那一棵子树的内容**，摊在 dest 下（跟 `restore --to` 同一条规矩：
+/// dest 就是那一棵子树的根），而不是把子树名字再套一层。
+#[test]
+fn export_prefix_writes_that_subtree_into_the_dest_itself() {
+    let (site, v1, _) = two_versions();
+    let out = site.out();
+    let r = site.export(&v1, Some("d"), &out, false, true).unwrap();
+    assert_eq!((r.files, r.dirs), (1, 0), "{r:?}");
+    assert_eq!(fs::read_to_string(out.join("b.txt")).unwrap(), "b");
+    assert!(!out.join("d").exists(), "不该把子树名字再套一层");
+    assert!(!out.join("a.txt").exists(), "前缀之外的一条都不许多写");
+}
+
+/// 前缀的两种错法与 `checkout` 同一个口径：目标树里没有 ⇒ `NoSuchPath`，
+/// 指向的是文件 ⇒ `NotYet`（那活归 `restore`）。
+#[test]
+fn export_prefix_checks_the_target_tree_like_checkout_does() {
+    let (site, v1, _) = two_versions();
+    let out = site.out();
+    assert!(
+        matches!(
+            site.export(&v1, Some("nope"), &out, false, true),
+            Err(Error::NoSuchPath { .. })
+        ),
+        "打错路径要说清是哪个版本里没有什么"
+    );
+    assert!(
+        matches!(
+            site.export(&v1, Some("a.txt"), &out, false, true),
+            Err(Error::NotYet { .. })
+        ),
+        "单文件是 restore 的活，这里不许糊过去"
+    );
+    assert!(!out.exists(), "两次都该在动手之前就被拒");
 }

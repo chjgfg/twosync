@@ -34,6 +34,9 @@ use crate::store::{build, cas, history, object, worktree};
 
 /// 两处拒绝覆盖时给的建议，各自说自己的话。
 pub const RESTORE_HINT: &str = "加 --force 才覆盖（仍要求被覆盖的那一版已在历史里）";
+/// `--to` 的目标在工作树外，所以这里**没有**"仍要求…已在历史里"那半句承诺——那道门管不到它。
+pub const EXPORT_HINT: &str =
+    "目标是工作树外的路径：加 --force 就覆盖它（那份内容不属于本项目历史，§7.3 拦不了它）";
 
 #[derive(Debug)]
 pub struct Restored {
@@ -69,6 +72,7 @@ pub fn restore(
         path: path.to_string(),
     })?;
 
+    let external = dest.is_some();
     let dest = match dest {
         Some(d) => d.to_path_buf(),
         None => work_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)),
@@ -78,12 +82,17 @@ pub fn restore(
         if !force {
             return Err(Error::LocalExists {
                 path: dest,
-                hint: RESTORE_HINT,
+                hint: if external { EXPORT_HINT } else { RESTORE_HINT },
             });
         }
-        // 覆盖之前先确认"被覆盖的这一版"取回来了才谈得上覆盖。
-        check_local_is_recoverable(db, store, pid, work_root, path)?;
-        gate_checked = true;
+        // §7.3 查的是**工作树里那一份**。`--to` 的目标不在工作树里 ⇒ 这道门既查不到也帮不上：
+        // 它保护的是"本项目还没备份的本地内容"，而目标上那份根本没被这个项目管过。
+        // 原来这里无条件调用，于是 `restore --to <已有路径> --force` 会因为**工作树**那一路
+        // 没扫过而报"NotInHistory"——一句关于另一个文件的不相关拒绝。
+        if !external {
+            check_local_is_recoverable(db, store, pid, work_root, path)?;
+            gate_checked = true;
+        }
     }
 
     // blob 只能在各自的分支里读：目录条目的 hash 是 **tree**，拿它去查 `B` 会报成

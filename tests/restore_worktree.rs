@@ -322,3 +322,40 @@ fn symlink_target_survives_into_history_and_back() {
         Err(other) => panic!("不该的错误类型：{other}"),
     }
 }
+
+/// `--to` 的覆盖**不看工作树那一份**。
+///
+/// §7.3 那道门查的是"工作树里的本地内容是不是已经在历史里"，而 `--to` 的目标根本不是
+/// 那个文件。修之前这里无条件走门，于是「工作树这一版没扫过」会让一次跟工作树毫无关系的
+/// 导出被 `NotInHistory` 拒掉——一句关于另一个文件的拒绝。判据只有一份门，但**门只管
+/// 它管得着的路径**。
+#[test]
+fn restoring_to_another_place_does_not_consult_the_worktree_gate() {
+    let site = Site::new();
+    site.write("a.txt", b"v1");
+    let first = site.commit();
+    // 工作树这一版被改了，而且**没有再 scan** ⇒ 走工作树那条路时门一定会拒。
+    site.write("a.txt", b"local-new-never-scanned");
+    let out = site.tmp.path().join("out.bin");
+    fs::write(&out, b"something-else-here").unwrap();
+
+    let err = site
+        .restore(&first, "a.txt", Some(&out), false)
+        .expect_err("目标已有就必须先问人");
+    assert!(
+        matches!(err, Error::LocalExists { .. }),
+        "拒的理由必须是目标路径，不是工作树：{err}"
+    );
+    assert_eq!(fs::read(&out).unwrap(), b"something-else-here");
+
+    let r = site
+        .restore(&first, "a.txt", Some(&out), true)
+        .unwrap_or_else(|e| panic!("--to 不该受工作树的门管：{e}"));
+    assert!(!r.gate_checked, "没查门就该如实说没查");
+    assert_eq!(fs::read(&out).unwrap(), b"v1", "导出必须落地");
+    assert_eq!(
+        fs::read(site.proj().join("a.txt")).unwrap(),
+        b"local-new-never-scanned",
+        "工作树一个字都不该被动"
+    );
+}

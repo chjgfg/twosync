@@ -609,10 +609,11 @@ pub fn restore(cli: &Cli, at: &str, path: &str, to: Option<&Path>, force: bool) 
     }
     println!(
         "§7.3      = {}",
-        if r.gate_checked {
-            "目标已存在，已确认被覆盖的那一版在历史里"
-        } else {
-            "目标不存在，不需要门"
+        match (r.gate_checked, to) {
+            (true, _) => "目标已存在，已确认被覆盖的那一版在历史里",
+            // 门查的是工作树那一份；`--to` 的目标在别处，所以这里不是"没查"，是"查不着"。
+            (false, Some(_)) => "目标是工作树外的路径，那道门管不到它（覆盖与否看 --force）",
+            (false, None) => "目标不存在，不需要门",
         }
     );
     Ok(())
@@ -661,21 +662,78 @@ pub fn ls_files(cli: &Cli, at: &str, prefix: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `checkout`：把一个版本落到工作树。默认**只报不动手**。
+/// `checkout`：把一个版本落到工作树，或（`--to`）导出到另一个目录。默认**只报不动手**。
+#[allow(clippy::too_many_arguments)]
 pub fn checkout(
     cli: &Cli,
     at: &str,
     prefix: Option<&str>,
     apply: bool,
     allow_mass_delete: bool,
+    to: Option<&Path>,
+    force: bool,
 ) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
     let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
     let commit = one_commit(history::resolve_rev(&*db, pid, at)?, at)?;
-
     let started = Instant::now();
+
+    if let Some(dest) = to {
+        let r = checkout::export(
+            &*db,
+            pid,
+            &store,
+            &checkout::ExportOpts {
+                target: &commit,
+                prefix,
+                dest,
+                work_root: &root,
+                force,
+                apply,
+            },
+        )?;
+        println!("project   = {name}  (id={pid:#010x})");
+        println!("目标      = {}  ({at})", keys::hex(&commit));
+        println!("导出到    = {}", dest.display());
+        println!(
+            "动作      = 写文件 {} / 建目录 {} / 链接 {} / 覆盖 {} / 跳过 {}   共 {:.1} KiB",
+            r.files,
+            r.dirs,
+            r.links,
+            r.overwrite,
+            r.skipped,
+            r.bytes as f64 / 1024.0
+        );
+        for line in &r.sample {
+            println!("  {line}");
+        }
+        if r.sample_more > 0 {
+            println!(
+                "  …另有 {} 条未列出（列表上限 {}）",
+                r.sample_more,
+                build::SAMPLE_MAX
+            );
+        }
+        if r.skipped > 0 {
+            // 这里不套 §7.3：那条门查的是工作树里那一份，而目标路径上的东西跟它不是一个文件。
+            println!(
+                "跳过的是目标目录里已有的路径。加 --force 会直接覆盖——那份内容不在本项目历史里，门也拦不住它。"
+            );
+        }
+        println!(
+            "{}",
+            if r.applied {
+                "已导出。工作树没动，head 也没动。"
+            } else {
+                "没有动任何东西：加 --apply 才真做。"
+            }
+        );
+        println!("elapsed   = {:.3} s", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+
     let r = checkout::checkout(
         &*db,
         pid,
