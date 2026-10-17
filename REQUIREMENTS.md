@@ -249,6 +249,14 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    - (g) **二级索引一致性**：任何改 `K.refcnt` 的路径都必须同步改 `k` 索引——用随机序列断言两者永不漂移（这是手工索引最容易烂掉的地方）。
 2. **crash injection**：在块写入中途、`fsync` 前后、清单提交前、head 集合更新前分别 `kill -9`；重启后断言：无半文件、无 orphan tmp 存活超 5 s、无"清单引用不存在的块"、不变量 (a)–(g) 仍成立、不重复传输已到位的块。**其中一半用例是在撞引擎的 WAL 恢复路径**（§15.10 明说这件事）。
 3. **路径对抗 fuzz**：`../../`、`\\?\`、UNC、`CON`、尾空格/点、超长名、仅大小写不同的两文件、NFC/NFD 混合、含 ANSI 转义 → 全部拒绝且不崩。
+   **落地状态（`tests/path_hostile.rs`，2026-10-17）**：敌意清单在 `restore` / `checkout --prefix` /
+   `history::resolve` 三条路上逐个试，判据是"**报错 + 不崩 + 整棵站点目录一字未变**"（最后那条才是硬的，
+   前面全是它的必要条件）。古怪但合法的名字（空格、中日韩、`#%`、`=+,.`、NFC/NFD 两种形式、120 字长名）
+   走"扫 → 提 → 导出到别处 → 逐文件比字节"全等。**两条如实标注的例外**：
+   ① 仅大小写不同的两个文件在 Windows 上根本建不出来 ⇒ 那条用例挂 `#[cfg(unix)]`；
+   ② 制表符、尾随点/空格在 Windows 上是**非法文件名**，收进"合法名字"清单就会变成测平台而不是测自己，所以不收。
+   顺带钉住一条容易被误当成漏洞的语义：`""` 与 `"/"` 解析到**根**（`resolve` 滤掉空段与 `.`），
+   所以它们的拒绝理由是"目录归 checkout 管"，而 `checkout --prefix ""` = 整棵树——这个语义不许漂。
 4. **与 git 的量化差分**（取代 v0.1 的"与 `rsync -n --delete` 比对"）：同一份 10 GB 语料 + 同一串变更脚本，跑 ①本工具 ②git（`git add -A; commit; push`）③Syncthing 默认结果，比 **传输字节数 / 磁盘占用增长 / 完成耗时 / 误删次数**。本工具必须在"传输字节"和"磁盘占用增长"上明确赢过 git，否则它没有存在理由——这张表是 README 的主图，也是 §1 那三条理由的兑现证明。
 5. **真机长跑**：10 GB 混合语料（1 个大稀疏文件 + 10 万个 4 KB 小文件 + 若干二进制资产），跨 Windows↔Ubuntu，随机变更脚本跑 72 h，记录 RSS/CPU/带宽/会话耗时/历史深度/head 数量，**外加 `health().max_chain` 与 `rows_above_one` 两条曲线**（§9.6.2 的复发通道只能靠时间暴露）。
 6. **基准（`criterion`）**：全量扫描、脏判定、commit 生成（NFR-6）、块切分+hash、`want/have` 协商、清单 diff、**union 可达性遍历（NFR-7）**、**分页扫描窗口大小调参**。
@@ -259,7 +267,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
 
 | 阶段 | 交付 | 可验证判据 |
 |---|---|---|
-| **M0 骨架** | `cargo init --lib --name twosync`；CLI(`commit/log/diff/show/checkout/restore/status/plan/version`)；**CAS 块仓 + blob/tree/commit 读写**；§9.2 键编码 + 引擎接入（FR-21 自检）；扫描器 + 变更检测 + 自动建 commit；**project 注册表**。**先不联网** | 扫 10 GB 建库给出实测耗时/RSS/CPU（NFR-1/2 变真数字）；**扫描峰值按拆后的 (f1)/(f2) 两段验收（≤ 8 MiB 那条在 0.4.0 上过不了，见 §9.6.1）**；改 1 MB 后 `commit` 成本符合 NFR-6；`restore --at` 取回任意历史版本；`checkout --to` 能把版本导出到工作树外（目标在工作树里必须拒，§17 补记十一）；`status` 能报出"扫描之后的增删"（盘上对账，只进打印不进账，§17 补记十二）；`H` 前缀能表达多 head、`K`/`k` 双写不漂移 |
+| **M0 骨架** | `cargo init --lib --name twosync`；CLI(`commit/log/diff/show/checkout/restore/status/plan/apply/version`，**这一轮补齐 plan/apply/version**)；**CAS 块仓 + blob/tree/commit 读写**；§9.2 键编码 + 引擎接入（FR-21 自检）；扫描器 + 变更检测 + 自动建 commit；**project 注册表**。**先不联网** | 扫 10 GB 建库给出实测耗时/RSS/CPU（NFR-1/2 变真数字）；**扫描峰值按拆后的 (f1)/(f2) 两段验收（≤ 8 MiB 那条在 0.4.0 上过不了，见 §9.6.1）**；改 1 MB 后 `commit` 成本符合 NFR-6；`restore --at` 取回任意历史版本；`checkout --to` 能把版本导出到工作树外（目标在工作树里必须拒，§17 补记十一）；`status` 能报出"扫描之后的增删"（盘上对账，只进打印不进账，§17 补记十二）；`H` 前缀能表达多 head、`K`/`k` 双写不漂移；改名按 FR-1 记进 `commit.stats.rename`（不是一删一增）；`status` 报出 §9.6.2 的引擎健康度与 NFR-5 的磁盘账；§10.3 的路径对抗清单成文用例 |
 | **M1 单向推送** | SSH 通道 + `HeadsState/WantHave/PushBatch/PushCommit/UnionAccept` + **多 project 复用一条连接** + FR-10 熔断 + FR-9 配额 GC + FR-13 原子写 | 本地删 30% 文件 → 对端拒绝该 commit 并提示；10 GB 文件改 1 MB → 传输 ≤ 8 MB；crash injection 通过；§10.4 差分表首版数字；20 project 一轮只 1 次认证 |
 | **M2 常驻（仍 1+1）** | watch + debounce + 周期兜底 → 自动 commit + 自动 push/pull；**拨号方向对称**（任一端可发起，§16.3）；断点续传；限速（含 GC 与 vacuum，总预算不叠加）；`status` 指标含引擎健康度；systemd/计划任务 | 拔网重连自动续传；稳态 CPU ≤ 10% 单核实测；**72 h 内 `max_chain` 不单调上升**；Windows 休眠后由对端拉平且不误提交 |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证） |
@@ -319,6 +327,7 @@ M0–M1 **不需要**回答 §14 任何问题就能开工。
     ② 门面把已有的 `prefix_scan_foreach` 提到 `Transaction` trait 上（`engine.rs` 里 `foreach` 出现 0 次，四个引擎的具体类型上都有）；
     ③ `scan_foreach` 那句文档"不收集全库到单一大 Vec"目前是**反的**，先改注释也别留着骗下一个人。
     → 要我做哪一步、还是先按 NFR-1 的 (f1)/(f2) 书面降级把 M0 收掉？
+   **2026-10-17 更新**：用户已另派人修引擎侧（「每次读/写调用折全库」这一笔不在 twosync 这边了）。在它落地前，twosync 的读路径策略维持 §9.6.1 改判后的口径：**窗口是 CPU 旋钮，尽量少调用**。
 
 （v0.1 的 Q1「服务器侧写入是程序产出还是人编辑」已不再是阻塞项——版本库 + 多 head 天生支持两端都写。）
 
@@ -358,6 +367,9 @@ M0–M1 **不需要**回答 §14 任何问题就能开工。
 | 二：图上重写/重放 | `branch tag reset revert stash cherry-pick commit --amend blame bisect project use` | 中。`branch` = ref 命名空间（`H` 前缀里换 `ref_name`）；`blame/bisect` = DAG 遍历；`stash` = 一个临时 commit，近乎免费 | M3–M4 |
 | 三：内容三方合并 | `merge`（有同路径交集时）、`rebase -i` 的冲突解决 | **另一个量级的工程，且与 §1 的分工矛盾**（跨 OS 编辑同一份源码本该交给真 git）→ 不提供，给明确报错 | 不做 |
 
+- **`plan` / `apply` 是 FR-7 的命名对，不是两条流水线**：`plan` 只读（预演"这次会提交什么"+ FR-10 熔断预演 + head 会怎么动），
+  `apply` 是执行侧**且就是 `commit` 同一个函数**。两份"怎么提交"迟早会有一份漏掉某道闸，所以宁可同名不同写法。
+  union 判定与 collision 列表要等 M1/M3 才有对象：`plan` 现在就把这件事明说出来，不放空字段。
 - **revspec 才是手感迁移的真正来源**，值得单独实现（FR-20）：`HEAD`、`<hash>`、`HEAD~3`、`HEAD^`、`branch:path`，配 `--stat/--hard/--patch`。工作量比 `merge` 小两个数量级，体验差别却是决定性的。
 - `push`/`pull` 在 P2P 下是**同一操作的两侧**（§16.3），不是 client/server 动词；v1 的 `pull` 语义 = "把对端 commit 收进来并检出"。
 
@@ -873,6 +885,66 @@ git 的 `core.untrackedCache` 撞的是同一堵墙，它的文档原话就是
 115 用例绿（新增 8 条：对账 6 + 上限/假阳性 2），clippy 0 警告。**M0 的功能面到此收完**；
 剩下的都是账：`§14 Q10`（上游有界读出口）等人拍板，`§10.4` 与 git 的量化差分要等 M1 联网。
 
+### v0.4 补记十三（2026-10-17，M0 收尾：`plan`/`apply`/`version`、FR-1 改名、status 的必填数字、§10.3 路径对抗）
+
+用户的话是"除了引擎那笔账，看看 M0 还有什么没弄，一块弄了，**并保持写的功能可以正常用**"。
+把 §11 的 M0 交付/判据逐格对着代码核了一遍，缺四块，都在这一条里补上（引擎侧那一块他已另派人修）。
+
+**1. 命令面缺三条：`version` / `plan` / `apply`**（§11 的 M0 CLI 清单里一直写着 `plan`、`version`，从没做）。
+- `plan` = FR-7 的只读那一半。它比 `status` 多说的两件，都是"只有要提交才需要知道"的：
+  **FR-10 熔断预演**（用与 `build` 完全同源的三个数 ⇒ 这里判"会拒"，`commit` 就一定拒）和
+  `tree` 变了没有 ⇒ head 会不会动。union/collision 是 M3 的事，**明说出来，不放空字段**。
+- `apply` = 执行侧，**直接调 `commit` 那个函数**。两份"怎么提交"迟早有一份漏掉某道闸，
+  这条规矩在 `checkout`（两趟共用一个 `Job::on`）和 `plan`/`build`（共用 `assemble`）上已经各买过一次单。
+- `version` 报**生效值 + 来源**（`lsm_tree (内置默认)`），和 `config get` 同一判据；
+  依赖版本不硬编（"版本以 Cargo.lock 为准：`cargo tree -p storage-engines`"），并顺手把
+  **二进制体积**打出来——NFR-9 的 ≤ 15 MB 得有人在现场能读到。
+  它**不开引擎**（NFR-8 的"热启动 ≤ 1 s"就是被这种命令吃掉的）。
+
+**2. FR-1 的显式改名**：`commit.stats.rename` 一直是硬编的 `0`，注释写着"改名检测是 FR-17 的活"——
+**两处都错**：FR-17 是后台常驻，改名的正本在 FR-1（"改名由 `mv` 子命令**或同 blob_hash 匹配**得出，
+记在 commit 里，不靠事后猜"）。引用与实现一起补：`ChangeSet::fold_renames()` 用 hash 配对，
+配成功一对就 `add-1 / delete-1 / rename+1`，把字节与 `deleted_blobs` 也一并撤掉（内容还在新树里，
+它不是被删的 blob），**并且必须在 FR-10 熔断之前**——否则一次大规模 `mv` 会被熔断当成"删了一半仓库"
+（新增用例 `a_mass_rename_does_not_trip_the_delete_circuit_breaker`：30 个文件改 15 个名字，
+50% > 20%，不折叠就必然被拒）。目录也参与配对：目录的 hash 是子树 tree hash，整棵搬走两侧相同 ⇒
+一次 `mv d d2` 折成 4 对改名（`d`、`d/e` 与两个文件）。
+另一个坑是 `is_empty()`：**必须把 rename 算进去**，否则纯改名的那轮会被当"无改动"拒掉，
+改名永远进不了历史（用例把这条钉成断言）。
+配对窗口有上限（`RENAME_PAIR_MAX = 4096` ≈ 0.5 MB），超了就放弃检测并打印说明——
+改名是账面与传输优化，不该为它吃掉常数内存的承诺。
+
+**3. `status` 的必填数字**（§9.6.2 与 NFR-5 两处明文要求，之前一个都没报）：
+引擎健康度三项 `active_txns / max_chain / rows_above_one`，磁盘三项
+`工作树 / CAS / 引擎` 各自字节数 + 文件数与块数，加一句 **CAS/工作树 = N ⇒ 约 N 份全量数据**
+（这就是"历史深度相当于几个全量副本"的可读形式）。
+**"跨 project 去重省下多少"故意不给数**：它等于 Σ(全部 `B` 清单声明字节) − CAS 实际字节，
+需要一次全量清单遍历 ⇒ 那是 `gc`（M1）的活。宁可印一行"要 gc 才知道"，也不在 `status` 里
+藏一个把命令变成分钟级的循环。NFR-8 说 `health()` 是 O(物理行数) 不许进热路径——`status` 是人敲的，
+与 `doctor` 同类；真正的热路径是 M2 的 agent/daemon，它自己走缓存。
+
+**4. §10.3 路径对抗成文**（`tests/path_hostile.rs`）：清单照抄文档一条不落，判据是三条一起——
+**报错 + 不崩 + 整棵站点目录一字未变**，最后一条才硬（前两条只是它的必要条件）。
+合法但古怪的名字（空格、中日韩、`#%`、`=+,.`、NFC/NFD 两种形式、120 字长名）走
+"扫 → 提 → 导出到别处 → 逐文件比字节全等"。两条如实标注的例外见 §10.3。
+
+**顺手抓到的一处顺序错误**：`restore --at X ""`（解析到**根**）以前会报"拒绝覆盖工作树根目录：
+工作树里这一条没被扫描过"——**目录根本没有"被覆盖"这回事**，类型分诊必须在覆盖门之前。
+这与补记四那条（先读 blob 再判类型，把"这活归 checkout"的实话变成一次看起来像磁盘损坏的错误）
+是同一族。现在：先看 kind ⇒ 目录直接 `NotYet`；再谈目标存在与 §7.3。同时把存在性判据从
+`dest.exists()` 换成 `symlink_metadata().is_ok()`——断链不是"不存在"，否则 `make_symlink`
+会撞在一个存在但指向空的路径上，报一句看起来像权限问题的错。
+
+**写路径体检**（release，全新站点，每条都真跑）：`scan → plan(+3 R0，熔断通过) → apply(=commit) →
+mv → scan → plan(+1 ~0 -0 **R1**，样本 `R src/main.rs → lib/main.rs`) → commit → log(带 R 列) →
+show(`stats = +1 ~0 -0 改名 1`) → restore --at HEAD~1 → checkout --to 根外(建 2/建目录 2) →
+status(盘上对账抓到 `restore` 刚写回去的那个文件，且 `引擎/磁盘/历史/去重` 四行齐全)`。
+
+122 用例绿（这一轮 +7：改名 3、路径对抗 3、命令面 3，去掉一条被替代的旧断言），clippy 0 警告。
+**M0 剩余**：只有"10 GB 语料的实测数字"这一件在跑（`scan_cold` 已经出来：**20 214 条目 / 11.9 GiB
+9.765 s ⇒ 1 246 MiB/s，peak heap 16.4 MiB**——原来 ts3 上那个 7 MiB/s 是启动开销主导的小样本读数，
+不是吞吐上限），`commit`/`status` 的 RSS 采样器第一轮写坏了（PS 5.1 拿不到 `TotalProcessorTime`，
+采到全 0），已换成 `Get-Process -Id` 轮询，跑完补录。
 ### v0.3 → v0.4（2026-10-15，同日）
 
 依据用户指令："我不想用 rusqlite、libsqlite3-sys 这两个，我想用 `D:\develop\workspace\rust_workspace\storage-engines` 这个发出的 crate"。

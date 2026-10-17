@@ -391,8 +391,13 @@ const MTIME_LAG: i64 = 1_000_000_000;
 pub fn view_since(root: &Path, epoch: i64) -> Result<DiskView> {
     let mut out = DiskView::default();
     match fs::metadata(root) {
-        Ok(md) if mtime_of(&md) > epoch - MTIME_LAG => open_layer(&mut out, ""),
-        Ok(_) => {}
+        Ok(md) => {
+            // 根自己也是"比过一层"，计入 dirs：不然 status 那句"比过 N 层"会少报一层。
+            out.dirs += 1;
+            if mtime_of(&md) > epoch - MTIME_LAG {
+                open_layer(&mut out, "");
+            }
+        }
         // 根读不了：没什么可比的，但要说出来（不许静默变成"盘是空的"）。
         Err(_) => {
             out.unreadable += 1;

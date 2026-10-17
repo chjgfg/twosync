@@ -26,7 +26,13 @@ fn dispatch(cli: &Cli) -> Result<()> {
         // ── M0 ──
         Cmd::Init => m0::init(cli),
         Cmd::Doctor => m0::doctor(cli),
+        Cmd::Version => m0::version(cli),
         Cmd::Project(cmd) => m0::project(cli, cmd),
+        Cmd::Plan => m0::plan(cli),
+        Cmd::Apply {
+            msg,
+            allow_mass_delete,
+        } => m0::apply(cli, msg.as_deref(), *allow_mass_delete),
         Cmd::Scan { force, batch } => m0::scan(cli, *force, *batch),
         Cmd::Commit {
             msg,

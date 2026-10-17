@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use storage_engines::{EngineConfig, EngineKind, KvEngine, StorageConfig};
@@ -71,4 +72,46 @@ pub fn check_durability_gate(db: &dyn KvEngine) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// 一棵目录树的字节数与条目数（NFR-5 的磁盘账要用：CAS / 引擎 / 工作树各占多少）。
+///
+/// 只算**普通文件**，且**不跟随符号链接**（含指向目录的链接）：跟随就可能在自引用的树上
+/// 转圈，而配额关心的是真占了多少磁盘。链接本身按名字长度记账不算字节。
+/// 出错（权限等）不中断整趟，只把这一条计入 `unreadable` —— 报"少了多少"比假装全量准。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DirSize {
+    pub bytes: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub unreadable: u64,
+}
+
+pub fn dir_size(root: &Path) -> DirSize {
+    let mut out = DirSize::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            out.unreadable += 1;
+            continue;
+        };
+        out.dirs += 1;
+        for e in entries.flatten() {
+            let Ok(md) = fs::symlink_metadata(e.path()) else {
+                out.unreadable += 1;
+                continue;
+            };
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else {
+                out.bytes += md.len();
+                out.files += 1;
+            }
+        }
+    }
+    out
 }

@@ -23,6 +23,11 @@ pub enum Cmd {
     /// 子命令，同名再来一次就是自己跟自己撞。
     Doctor,
 
+    /// 版本与**生效**配置（引擎、block_size、站点根、二进制大小）
+    ///
+    /// 只报运行时确证得了的东西：依赖版本以 `Cargo.lock` 为准，这里不硬编一个会过期的数字。
+    Version,
+
     /// 项目注册表（§16.1）
     #[command(subcommand)]
     Project(ProjectCmd),
@@ -105,6 +110,19 @@ pub enum Cmd {
     /// 工作树（按最后一次扫描）与 HEAD 差在哪。**只读，一个字节都不写**
     ///
     /// 它不看文件内容，只看 `W` 与上一版树的差 —— 所以"扫描之后又改了"的那部分
+    /// 预演"这次会提交什么"，并预告 FR-10 熔断会不会拦（FR-7 的 plan 侧，默认不执行）
+    ///
+    /// 比 `status` 多说的两件都是"只有要提交才需要知道"的：熔断预演、head 会怎么动。
+    Plan,
+    /// 执行 `plan` 预演的那次提交（FR-7 的 apply 侧）。**就是 `commit`**，同一份实现。
+    Apply {
+        /// 提交说明
+        #[arg(long, short = 'm')]
+        msg: Option<String>,
+        /// 越过 FR-10 删除熔断
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
     /// 不在这里（要先 `scan`）。这一条与 git 的 `status` 语义相同，代价也相同。
     Status,
 

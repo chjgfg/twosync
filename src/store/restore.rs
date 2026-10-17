@@ -72,16 +72,25 @@ pub fn restore(
         path: path.to_string(),
     })?;
 
+    // **先问类型，再问覆盖**：目录条目的 hash 是 tree，它根本没有"被覆盖"这回事。
+    // 顺序反过来会让人收到一句关于"覆盖工作树根目录"的话（`restore --at X ""` 解析到的就是根），
+    // 而正确的那句是"目录归 checkout 管"。补记四里"blob 在分支里读"是同族错误。
+    if e.kind == Kind::Dir {
+        return Err(Error::NotYet {
+            what: format!("恢复目录（{path}）"),
+            milestone: "那是 `checkout` 的活：它要一次处理整棵子树与删除",
+        });
+    }
     let external = dest.is_some();
     let dest = match dest {
         Some(d) => d.to_path_buf(),
         None => work_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)),
     };
     let mut gate_checked = false;
-    if dest.exists() {
+    if dest.symlink_metadata().is_ok() {
         if !force {
             return Err(Error::LocalExists {
-                path: dest,
+                path: dest.clone(),
                 hint: if external { EXPORT_HINT } else { RESTORE_HINT },
             });
         }
@@ -125,10 +134,8 @@ pub fn restore(
                 gate_checked,
             })
         }
-        Kind::Dir => Err(Error::NotYet {
-            what: format!("恢复目录（{path}）"),
-            milestone: "那是 `checkout` 的活：它要一次处理整棵子树与删除",
-        }),
+        // 目录在函数开头就被拦掉了：走到这里只剩文件与符号链接两种落地方式。
+        Kind::Dir => unreachable!("上面的类型分诊已经拦掉了"),
     }
 }
 

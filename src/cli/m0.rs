@@ -17,7 +17,7 @@ use crate::cli::registry::{self, Registry};
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::{build, cas, checkout, history, object, restore, worktree};
-use crate::utils::{db_dir, journal_dir, log_dir, objects_dir, projects_file, site_dir};
+use crate::utils::{self, db_dir, journal_dir, log_dir, objects_dir, projects_file, site_dir};
 
 /// `Commit.peer` 的占位值。真正的 peer id 要等 M1 的 `peer add|trust`；现在填什么都一样——
 /// 它**只是元数据，不参与任何裁决**（§9.5.2 / §15.7），所以不值得为它提前做一套身份。
@@ -200,13 +200,14 @@ pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
                     for h in &st.heads {
                         let c = object::read_commit(&*db, pid, h)?;
                         println!(
-                            "head      = {}  {}  {:<7} +{} ~{} -{}  {}",
+                            "head      = {}  {}  {:<7} +{} ~{} -{} R{}  {}",
                             keys::short(h),
                             history::fmt_ts(c.ts),
                             c.peer,
                             c.stats.add,
                             c.stats.modify,
                             c.stats.delete,
+                            c.stats.rename,
                             c.msg
                         );
                     }
@@ -317,7 +318,7 @@ pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
     let peak = wm.peak_growth();
 
     let secs = rep.elapsed_ms as f64 / 1000.0;
-    println!("project     = {name}  (id={pid:#010x})");
+    println!("project   = {name}  (id={pid:#010x})");
     println!("root        = {}", root.display());
     println!("walked      = {}", rep.walked);
     println!(
@@ -384,13 +385,14 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<(
         Some(h) => println!("commit      = {}", keys::hex(&h)),
         None => println!("commit      = （无改动：不产生空提交，head 不动）"),
     }
-    println!("tree        = {}", keys::hex(&b.tree));
+    println!("tree      = {}", keys::hex(&b.tree));
     let c = &b.changes;
     println!(
-        "changes     = +{} ~{} -{}   入 {:.1} MiB / 删 {:.1} MiB",
+        "changes     = +{} ~{} -{} R{}   入 {:.1} MiB / 删 {:.1} MiB",
         c.add,
         c.modify,
         c.delete,
+        c.rename,
         c.bytes as f64 / 1048576.0,
         c.deleted_bytes as f64 / 1048576.0
     );
@@ -439,13 +441,14 @@ pub fn log(cli: &Cli, max_count: usize) -> Result<()> {
     for n in &nodes {
         let s = &n.commit.stats;
         println!(
-            "{}  {}  {:<7} +{:<5} ~{:<4} -{:<4} {}",
+            "{}  {}  {:<7} +{:<5} ~{:<4} -{:<4} R{:<4} {}",
             keys::short(&n.hash),
             history::fmt_ts(n.commit.ts),
             n.commit.peer,
             s.add,
             s.modify,
             s.delete,
+            s.rename,
             n.commit.msg,
         );
     }
@@ -845,7 +848,7 @@ pub fn config(cli: &Cli, cmd: &ConfigCmd) -> Result<()> {
 const MV_HINT: &str = "mv 这一条没有覆盖语义，先把它挪开或删掉（删之前想想 §7.3）";
 
 /// `mv`：改个工作树里的路径名。**只动磁盘，不碰库**——改名要等下一次 `scan` + `commit`
-/// 才进历史，那时它在账面上是"一次删除 + 一次新增"（改名检测是 FR-17，还没做）。
+/// 才进历史，那时按 FR-1 折成一次改名（同 hash 配对），账面是 `R`，不是"一删一增"。
 ///
 /// 目标已存在一律拒（`LocalExists`）。这里没有 `--force`：`mv` 想覆盖的话，用户应该显式
 /// 先 `restore`/`rm`，少一个静默丢数据的口子。
@@ -873,7 +876,7 @@ pub fn mv(cli: &Cli, src: &str, dst: &str) -> Result<()> {
         if md.is_dir() { "目录" } else { "文件" }
     );
     println!("  库里还没记：下一步 `scan` 然后 `commit`");
-    println!("  账面上会是 -1 / +1（改名检测是 FR-17）；块是内容寻址的 ⇒ 磁盘和传输都不受影响");
+    println!("  下一次 commit 会按 FR-1 折成改名（R）；块是内容寻址的 ⇒ 磁盘和传输都不受影响");
     Ok(())
 }
 
@@ -946,7 +949,7 @@ pub fn status(cli: &Cli) -> Result<()> {
         println!("盘上对账  = 从来没有完整扫描过 ⇒ 没有活性线可比：先 twosync scan");
     } else if rec.suspect == 0 {
         println!(
-            "盘上对账  = {} 个目录的 mtime 都不晚于最后扫描 ⇒ 没有漏记的增删",
+            "盘上对账  = 没有目录在最后扫描之后被动过（比过 {} 层 mtime）⇒ 没有漏记的增删",
             view.dirs
         );
     } else {
@@ -970,13 +973,133 @@ pub fn status(cli: &Cli) -> Result<()> {
             "提醒      = 上面这些还没进账。要让它们成为变更：先 `scan`，再看 `status`/`commit`。"
         );
     }
+    // §9.6.2 明写 `status` 必须报这三项。NFR-8 说 `health()` 是 O(物理行数) 不许进热路径——
+    // `status` 是人敲的命令，与 `doctor` 同类；M2 的 agent/daemon 才是热路径，它自己走缓存。
+    let h = db.health();
     println!(
-        "耗时        = {:.3} s   peak heap = {:.1} MiB",
+        "引擎      = {}  active_txns={}  max_chain={}  rows_above_one={}",
+        db.name(),
+        h.active_txns,
+        h.max_chain,
+        h.rows_above_one
+    );
+    // NFR-5 的磁盘账：配额够不够用，取决于这三个数加不加起来看得见。
+    let cas_size = utils::dir_size(&objects_dir(&cli.root));
+    let engine_size = utils::dir_size(&db_dir(&cli.root));
+    let work_size = utils::dir_size(&root);
+    println!(
+        "磁盘      = 工作树 {:.1} MiB({} 文件) / CAS {:.1} MiB({} 块) / 引擎 {:.1} MiB",
+        work_size.bytes as f64 / 1048576.0,
+        work_size.files,
+        cas_size.bytes as f64 / 1048576.0,
+        cas_size.files,
+        engine_size.bytes as f64 / 1048576.0
+    );
+    if work_size.bytes > 0 {
+        // "几个全量副本"就是 CAS/工作树这个比值：它直接回答"留这么多历史吃得消吗"。
+        let ratio = cas_size.bytes as f64 / work_size.bytes as f64;
+        println!("历史      = CAS / 工作树 = {ratio:.2} ⇒ 块仓里约等于 {ratio:.1} 份全量数据");
+    }
+    // 这一项故意**不**给数：它需要遍历全部 `B` 清单把"声明字节"加起来，那是 `gc`（M1）的活。
+    // 宁可说一句"要 gc 才知道"，也不要在这里塞一个把 `status` 变成分钟级的隐藏循环。
+    println!(
+        "去重      = 跨 project 省下多少 = Σ(blob 声明字节) − CAS 实际字节；需要全量清单 ⇒ 归 `gc`（M1）"
+    );
+    println!(
+        "耗时      = {:.3} s   peak heap = {:.1} MiB",
         started.elapsed().as_secs_f64(),
         peak as f64 / 1048576.0
     );
     println!("注意：与 HEAD 的差按「最后一次扫描」算；「盘上对账」那一段才是此刻盘上的样子。");
     Ok(())
+}
+
+/// `version`：版本与**生效**配置。断言走 [`version_lines`]（打印出来的东西测不到）。
+pub fn version(cli: &Cli) -> Result<()> {
+    for line in version_lines(cli)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn version_lines(cli: &Cli) -> Result<Vec<String>> {
+    let cfg = Config::load(&cli.root)?;
+    let (engine, esrc) = cfg.effective("engine")?;
+    // 命令行 `--engine` 压过配置文件（优先级只在 `Cli::store()` 里实现一次，这里报的是同一口径）。
+    let esrc = if cli.engine.is_some() {
+        "命令行 --engine"
+    } else {
+        esrc
+    };
+    let (block, bsrc) = cfg.effective("block_size")?;
+    let mut out = vec![
+        format!("twosync   = {}", env!("CARGO_PKG_VERSION")),
+        format!("站点根    = {}", cli.root.display()),
+        format!("引擎      = {engine:<10} ({esrc})"),
+        format!("block_size = {block:<10} ({bsrc})"),
+        "存储基座  = storage-engines".to_string(),
+        "            版本以 Cargo.lock 为准（`cargo tree -p storage-engines`）；这里不硬编一个会过期的数字"
+            .to_string(),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        let n = fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+        // NFR-9 的判据就在这行：单二进制 ≤ 15 MB。
+        out.push(format!(
+            "二进制    = {}  ({:.1} MiB)",
+            exe.display(),
+            n as f64 / 1048576.0
+        ));
+    }
+    Ok(out)
+}
+
+/// `plan`：FR-7 的只读那一半。**一个字节都不写**，`apply` 才执行。
+///
+/// 它比 `status` 多说的两件，都是"只有要提交才需要知道"的：**FR-10 熔断预演**
+/// （用与 `build` 完全同源的三个数 ⇒ 这里判"会拒"，commit 就一定拒）和 head 会怎么动。
+/// union / collision 是 M3 的活：现在没有对端，报 `NotYet` 之前先把"无对象可算"说清楚。
+pub fn plan(cli: &Cli) -> Result<()> {
+    let (name, _) = resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&name);
+    let started = Instant::now();
+    let wm = allocstats::watermark();
+    let p = build::plan(&*db, pid)?;
+    let peak = wm.peak_growth();
+    let cs = &p.changes;
+
+    println!("project     = {name}  (id={pid:#010x})");
+    println!("预演      = 若现在 commit（按最后一次扫描，不复核磁盘）");
+    print_changes(cs);
+    println!(
+        "tree        = {}  {}",
+        keys::short(&p.tree),
+        if cs.is_empty() {
+            "与 HEAD 相同 ⇒ 不会产生 commit"
+        } else {
+            "与 HEAD 不同 ⇒ commit +1、head 前移"
+        }
+    );
+    // 熔断预演：`known` 与 build 用的是同一个数（库里 W 行全量，不是本轮活行）。
+    match build::check_mass_delete(cs.delete, cs.deleted_bytes, p.known, false) {
+        Ok(()) => println!("熔断      = 通过（不必 --allow-mass-delete）"),
+        Err(e) => println!("熔断      = 会被拒：{e}"),
+    }
+    println!("union     = 现在只有本机一个 head：union 判定与 collision 列表要等 M1/M3 才有对象");
+    println!(
+        "耗时        = {:.3} s   peak heap = {:.1} MiB",
+        started.elapsed().as_secs_f64(),
+        peak as f64 / 1048576.0
+    );
+    println!("注意      = plan 只读；要真做是 `apply`（= `commit`）。磁盘上更晚的改动先 `scan`。");
+    Ok(())
+}
+
+/// `apply`：FR-7 的执行那一半。**与 `commit` 同一份实现**，不是第二份代码——
+/// "怎么提交"这件事有两份实现迟早会在其中一份里漏掉一道闸（本项目为这事记过不止一条）。
+pub fn apply(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<()> {
+    println!("apply     = commit 的执行侧（FR-7 的命名对），走的是同一个函数");
+    commit(cli, msg, allow_mass_delete)
 }
 
 /// `diff --at REV`：同一份变更表，只是比较对象换成任意一个版本。
@@ -1006,10 +1129,11 @@ fn print_changes(c: &build::ChangeSet) {
         return;
     }
     println!(
-        "变更      = +{} ~{} -{}   入 {:.1} KiB / 删 {:.1} KiB",
+        "变更      = +{} ~{} -{} R{}   入 {:.1} KiB / 删 {:.1} KiB",
         c.add,
         c.modify,
         c.delete,
+        c.rename,
         c.bytes as f64 / 1024.0,
         c.deleted_bytes as f64 / 1024.0
     );
@@ -1026,6 +1150,19 @@ fn print_changes(c: &build::ChangeSet) {
             "  …另有 {} 条未列出（列表上限 {}）",
             c.sample_more,
             build::SAMPLE_MAX
+        );
+    }
+    // 改名单独列（FR-1）：它是"同一份内容换了路径"，不复制数据也不占传输，所以既不算 +也不算 -。
+    for (old, new) in &c.renames {
+        println!("  R {old} → {new}");
+    }
+    if c.rename_more > 0 {
+        println!("  …另有 {} 对改名未列出", c.rename_more);
+    }
+    if c.rename_gave_up {
+        println!(
+            "注意      = 变更条数超过配对上限 {}，改名只报了部分（改名是账面与传输优化，不影响正确性）",
+            build::RENAME_PAIR_MAX
         );
     }
 }
