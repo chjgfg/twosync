@@ -29,9 +29,17 @@
 //! cargo run -q -- --root /tmp/ts3 scan --force  # 全重算，看 throughput 那一行
 //! ```
 //!
-//! 期望：`peak heap` 那一行**与文件数、最大文件都无关**（只跟 `--batch` 与 `HASH_BUF`
-//! 有关，这是 §9.6.1 的量尺）；第二次 `hashed=0` 说明 size+mtime 粗筛生效；`--force`
-//! 那次的 `throughput` 才是这台机器真实的 blake3 速度。
+//! 期望：第二次 `hashed=0` 说明 size+mtime 粗筛生效；`--force` 那次的 `throughput` 才是
+//! 这台机器真实的 blake3 速度。
+//!
+//! `peak heap` **不是**与文件数无关（2026-10-17 实测更正，见 §9.6.1 与 §17 补记十）：扫描器
+//! 自己那一层确实只有 `--batch` + `HASH_BUF`，但引擎每次 `commit` 都要在库里做一次全库级的活，
+//! 所以现场 22 000 行 / 库内十万键的站点上地板是 **~25 MiB**，而且 `--batch` 调大只会双输
+//! （100 → 9.7 s/24.9 MiB，20 000 → 23.9 s/31.7 MiB）。想看这一条用大语料：
+//!
+//! ```sh
+//! cargo run -q --release -- --root /tmp/ts6 status   # 20000 文件 / 2000 目录
+//! ```
 //!
 //! 注意语料为什么放在 `/tmp/ts3/lab/data` 而不是别处：注册表里的 `path` 是**相对 root**
 //! 的（§16.1），`check_rel_path` 明确拒绝绝对路径，所以 `--root` 和语料位置必须对得上。
