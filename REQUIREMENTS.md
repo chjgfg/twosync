@@ -319,8 +319,22 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    `log_walk`（历史 5/25/100 个 commit，NFR-7）。
    **两格没测也不假装**：① `want/have` 协商——M1 的会话层已经落地（`net::session`），这一格**现在能做而还没做**，
    排进 M1 剩余清单；② **"分页扫描窗口大小调参"这条现在做不了**——
-   `build::PAGE` 是编译期常量，要做成运行期旋钮才有那条曲线。**冒烟已过（`cargo bench -- --test` 15 个点全 Success）**，
-   真读数的口径规矩照 §10 开头那条：profile + 硬件 + 数据形状，缺一项就不许进表。
+   `build::PAGE` 是编译期常量，要做成运行期旋钮才有那条曲线。
+   **首批读数（2026-10-18）**：冒烟 `cargo bench -- --test` 15 个点全 Success；正式跑了一轮
+   `--sample-size 10 --measurement-time 2 --warm-up-time 1`（release，站点建在 **C: = KIOXIA SSD** 的 tempdir 上，
+   **每点只有 10 个样本 ⇒ 看中位数与趋势，绝对值别外传**，本机 run 间噪声 ±2×）：
+
+   | 组 | 规模 | 中位耗时 | 每单位成本 | 这条曲线说明什么 |
+   |---|---|---|---|---|
+   | `scan` | steady 200 / 1 000 / 4 000 条 | 0.58 / 0.64 / 2.72 s | 2.9 / 0.64 / 0.68 ms/条 | 200 那档被噪声吃掉（区间 0.33–0.73 s）；1 000→4 000 **线性** |
+   | `scan` | forced 同三档 | 0.56 / 0.54 / 7.89 s | — | 4 000 档 forced 是 steady 的 **2.9 倍** ⇒ 脏判定省的是"重算 hash"那一腿，**省不掉折叠那一腿** |
+   | `hash` | 4 / 16 / 64 MiB 单文件 | 3.51 / 14.22 / 60.55 ms | **1.14 / 1.15 / 1.06 GiB/s** | 切块 + blake3 的纯 CPU 吞吐与大小无关 ≈ **1.1 GiB/s 单核** |
+   | `plan` | 200 / 1 000 / 4 000 条 | 2.81 / 12.88 / 55.39 ms | **14.0 / 12.9 / 13.8 µs/条** | 每单位成本平直 ⇒ (f1) 要的线性成立 |
+   | `commit` | 改 1 / 10 / 100 个文件 | 1.068 / 0.947 / 1.240 s | — | 改 1 个与改 100 个几乎同价 ⇒ **固定成本主导**（这份 2 000 条的库 ≈ 0.9 s），NFR-6 那一格的形状 |
+   | `history` | 历史 5 / 25 / 100 个 commit | 42.3 / 211 / 788 µs | **8.5 / 8.4 / 7.9 µs/commit** | 平直 ⇒ NFR-7 的线性成立 |
+
+   **一条口径警告**：`target/criterion/` 里存着上一轮（100 样本配置）的半成品基线，输出里那些
+   `change: [-80% …]` 是**跨配置比出来的**，不作数；要干净的对比先删 `target/criterion` 再跑。
 7. 判据：1/2/3 未全绿，**禁止发任何 release**；且 release 时 `storage-engines` 必须是 §9.7 的版本号依赖，不许残留 `path`（提交前用 `cargo tree -p storage-engines` 核对）。
 8. **引擎矩阵**（本项目独有的素材）：同一套 §10.1 不变量 + §10.6 基准在 `lsm_tree` / `bplus_tree` 上各跑一遍，`memory` 上跑全量 proptest（无持久化 = 快一个量级，适合当回归主力）。四引擎在同一真实负载下的 RSS/CPU/p99/磁盘增长，加上 `health()` 读数必须一致这条约束，就是"自研引擎吃自己狗粮"能拿出的最硬的表。
 
@@ -329,7 +343,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
 | 阶段 | 交付 | 可验证判据 |
 |---|---|---|
 | **M0 骨架** | `cargo init --lib --name twosync`；CLI(`commit/log/diff/show/checkout/restore/status/plan/apply/version`，**这一轮补齐 plan/apply/version**)；**CAS 块仓 + blob/tree/commit 读写**；§9.2 键编码 + 引擎接入（FR-21 自检）；扫描器 + 变更检测 + 自动建 commit；**project 注册表**。**先不联网** | 扫 10 GB 建库给出实测耗时/RSS/CPU（NFR-1/2 变真数字）——**已交付，见 §11.1 那张表：判据没过（墙钟 10.6×、RSS 余量 19 MB），归因已做完**；**扫描峰值按拆后的 (f1)/(f2) 两段验收（≤ 8 MiB 那条在 0.4.0 上过不了，见 §9.6.1）**；改 1 MB 后 `commit` 成本符合 NFR-6；`restore --at` 取回任意历史版本；`checkout --to` 能把版本导出到工作树外（目标在工作树里必须拒，§17 补记十一）；`status` 能报出"扫描之后的增删"（盘上对账，只进打印不进账，§17 补记十二）；`H` 前缀能表达多 head、`K`/`k` 双写不漂移（**(g) 现在是三方对照的随机用例**，见 §10.1 落地状态）；改名按 FR-1 记进 `commit.stats.rename`（不是一删一增）；`status` 报出 §9.6.2 的引擎健康度与 NFR-5 的磁盘账；§10.3 的路径对抗清单成文用例 |
-| **M1 单向推送** | SSH 通道 + `HeadsState/WantHave/PushBatch/PushCommit/UnionAccept` + **多 project 复用一条连接** + FR-10 熔断 + FR-9 配额 GC + FR-13 原子写 | 本地删 30% 文件 → 对端拒绝该 commit 并提示；10 GB 文件改 1 MB → 传输 ≤ 8 MB；crash injection 通过；§10.4 差分表首版数字；20 project 一轮只 1 次认证。**现状（2026-10-18）：会话层与 `gc` 已落地，判据逐条状态见 §11.0——三条"同机器语义"已过（熔断拒绝、改一字节只传一块、一根管子连开两场会话），crash injection、真 SSH 往返、TOFU 指纹表、块级配额淘汰四格还没做** |
+| **M1 单向推送** | SSH 通道 + `HeadsState/WantHave/PushBatch/PushCommit/UnionAccept` + **多 project 复用一条连接** + FR-10 熔断 + FR-9 配额 GC + FR-13 原子写 | 本地删 30% 文件 → 对端拒绝该 commit 并提示；10 GB 文件改 1 MB → 传输 ≤ 8 MB；crash injection 通过；§10.4 差分表首版数字；20 project 一轮只 1 次认证。**现状（2026-10-18）：会话层、`gc`、真子进程管子都已落地，判据逐条状态见 §11.0——四条已过（熔断拒绝、改一字节只传一块、一根管子连开两场会话、对端半程被 kill 之后 head 不动且能追平）；剩下的四格是 §10.2 的其余崩溃点（尤其引擎 WAL 恢复那一半）、两台机器之间的真 SSH、TOFU 指纹表、块级配额淘汰** |
 | **M2 常驻（仍 1+1）** | watch + debounce + 周期兜底 → 自动 commit + 自动 push/pull；**拨号方向对称**（任一端可发起，§16.3）；断点续传；限速（含 GC 与 vacuum，总预算不叠加）；`status` 指标含引擎健康度；systemd/计划任务 | 拔网重连自动续传；稳态 CPU ≤ 10% 单核实测；**72 h 内 `max_chain` 不单调上升**；Windows 休眠后由对端拉平且不误提交 |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证） |
 | **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7） |
@@ -352,21 +366,24 @@ M0–M1 **不需要**回答 §14 任何问题就能开工。
 | `cli::m1::push` | 起 `ssh <peer> "<agent_bin> --root <远端> agent"`，把它的 stdin/stdout 拼成一根管子。**不开新端口、不引入异步运行时**（§9.5） |
 | `cli::m1::agent` | 服务端循环：一条连接连续服务多场会话 = FR-19；**stdout 只能有帧**，诊断一律走 stderr |
 | `cli::m1::gc` | 引擎版本回收（见下面"引擎侧的能力边界"） |
-| `tests/net_session.rs` | 6 条用例，全部跑在内存管道上 ⇒ **同一份会话代码**，不等 SSH |
+| `tests/net_session.rs` | **8 条**用例：6 条跑在内存管道上（**同一份会话代码**，不等 SSH），2 条起**真子进程 + 真 OS 管道**——一条跑完整场 push，一条在对端落块落一半时把它 `kill` 掉 |
 
 **判据逐条的状态**（不许把"用例绿了"读成"M1 完成"）：
 
 | §11 那行的判据 | 状态 | 依据 |
 |---|---|---|
+| **CLI 那两层（拼命令、`Duplex`、等退出码）到底跑过没有** | **已过（除 ssh 拨号那一行）** | `push_over_a_real_child_process_and_pipes`：同机两站点，`agent` 起成**真子进程**、走**真 OS 管道**传完整场会话，退出码 0，对端 head / 块数 / 根 tree 三条全核对。**必须真管道**的理由：内存管道无界，"大帧会不会把写端堵死"只有这条路测得出来 |
 | 本地删 30% 文件 → 对端拒绝该 commit | **已过**（同机器语义） | `the_peer_refuses_a_mass_delete_commit_and_keeps_the_old_history`：发起方放开 `--allow-mass-delete` 也挡不住对端自己的闸；**被拒的是那个 commit，对端 head 仍停在上一版** |
 | 10 GB 文件改 1 MB → 传输 ≤ 8 MB | **机制已过、量级未过** | `an_incremental_push_sends_only_the_changed_blocks`：改 1 个字节 ⇒ `blocks_sent = 1`、`blocks_skipped = 5`、两边字节数对账相等。10 GiB 站点上的那一格还没跑（要两个站点，见下面"还缺的"） |
 | 20 project 一轮只 1 次认证 | **形状已过、次数未验** | `a_second_push_sends_no_bytes` 在**同一根管子上连开两场会话**（`agent` 就是这个循环）；"认证次数"只能在真 SSH 上数 |
-| crash injection | **没做** | §10.2 那一族需要 kill -9 与半程重启，M1 后半 |
+| crash injection | **第一刀已过**（同机、真子进程） | `a_peer_killed_mid_session_leaves_no_half_applied_history`：手工驱动协议到"announce 三块、只写完两块"那一刻 `kill` 掉 `agent` 子进程 ⇒ 对端 **head 没动**、**commit 对象压根不在库里**、落下的块 ≤ 2（只是孤块，等块级 GC）；然后**重起 agent 做一次完整 push 能追平**（FR-13 的"半成品不许把站点锁死"）。剩下的：`kill -9` 之后**引擎自己的 WAL 恢复**（§12 那条"直接去撞它"的狗粮项）要在崩溃点之后额外开一次 `doctor`/`fsck` 才算撞满 |
 | §10.4 与 git 的量化差分 | **没做** | 分子已经会打了（`Report.bytes_sent` / `blocks_skipped`），缺 git 那一侧的对照跑法 |
 
-**还没做的两格是硬的**：① §9.5 的 **TOFU 指纹表**（`peer add|list|trust`）——现在 `peer_id` 只是"对端自报的名字"，
+**还没做的三格是硬的**：① §9.5 的 **TOFU 指纹表**（`peer add|list|trust`）——现在 `peer_id` 只是"对端自报的名字"，
 任何人都能冒充，**接真机之前必须补**；② **块级配额淘汰**（FR-9 的"超配额按最老且不可达优先删"）——`gc` 现在只压
-引擎的版本链，不删任何块，所以 `push` 只保证"对端缺什么才传什么"，**不保证对端磁盘装得下**。
+引擎的版本链，不删任何块，所以 `push` 只保证"对端缺什么才传什么"，**不保证对端磁盘装得下**；
+③ **`Command::new("ssh")` 那一行本身**——它只能在有第二台机器（或本机装了 sshd）时验。免密登录、远端 `PATH`、
+远端 stderr 怎么回到发起方，这三件事目前只有代码没有读数。
 
 **引擎侧的能力边界（`gc` 为什么是"全库一刀"）**：`storage_engines` 的**具体** MVCC 类型上有
 `vacuum_bounded(after, budget_rows)`（游标 + 每圈预算），但门面 `KvEngine` 只暴露 `vacuum()`（全库一轮）与
@@ -529,7 +546,10 @@ Windows 的写缓存把两者合并了 ⇒ **孤立单价 × 次数 不是这一
 差的只有睡眠。**NFR-2/NFR-3 要的"可限速"到这一格才算真的有读数**，CPU 从 51.2% 掉到 5.3% 就是"别抢同机进程"那一条。
 
 **还没测的（不许算成"没问题"）**：① 真目标机（Ubuntu 1 核 6 G，盘型未知）上的同一轮；② §10.4 与 git 的量化差分；
-③ §10.2 crash injection；④ **两台机器之间的真 SSH 往返**（会话层现在只在内存管子上验过，§11.0）；
+③ §10.2 crash injection 的**其余崩溃点**（清单提交前、head 更新前，以及崩完之后引擎 WAL 恢复那一半）——
+第一刀已经落了：`a_peer_killed_mid_session_leaves_no_half_applied_history`（对端落块落一半被 kill ⇒ head 不动、
+对象不入库、下一次完整 push 追平），但它撞的是 **twosync 自己的写序**，还没撞引擎；
+④ **两台机器之间的真 SSH 往返**（同机双站点、真 OS 管道的 `push → agent` 已过，缺的只有 `Command::new("ssh")` 那一行）；
 ⑤ 块级配额淘汰（FR-9）与 TOFU 指纹表。
 
 ## 12. 技术选型
@@ -1429,7 +1449,8 @@ W|p|src/main.rs     ← 子项紧跟，中间插不进任何东西
 
 **一、会话层的形状**：`net::frame`（消息 ↔ 字节）+ `net::session`（`push` / `serve`，只要求 `Io = Read + Write`）
 + `cli::m1`（`push` 起 `ssh <peer> "<agent_bin> --root <远端> agent"`；`agent` 在一条连接上循环 `serve` = FR-19；
-**stdout 只能有帧**，诊断一律 stderr）。`tests/net_session.rs` 6 条用例跑在内存管道上 ⇒ **同一份会话代码**，不必等 SSH。
+**stdout 只能有帧**，诊断一律 stderr）。`tests/net_session.rs` 现在 8 条：6 条跑在内存管道上（**同一份会话代码**，
+不必等 SSH），2 条起真子进程走真管道（见下面第六条）。
 
 **第一次跑就抓到三条真 bug**：
 
@@ -1488,16 +1509,30 @@ W|p|src/main.rs     ← 子项紧跟，中间插不进任何东西
 - 一个**未归因**的事实记在这里当账：自动回收切片默认开着（`16 384` 行），同一站点上链照样涨到 `max_chain 5`。
   不猜原因（触发条件 or 按 key 计量的差别），下次专项查。
 
-**五、criterion 基准**：`benches/m0.rs` 五组、全部把规模当自变量；`cargo bench -- --test` 冒烟全绿，
-跑法与两条如实边界（窗口大小是编译期常量 ⇒ 测不了调参曲线；二进制挂着计数分配器 ⇒ 绝对值偏慢、趋势不变）写在文件头。
+**五、criterion 基准**：`benches/m0.rs` 五组、全部把规模当自变量；`cargo bench -- --test` 冒烟 15 个点全绿，
+首批 10 样本读数与**它的口径警告**（`target/criterion` 里混着上一轮不同配置的基线，`change:` 百分比不作数）在 §10.6。
+两条如实边界写在文件头：`build::PAGE` 是编译期常量 ⇒ 测不了窗口调参；二进制挂着计数分配器 ⇒ 绝对值偏慢、趋势不变。
+最有用的一条形状：`commit` 改 1 个文件与改 100 个文件几乎同价（1.068 s vs 1.240 s）⇒ **固定成本主导**，
+这就是 NFR-6 那格在 0.4.0 上的样子；`history/walk` 每 commit 稳定在 8 µs 上下 ⇒ NFR-7 的线性成立。
 
-**六、顺带记一条与 git 的语义差别**（增量四格量 `ls-files` 时发现的）：本工具的 `ls-files` 把**目录也列出来**
+**六、`push` 的命令行那两层第一次真跑，顺带落了 §10.2 的第一刀**：
+- `push_over_a_real_child_process_and_pipes`——同机两站点，`agent` 起成**真子进程**、走**真 OS 管道**跑完整场会话
+  （`Duplex::from_child` 与 `push` 共用同一个构造函数，测试测的就是生产走的那条路），退出码、对端 head、块数、
+  根 tree 四条全核对。**为什么非真管道不可**：内存管道无界，"大帧把写端堵死"这类故障（本机已经栽过一次：
+  20 000 行 stdout 把采样器堵死，见补记十四的台架账）在内存管子上永远测不出来。
+- `a_peer_killed_mid_session_leaves_no_half_applied_history`——手工驱动协议到"announce 三块、只写完两块"那一刻
+  `kill` 掉对端：head 不动、commit 对象压根不在库里、落下的块只是 ≤2 个孤块；然后重起 agent 做一次完整 push
+  **能追平**。这一刀撞的是 twosync 自己的写序（FR-13），**还没撞引擎的 WAL 恢复**，别把它读成 §10.2 全绿。
+- 剩下没验的只有 `Command::new("ssh")` 那一行本身（§11.0）。
+
+**七、顺带记一条与 git 的语义差别**（增量四格量 `ls-files` 时发现的）：本工具的 `ls-files` 把**目录也列出来**
 （size 记 0、hash 是那棵子树的 hash），git 的 `ls-files` 只列 blob。不是 bug，是 §16.2"手感照 git 自建"里没写死的一项，
-但**报数的时候要说清 20 214 行 = 20 011 文件 + 203 目录**，否则与 git 的差分表会拿不同分母相比（§10.4）。
+但**报数的时候要说清 20 214 行 = 20 011 文件 + 203 目录**，否则 §10.4 的差分表会拿不同分母相比。
 
-**七、这一轮的账面**：`cargo test --no-fail-fast` **147 通过 / 0 失败**（新增 `net_session` 6 条），
-`cargo clippy --all-targets` **零告警**，release 二进制 **8 328 300 B = 7.94 MiB**（NFR-9 上限 15 MB，含 M1 的
-postcard 线格式层）。M1 判据的逐条状态在 §11.0——**过的是"同机器语义"，真 SSH 一次都没跑过**。
+**八、这一轮的账面**：`cargo test --no-fail-fast` **149 通过 / 0 失败 / 1 忽略**（`net_session` 从 0 条到 8 条），
+`cargo clippy --all-targets` **零告警**，release 二进制 **8 309 872 B = 7.92 MiB**（NFR-9 上限 15 MB，含 M1 的
+postcard 线格式层）。M1 判据的逐条状态在 §11.0——**过的是"同机器语义"，`Command::new("ssh")` 那一行还没在人家的
+第二台机器上跑过**。
 
 ### v0.3 → v0.4（2026-10-15，同日）
 
