@@ -18,7 +18,7 @@ use crate::cli::cmd::engine_parser;
 use crate::cli::config::Config;
 use crate::error::Result;
 use crate::utils::open_store;
-pub use cmd::{Cmd, Import};
+pub use cmd::{Cmd, Import, PeerCmd};
 use storage_engines::{EngineKind, KvEngine};
 
 /// 全局参数。`Cli` 直接住在本模块，不另开 `cli.rs`——那会撞 `clippy::module_inception`

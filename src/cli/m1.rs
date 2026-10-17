@@ -33,14 +33,16 @@ use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use crate::cli::Cli;
+use crate::cli::cmd::PeerCmd;
 use crate::cli::m0;
 use crate::error::{Error, Result};
 use crate::net::frame::caps;
 use crate::net::session::{self, PushOpts};
 use crate::store::build;
 use crate::store::cas::Cas;
+use crate::store::history;
 use crate::store::keys;
-use crate::utils::objects_dir;
+use crate::utils::{objects_dir, site_id};
 
 /// 一根管子：读一头、写一头。会话层只认 `Read + Write` 这个形状，所以子进程的 stdio
 /// 与进程自己的 stdio（`agent`）共用同一份会话代码。
@@ -149,10 +151,13 @@ pub fn push(
             ))
         })?;
     let mut io = Duplex::from_child(child)?;
+    // 本端身份：`.twosync/site-id`，第一次用到时生成（§9.5.1）。
+    let site = site_id(&cli.root)?;
 
     let opts = PushOpts {
         project: &name,
-        peer_id: name.as_bytes(),
+        peer_id: &site,
+        peer_name: peer.as_bytes(),
         caps: caps::FIXED_CHUNK | caps::SPARSE | caps::XATTR_MODE,
         max_block_bytes: if max_send_mib > 0.0 {
             (max_send_mib * 1048576.0) as u64
@@ -161,10 +166,35 @@ pub fn push(
         },
         allow_mass_delete,
     };
-    let rep = session::push(&mut io, &*db, &cas, &opts)?;
+    let rep = match session::push(&mut io, &*db, &cas, &opts) {
+        Ok(rep) => rep,
+        Err(e) => {
+            // **先收尾再写报错**：关写端 → 对端读到尾 → 等它退出。反过来（先 `try_wait` 再收尾）
+            // 两件事都会坏：`try_wait` 在"管子已到尾但进程还没被回收"的那一刻给 `None`，报错里就
+            // 只剩结果没有原因；而对端还在等输入时直接 `wait` 会把自己卡死。
+            let why = match io.finish() {
+                Ok(()) => e.to_string(),
+                Err(done) => format!(
+                    "{e}\n  对端进程那一侧的读数：{done}\n  \
+                     没装 twosync、免密登录失败、sshd 根本没起，都会落到这一支——\
+                     真实原因在 ssh 自己打的几行里（它写的是本端 stderr）"
+                ),
+            };
+            return Err(Error::BadInput(why));
+        }
+    };
+    if rep.first_contact {
+        println!(
+            "TOFU      = 首次连接 {peer}，它的站点身份已进 P 表。以后**身份一变就拒**；\
+             对端确实重装过就 `peer forget {peer}` 重新确认"
+        );
+    }
 
     println!("project     = {name}");
-    println!("peer        = {peer}  (经 ssh 起的 agent；未验指纹，TOFU 表还没做)");
+    println!(
+        "peer        = {peer}  (经 ssh 起的 agent；TOFU：本端认的是它的**站点身份**，\
+         host key 那一层仍归 ssh)"
+    );
     println!(
         "commits     = {}，清单 blobs {} 份 / tree {} 份",
         rep.commits, rep.blobs_sent, rep.trees_sent
@@ -200,7 +230,9 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
             reg.projects.keys().cloned().collect()
         }
     };
-    let peer = std::env::var("TWOSYNC_PEER_ID").unwrap_or_else(|_| "local".to_string());
+    // 服务端在 Hello 里报的是**本站点的身份**（`.twosync/site-id`），不是环境变量：
+    // 发起端的 TOFU 表要绑的是一个稳定的东西，而"谁调用我时传什么"是可以随便改的。
+    let site = site_id(&cli.root)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut io = Duplex {
@@ -214,7 +246,7 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
         let mut resolve = |name: &str| -> Option<u32> {
             allowed.iter().any(|n| n == name).then(|| keys::project_id(name))
         };
-        match session::serve(&mut io, &*db, &cas, peer.as_bytes(), !0, &mut resolve, false) {
+        match session::serve(&mut io, &*db, &cas, &site, !0, &mut resolve, false) {
             Ok(rep) => {
                 sessions += 1;
                 eprintln!(
@@ -313,5 +345,37 @@ pub fn gc(cli: &Cli, auto_slice: Option<u64>) -> Result<()> {
         before.total_rows,
         after.total_rows
     );
+    Ok(())
+}
+
+/// `peer list|forget`：§9.5.1 的 TOFU 表。表只有库里那一份（`P` 前缀），
+/// 不落 `peers.json` —— 一份数据两处存就要同步，而同步是漂移的产地。
+pub fn peer(cli: &Cli, cmd: PeerCmd) -> Result<()> {
+    let db = cli.store()?;
+    match cmd {
+        PeerCmd::List => {
+            let rows = session::read_peers(&*db)?;
+            if rows.is_empty() {
+                println!("(还没有已知对端：`push` 成功一次就会把对方记进 P 表)");
+                return Ok(());
+            }
+            println!("对端          站点身份                                首次确认");
+            for (name, p) in rows {
+                println!(
+                    "{:<14} {:<40} {}",
+                    name,
+                    session::hex(&p.site_id),
+                    history::fmt_ts(p.first_seen)
+                );
+            }
+        }
+        PeerCmd::Forget { name } => {
+            if session::forget_peer(&*db, name.as_bytes())? {
+                println!("已忘掉 {name}：下一次 push 会重新确认它（首连告警会再打一次）");
+            } else {
+                println!("{name} 不在表里：没有什么可忘的（名字要跟当初 `push` 给 ssh 的那个一字不差）");
+            }
+        }
+    }
     Ok(())
 }

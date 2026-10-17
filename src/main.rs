@@ -76,6 +76,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         ),
         Cmd::Agent { project } => m1::agent(cli, project.as_deref()),
         Cmd::Gc { auto_slice } => m1::gc(cli, *auto_slice),
+        Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Log { max_count } => m0::log(cli, *max_count),
         Cmd::Show { rev, path } => m0::show(cli, rev, path.as_deref()),
         Cmd::Restore {

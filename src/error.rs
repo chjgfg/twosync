@@ -89,6 +89,16 @@ pub enum Error {
         what: String,
         milestone: &'static str,
     },
+    /// §9.5.1 TOFU：这次连上的对端与表里记的**不是同一个站点**。这一条是**拒绝会话**，不是提示。
+    ///
+    /// 报错里必须带上"怎么恢复"：对端重装过是要重新确认（`peer forget`），而不是让人以为历史坏了。
+    #[error("对端 {peer} 的身份变了：表里记的是 {want}，这次报的是 {got}。\
+         要么对端换过站点（`peer forget {peer}` 重新确认一次），要么你在往**不是它**的机器上推")]
+    PeerIdentityChanged {
+        peer: String,
+        want: String,
+        got: String,
+    },
 }
 
 /// 全项目只有一种错误，所以签名统一写 `Result<T>`。

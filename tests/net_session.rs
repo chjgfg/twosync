@@ -30,7 +30,7 @@ use twosync::store::history;
 use twosync::store::keys;
 use twosync::store::object;
 use twosync::store::worktree;
-use twosync::utils::{objects_dir, open_store};
+use twosync::utils::{objects_dir, open_store, site_id};
 
 const PROJECT: &str = "shared";
 
@@ -273,6 +273,45 @@ fn opts<'a>(project: &'a str) -> PushOpts<'a> {
         peer_id: b"peer-a",
         ..Default::default()
     }
+}
+
+// ── 真子进程那一侧的公共动作 ──────────────────────────────────────────────
+
+/// 命令行可执行文件（cargo 给集成测试留的 `CARGO_BIN_EXE_<name>`，它会自动把 bin 编出来）。
+const EXE: &str = env!("CARGO_BIN_EXE_twosync");
+
+/// 在一个空目录上注册项目（`agent` 的白名单就是注册表，§9.5.3）。
+fn register(exe: &str, root: &Path, project: &str) {
+    fs::create_dir_all(root.join(project)).expect("对端项目目录");
+    let out = Command::new(exe)
+        .args(["--root", &root.to_string_lossy(), "project", "add", project])
+        .output()
+        .expect("起不了 project add");
+    assert!(
+        out.status.success(),
+        "project add 失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// 把 `agent` 起成子进程并拼成一根管子。**测试要走的就是 `push` 走的那条构造**，
+/// 所以这里不自己拼 `Duplex` 的字段。
+fn agent_child(exe: &str, root: &Path, project: &str) -> m1::Duplex {
+    let child = Command::new(exe)
+        .args([
+            "--root",
+            &root.to_string_lossy(),
+            "agent",
+            "--project",
+            project,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // agent 的诊断走 stderr，继承进来：`--nocapture` 时看得见它到底说了什么
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("起不了 agent 子进程");
+    m1::Duplex::from_child(child).expect("管子两头都得在")
 }
 
 /// 一次成功的推送：对端 head 前移，块真的落在对端的 CAS 里，服务端的账与发起方对得上。
@@ -576,30 +615,8 @@ fn push_over_a_real_child_process_and_pipes() {
     assert!(sent >= 3, "3 个文件至少 3 个块：{sent}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
-    let b_root = b_tmp.path().to_str().expect("utf-8 路径").to_string();
-    let exe = env!("CARGO_BIN_EXE_twosync");
-
-    // 对端先注册项目：`agent` 的白名单就是注册表（没注册的项目直接 Abort，§9.5）
-    fs::create_dir_all(b_tmp.path().join(PROJECT)).expect("对端项目目录");
-    let reg = Command::new(exe)
-        .args(["--root", &b_root, "project", "add", PROJECT])
-        .output()
-        .expect("起不了 project add");
-    assert!(
-        reg.status.success(),
-        "project add 失败：{}",
-        String::from_utf8_lossy(&reg.stderr)
-    );
-
-    let child = Command::new(exe)
-        .args(["--root", &b_root, "agent", "--project", PROJECT])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // agent 的诊断走 stderr，继承到测试输出里：`--nocapture` 时能看见它到底说了什么
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("起不了 agent 子进程");
-    let mut io = m1::Duplex::from_child(child).expect("管子两头都得在");
+    register(EXE, b_tmp.path(), PROJECT);
+    let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
 
     let rep = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
         .expect("真管道上的一次 push 该成功");
@@ -664,25 +681,17 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
     assert_eq!(blocks.len(), 3, "3 个文件各 1 块：{blocks:?}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
-    let b_root = b_tmp
-        .path()
-        .to_str()
-        .expect("utf-8 路径")
-        .to_string();
-    let exe = env!("CARGO_BIN_EXE_twosync");
-    fs::create_dir_all(b_tmp.path().join(PROJECT)).expect("对端项目目录");
-    let reg = Command::new(exe)
-        .args(["--root", &b_root, "project", "add", PROJECT])
-        .output()
-        .expect("起不了 project add");
-    assert!(
-        reg.status.success(),
-        "project add 失败：{}",
-        String::from_utf8_lossy(&reg.stderr)
-    );
-
-    let mut child = Command::new(exe)
-        .args(["--root", &b_root, "agent", "--project", PROJECT])
+    register(EXE, b_tmp.path(), PROJECT);
+    // 这一条**不能用 `agent_child`**：它要自己捏着子进程的 stdin/stdout 手工驱动协议，
+    // 好在"只写完两块"的那一刻把进程杀掉。
+    let mut child = Command::new(EXE)
+        .args([
+            "--root",
+            &b_tmp.path().to_string_lossy(),
+            "agent",
+            "--project",
+            PROJECT,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -768,14 +777,7 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
     drop(b_db);
 
     // 恢复：下一次**完整**会话必须把它追平，半成品不许把站点锁死。
-    let child = Command::new(exe)
-        .args(["--root", &b_root, "agent", "--project", PROJECT])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("重起 agent");
-    let mut io = m1::Duplex::from_child(child).expect("管子两头都得在");
+    let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
     let rep =
         session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT)).expect("崩溃之后的一次完整 push");
     io.finish().expect("agent 该正常收尾");
@@ -804,4 +806,80 @@ fn expect_frame(got: TsResult<Proto>, ok: impl Fn(&Proto) -> bool, want: &str) {
     }
 }
 
+/// §9.5.1 TOFU 的三半：**首连入表**、**同一站点再连不报首连**、**换个站点冒充同一个名字就拒**。
+/// 最后那一半要核的不只是"报错了"，还有"拒在建身份之前 ⇒ 对面一个字都没收到"。
+#[test]
+fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
+    let a = Site::open();
+    let files = seed(2);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
 
+    let b1 = tempfile::tempdir().expect("对端站点一");
+    register(EXE, b1.path(), PROJECT);
+    let o = PushOpts {
+        peer_name: b"peer-b",
+        ..opts(PROJECT)
+    };
+
+    // ① 首连：成功，并报"这是第一次见"
+    let mut io = agent_child(EXE, b1.path(), PROJECT);
+    let rep = session::push(&mut io, &*a.db, &a.cas(), &o).expect("首连该成功");
+    assert!(rep.first_contact, "首连必须报「第一次见」");
+    io.finish().expect("agent 收尾");
+    let rows = session::read_peers(&*a.db).expect("读 TOFU 表");
+    assert_eq!(rows.len(), 1, "表里该只有一条：{rows:?}");
+    assert_eq!(rows[0].0, "peer-b");
+    assert_eq!(
+        rows[0].1.site_id,
+        site_id(b1.path()).expect("b1 的身份"),
+        "记的就是对方站点自己的身份，不是它自报的字符串"
+    );
+
+    // ② 同一站点第二次连：身份一致 ⇒ 不再报首连
+    let mut io = agent_child(EXE, b1.path(), PROJECT);
+    let rep = session::push(&mut io, &*a.db, &a.cas(), &o).expect("第二次也该成功");
+    assert!(!rep.first_contact, "同一站点不该再报首连");
+    assert_eq!(rep.blocks_sent, 0, "没有新东西 ⇒ 一个块都不发");
+    io.finish().expect("agent 收尾");
+
+    // ③ **换个站点、同一个对端名字** ⇒ 拒。这就是 TOFU 与"信任一切"的差别。
+    let b2 = tempfile::tempdir().expect("对端站点二");
+    register(EXE, b2.path(), PROJECT);
+    let mut io = agent_child(EXE, b2.path(), PROJECT);
+    let err = session::push(&mut io, &*a.db, &a.cas(), &o)
+        .expect_err("名字相同、站点不同 ⇒ 必须拒，不是提示");
+    assert!(err.to_string().contains("身份变了"), "报错要说清是身份变了：{err}");
+    io.finish().expect("拒了也要把子进程收干净");
+
+    // 拒的那一侧一个字都没落：会话在 `BeginSession` 之前就断了
+    let b2_db = open_store(b2.path(), EngineKind::LsmTree).expect("开 b2");
+    assert!(
+        build::ref_heads(&*b2_db, keys::project_id(PROJECT), MAIN)
+            .expect("读 head")
+            .is_empty(),
+        "对端不该有任何 head：项目名字都还没说出口"
+    );
+    assert_eq!(
+        count_blocks(&objects_dir(b2.path())),
+        0,
+        "一个块都不许落进冒牌站点"
+    );
+    drop(b2_db);
+    let rows = session::read_peers(&*a.db).expect("再读表");
+    assert_eq!(
+        rows[0].1.site_id,
+        site_id(b1.path()).expect("b1"),
+        "表不能被冒牌货覆盖：记的必须还是原来那个站点"
+    );
+
+    // ④ 对端确实重装过的正解：忘掉，然后重新确认（不是把历史当坏了）
+    assert!(session::forget_peer(&*a.db, b"peer-b").expect("forget"));
+    let mut io = agent_child(EXE, b2.path(), PROJECT);
+    let rep = session::push(&mut io, &*a.db, &a.cas(), &o).expect("forget 之后该重新接受");
+    assert!(rep.first_contact, "重新确认就该再报一次首连");
+    io.finish().expect("agent 收尾");
+}

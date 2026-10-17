@@ -234,7 +234,17 @@ pub enum Cmd {
         auto_slice: Option<u64>,
     },
 
-    // ── M1 剩下的 ── peer add|list|trust / 块级 gc
+    /// 对端身份表（§9.5.1 的 TOFU）：`list` 看库里记了谁，`forget` 忘掉一条以便重新确认
+    ///
+    /// **没有 `add`**：手工 add 要求人先知道对方的站点身份，而那个身份只能从"第一次连上它"看到
+    /// ⇒ 正确的形态是首连自动入表（`push` 里做），`add` 没有独立价值。里程碑那行原来写的三条，
+    /// 兑现成两条 + 一条如实的"为什么要少一条"。
+    Peer {
+        #[command(subcommand)]
+        cmd: PeerCmd,
+    },
+
+    // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync
     // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
@@ -263,6 +273,15 @@ impl Import {
             (self.max_mbps * 1048576.0) as u64
         }
     }
+}
+
+/// §9.5.1 的 TOFU 表操作。
+#[derive(Subcommand, Clone)]
+pub enum PeerCmd {
+    /// 列出已知对端：名字、它的站点身份、第一次确认的时间
+    List,
+    /// 忘掉一个对端：下一次连接会重新确认它（对端重装过就走这条，不是把历史当坏了）
+    Forget { name: String },
 }
 
 #[derive(Subcommand, Clone)]

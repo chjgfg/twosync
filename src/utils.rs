@@ -59,6 +59,38 @@ pub fn projects_file(root: &Path) -> PathBuf {
     site_dir(root).join("projects.toml")
 }
 
+/// 本站点的身份（§9.5.1 的 TOFU 表绑的就是它）。第一次用到时生成并落盘。
+///
+/// **这不是密钥，也不打算当密钥用**：v1 不给 commit 签名（§9.5.2），所以"对端自报的身份"本身
+/// 不值钱。它回答的问题是另一个、而且是很值钱的一个：**我现在拨到的这台机器，是不是我当初确认过的
+/// 那一个站点**。SSH 的 host key 只保证"这台主机还是那台主机"，保证不了"那台主机上跑的还是那个站点"
+/// ——跳板机、换目录、重装、两台机器共用一个 hostname 都会变。
+///
+/// 生成源取"时间 + 进程 id + 站点根路径"折成 16 字节。要的是**唯一**，不是抗伪造：抗伪造归 SSH。
+pub fn site_id(root: &Path) -> Result<Vec<u8>> {
+    let p = site_dir(root).join("site-id");
+    if let Ok(b) = fs::read(&p)
+        && b.len() == 16
+    {
+        return Ok(b);
+    }
+    let mut h = blake3::Hasher::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    h.update(&now.as_nanos().to_le_bytes());
+    h.update(&std::process::id().to_le_bytes());
+    h.update(root.to_string_lossy().as_bytes());
+    let id = h.finalize().as_bytes()[..16].to_vec();
+    // 落盘走 tmp → rename：半截的 id 文件会让下一次读到错误长度，然后**再生成一个不同的 id**，
+    // 而对端表里记的是旧的——那正好伪造出一次"身份变了"。
+    fs::create_dir_all(site_dir(root))?;
+    let tmp = p.with_extension("tmp");
+    fs::write(&tmp, &id)?;
+    fs::rename(&tmp, &p)?;
+    Ok(id)
+}
+
 /// 打开存储基座（FR-3），并在返回前过一遍 FR-21 自检。
 ///
 /// **所有要读写元数据的命令都从这里拿句柄**：自己拼 `StorageConfig` 就会绕过自检闸，

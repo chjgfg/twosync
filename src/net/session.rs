@@ -36,6 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 
+use serde::{Deserialize, Serialize};
 use storage_engines::KvEngine;
 
 use crate::error::{Error, Result};
@@ -52,8 +53,11 @@ impl<T: Read + Write> Io for T {}
 /// 发起一次 push 的坐标。
 pub struct PushOpts<'a> {
     pub project: &'a str,
-    /// 本端身份（TOFU 指纹表的键）。**不签名**（§9.5.2）。
+    /// 本端身份（写进 `Hello`）。**这是站点身份，不是密钥**，见 [`crate::utils::site_id`]。
     pub peer_id: &'a [u8],
+    /// 拨的那个对端的名字（`ssh` 的目标）。它就是 TOFU 表 `P` 行的键；**空 = 不做 TOFU**
+    /// （单测里点对点跑协议时要的正是这个口子）。
+    pub peer_name: &'a [u8],
     /// 本端能力位；两边按位与之后生效。
     pub caps: u32,
     /// §9.4.5 的会话配额：**发起方自己按自己的清单算**，不等对端报。
@@ -67,6 +71,7 @@ impl Default for PushOpts<'_> {
         Self {
             project: "",
             peer_id: b"",
+            peer_name: b"",
             caps: frame::caps::FIXED_CHUNK | frame::caps::SPARSE | frame::caps::XATTR_MODE,
             max_block_bytes: u64::MAX,
             allow_mass_delete: false,
@@ -89,6 +94,100 @@ pub struct Report {
     pub accepted: Vec<Hash>,
     /// 两边交集后的能力位。
     pub caps: u32,
+    /// `true` = 这个对端是**第一次**见到，身份刚刚入表（§9.5.1 的告警归命令层打）。
+    pub first_contact: bool,
+}
+
+// ── TOFU 表（§9.5.1，`P` 前缀）────────────────────────────────────────────
+//
+// 表放在**引擎里**而不是 `peers.json`：一份数据两处存就要同步，而同步是漂移的产地（§15.15 那条
+// 同源教训）。要看就 `peer list` 从库里读。`P` 行没有 project 前缀（它是站点级的，§9.2）。
+
+/// 一条对端记录。**只有"它自报的站点身份 + 第一次见到的时间"**：没有密钥、没有签名（§9.5.2）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Peer {
+    pub site_id: Vec<u8>,
+    /// epoch **纳秒**（与 `Commit::ts` 同一个单位，`history::fmt_ts` 直接能打印）。
+    pub first_seen: i64,
+}
+
+/// 全部已知对端 `(名字, 记录)`，按名字排序。
+pub fn read_peers(db: &dyn KvEngine) -> Result<Vec<(String, Peer)>> {
+    let prefix = [keys::TAG_PEER];
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        // 键 = `P|名字`，所以名字就是标签之后那一段（它可以含任意字节，显示时按 lossy 处理）。
+        let Some(name) = r.key.get(1..) else { continue };
+        let Some(raw) = r.value else { continue };
+        let body = keys::strip(&raw)?;
+        let p: Peer = postcard::from_bytes(body)
+            .map_err(|e| Error::Codec(format!("Peer 解码失败：{e}")))?;
+        out.push((String::from_utf8_lossy(name).into_owned(), p));
+    }
+    // 只按名字排：`Peer` 没有序（它是个记录，不是个可比较的量），而"表按对端名排序"才是人想要的。
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// 忘掉一个对端（下次连接重新 TOFU）。返回是否真有这一条。
+pub fn forget_peer(db: &dyn KvEngine, name: &[u8]) -> Result<bool> {
+    let key = keys::peer_key(name);
+    let tx = db.begin();
+    let existed = tx.get(&key).is_some();
+    if existed {
+        tx.delete(&key);
+    }
+    tx.commit();
+    Ok(existed)
+}
+
+/// 核身份：没见过就记下并返回 `true`（首连），见过且一致返回 `false`，不一致**报错**。
+fn check_or_record_peer(db: &dyn KvEngine, name: &[u8], their_site: &[u8]) -> Result<bool> {
+    let key = keys::peer_key(name);
+    let tx = db.begin();
+    let recorded = match tx.get(&key) {
+        Some(raw) => Some(
+            postcard::from_bytes::<Peer>(keys::strip(&raw)?)
+                .map_err(|e| Error::Codec(format!("Peer 解码失败：{e}")))?,
+        ),
+        None => None,
+    };
+    tx.commit();
+    if let Some(p) = &recorded {
+        if p.site_id != their_site {
+            return Err(Error::PeerIdentityChanged {
+                peer: String::from_utf8_lossy(name).into_owned(),
+                want: hex(&p.site_id),
+                got: hex(their_site),
+            });
+        }
+        return Ok(false);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
+    let body = postcard::to_allocvec(&Peer { site_id: their_site.to_vec(), first_seen: now })
+        .map_err(|e| Error::Codec(format!("Peer 编码失败：{e}")))?;
+    let tx = db.begin();
+    if !tx.set(&key, keys::wrap(body)) {
+        return Err(Error::WriteConflict(hex(name)));
+    }
+    tx.commit();
+    Ok(true)
+}
+
+/// 身份是字节，报错与打印都要看得见：小写 hex，不打印不可见字符。
+pub fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{x:02x}");
+    }
+    s
 }
 
 /// 服务端一场的账（`agent` 打印 + NFR-10 溯源）。
@@ -120,9 +219,9 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
         },
     )?;
     let theirs = match frame::decode(io)? {
-        Proto::Hello { proto_ver, caps, .. } => Ok((proto_ver, caps)),
-        other => Err(unexpected(&other, "Hello")),
-    }?;
+        Proto::Hello { proto_ver, caps, peer_id } => (proto_ver, caps, peer_id),
+        other => return Err(unexpected(&other, "Hello")),
+    };
     if theirs.0 != PROTO_VER {
         return Err(Error::BadInput(format!(
             "对端协议版本 {} ≠ 本端 {PROTO_VER}：先对齐版本再同步",
@@ -130,6 +229,13 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
         )));
     }
     rep.caps = opts.caps & theirs.1;
+
+    // ①' §9.5.1 TOFU：**在说出任何一个项目名字之前**先核对对端身份。
+    // 首连 = 入表并告警；不符 = 一字节都不发就停。顺序是这条的全部价值——晚一步就已经把
+    // 项目名、head 集合与历史深度泄露给了一个不是对方的机器。
+    if !opts.peer_name.is_empty() {
+        rep.first_contact = check_or_record_peer(db, opts.peer_name, &theirs.2)?;
+    }
 
     // ② 开场：带上本地 head 集合，换回对方的。
     let my_heads = build::ref_heads(db, pid, build::MAIN)?;
