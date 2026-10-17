@@ -15,15 +15,20 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use storage_engines::EngineKind;
-use twosync::error::Error;
+use twosync::cli::m1;
+use twosync::error::{Error, Result as TsResult};
+use twosync::net::frame::{self, Proto, PROTO_VER};
 use twosync::net::session::{self, PushOpts, Report, ServeReport};
 use twosync::store::build::{self, MAIN, Meta};
 use twosync::store::cas::{self, Cas};
+use twosync::store::history;
 use twosync::store::keys;
+use twosync::store::object;
 use twosync::store::worktree;
 use twosync::utils::{objects_dir, open_store};
 
@@ -165,21 +170,28 @@ impl Site {
     }
 
     fn block_count(&self) -> usize {
-        let dir = objects_dir(self.tmp.path());
-        let mut n = 0;
-        let mut stack = vec![dir];
-        while let Some(d) = stack.pop() {
-            let Ok(rd) = fs::read_dir(&d) else { continue };
-            for e in rd.flatten() {
-                if e.path().is_dir() {
-                    stack.push(e.path());
-                } else if !e.file_name().to_string_lossy().starts_with(".tmp.") {
-                    n += 1;
-                }
+        count_blocks(&objects_dir(self.tmp.path()))
+    }
+}
+
+/// 数 CAS 里真实落了几个块文件（跳过 `.tmp.` 那些写一半的）。
+///
+/// 自由函数而不是 `Site` 的方法：对端在子进程跑完之前**不能**开着同一个 LSM（§9.6 的锁语义），
+/// 所以那一份账只能在子进程退出之后、用裸目录去数。
+fn count_blocks(dir: &Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                stack.push(e.path());
+            } else if !e.file_name().to_string_lossy().starts_with(".tmp.") {
+                n += 1;
             }
         }
-        n
     }
+    n
 }
 
 // ── 用例 ───────────────────────────────────────────────────────────────────
@@ -539,3 +551,257 @@ fn maximal_heads_covers_fast_forward_and_divergence() {
     let order = session::topo_pending(&*a.db, a.pid, &all, &Default::default());
     assert_eq!(order, vec![h1, h2], "h1 必须在 h2 之前：{order:?}");
 }
+
+/// 真子进程 + 真 OS 管道跑完整一场 `push → agent`。
+///
+/// 为什么单独一条：`cli::m1` 那两层（拼远端命令、`Duplex`、`finish()` 等退出码）在内存管道用例里
+/// **一行都没执行过**；而内存管道是**无界**的 ⇒ "大帧会不会把写端堵死"这件事只有真管道测得出来
+/// （本机已经栽过两次：20 000 行 stdout 把采样器堵死过一次，见 §17 补记十四）。
+///
+/// 对端只用命令行（`project add` + `agent`），而**验证在子进程退出之后才开句柄**：同一份 LSM 目录
+/// 两个进程同时开着是不行的（§9.6），所以这里刻意把两侧的时段错开。
+#[test]
+fn push_over_a_real_child_process_and_pipes() {
+    let a = Site::open();
+    let files = seed(3);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    let head = a.commit(&refs, 1).commit.expect("用例首轮必有提交");
+    let tree = object::read_commit(&*a.db, a.pid, &head)
+        .expect("读本端的 commit")
+        .tree;
+    let sent = a.block_count();
+    assert!(sent >= 3, "3 个文件至少 3 个块：{sent}");
+
+    let b_tmp = tempfile::tempdir().expect("对端站点");
+    let b_root = b_tmp.path().to_str().expect("utf-8 路径").to_string();
+    let exe = env!("CARGO_BIN_EXE_twosync");
+
+    // 对端先注册项目：`agent` 的白名单就是注册表（没注册的项目直接 Abort，§9.5）
+    fs::create_dir_all(b_tmp.path().join(PROJECT)).expect("对端项目目录");
+    let reg = Command::new(exe)
+        .args(["--root", &b_root, "project", "add", PROJECT])
+        .output()
+        .expect("起不了 project add");
+    assert!(
+        reg.status.success(),
+        "project add 失败：{}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    let child = Command::new(exe)
+        .args(["--root", &b_root, "agent", "--project", PROJECT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // agent 的诊断走 stderr，继承到测试输出里：`--nocapture` 时能看见它到底说了什么
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("起不了 agent 子进程");
+    let mut io = m1::Duplex::from_child(child).expect("管子两头都得在");
+
+    let rep = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
+        .expect("真管道上的一次 push 该成功");
+    io.finish().expect("关掉 stdin 之后 agent 该读到尾、退出码 0");
+
+    assert_eq!(rep.blocks_sent, sent, "对端是空站 ⇒ 块全上线");
+    assert_eq!(rep.accepted, vec![head], "发起方拿到的 head 就是推过去的那个");
+
+    // 子进程已经退出 ⇒ 现在才允许自己开对端那份库
+    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("开对端的库");
+    let pid = keys::project_id(PROJECT);
+    assert_eq!(
+        build::ref_heads(&*b_db, pid, MAIN).expect("对端 head"),
+        vec![head],
+        "对端的 H/main 真的前移了"
+    );
+    assert_eq!(
+        count_blocks(&objects_dir(b_tmp.path())),
+        sent,
+        "块必须真的落在对端的 CAS 里，不只是发出去了"
+    );
+    assert_eq!(
+        object::read_commit(&*b_db, pid, &head)
+            .expect("读回对端的 commit")
+            .tree,
+        tree,
+        "同一份历史：两边的根 tree 必须一字不差"
+    );
+}
+
+/// §10.2 的第一刀：**对端在会话中途被杀**。FR-13 的承诺是"动 head 是最后一步"，所以半路死的对端
+/// 必须留下三样东西：head 不动、清单不进库、落下的块只是孤块（等块级 GC，那一半还没做）。
+/// 更要紧的是**下一次完整 push 能追平**——半成品不许把站点锁死。
+///
+/// 这一条**手工驱动协议**而不用 `session::push`：要的就是"只发两个段然后杀掉"这个精确时刻，
+/// 而 `push` 一旦开始就不会在中途被我们掐住（掐住的地方也就不是"对端死了"而是"我这边出事了"）。
+#[test]
+fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
+    let a = Site::open();
+    let files = seed(3);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    let head = a.commit(&refs, 1).commit.expect("用例首轮必有提交");
+    let tree = object::read_commit(&*a.db, a.pid, &head)
+        .expect("读 commit")
+        .tree;
+
+    // 凑齐要发的块：走一遍树拿 blob hash，再从清单里取 (hash, size)。
+    let mut blocks: Vec<(keys::Hash, u32)> = Vec::new();
+    history::walk_tree(&*a.db, a.pid, &tree, &mut |_path, e| {
+        if e.kind == keys::Kind::File {
+            let b = build::read_blob(&*a.db, a.pid, &e.hash).expect("读 blob");
+            for blk in &b.blocks {
+                blocks.push((blk.hash, blk.size));
+            }
+        }
+        Ok(())
+    })
+    .expect("walk 树");
+    assert_eq!(blocks.len(), 3, "3 个文件各 1 块：{blocks:?}");
+
+    let b_tmp = tempfile::tempdir().expect("对端站点");
+    let b_root = b_tmp
+        .path()
+        .to_str()
+        .expect("utf-8 路径")
+        .to_string();
+    let exe = env!("CARGO_BIN_EXE_twosync");
+    fs::create_dir_all(b_tmp.path().join(PROJECT)).expect("对端项目目录");
+    let reg = Command::new(exe)
+        .args(["--root", &b_root, "project", "add", PROJECT])
+        .output()
+        .expect("起不了 project add");
+    assert!(
+        reg.status.success(),
+        "project add 失败：{}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    let mut child = Command::new(exe)
+        .args(["--root", &b_root, "agent", "--project", PROJECT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("起不了 agent 子进程");
+    let mut w = child.stdin.take().expect("piped stdin");
+    let mut r = child.stdout.take().expect("piped stdout");
+
+    frame::encode(
+        &mut w,
+        &Proto::Hello {
+            proto_ver: PROTO_VER,
+            peer_id: b"crash-test".to_vec(),
+            caps: u32::MAX,
+        },
+    )
+    .expect("发 Hello");
+    expect_frame(frame::decode(&mut r), |p| matches!(p, Proto::Hello { .. }), "Hello");
+
+    frame::encode(
+        &mut w,
+        &Proto::BeginSession {
+            project: PROJECT.to_string(),
+            pid: a.pid,
+            my_heads: vec![head],
+        },
+    )
+    .expect("发 BeginSession");
+    expect_frame(
+        frame::decode(&mut r),
+        |p| matches!(p, Proto::HeadsState { .. }),
+        "HeadsState",
+    );
+
+    frame::encode(
+        &mut w,
+        &Proto::WantHave {
+            want: blocks.iter().map(|(h, _)| *h).collect(),
+        },
+    )
+    .expect("发 WantHave");
+    frame::encode(&mut w, &Proto::HaveDone).expect("发 HaveDone");
+    let mut missing: Vec<keys::Hash> = Vec::new();
+    loop {
+        let p = frame::decode(&mut r).expect("读 MissingBlocks");
+        match p {
+            Proto::MissingBlocks { hashes } => missing.extend(hashes),
+            Proto::MissingDone => break,
+            other => panic!("该收 MissingBlocks/MissingDone，收到 {other:?}"),
+        }
+    }
+    assert_eq!(missing.len(), 3, "空站当对端 ⇒ 三块全缺");
+
+    // announce 三块，只**写完两块**就掐断 ⇒ 第三块与全部清单都还没到。
+    let bytes: u64 = blocks.iter().map(|(_, s)| *s as u64).sum();
+    frame::encode(&mut w, &Proto::PushBlocks { count: 3, bytes }).expect("发 PushBlocks");
+    for (h, size) in &blocks[..2] {
+        let body = a.cas().read_block(h, *size).expect("读本端块");
+        frame::write_segment(&mut w, h, &body).expect("发块段");
+    }
+    w.flush().expect("flush");
+    child.kill().expect("杀掉对端");
+    let _ = child.wait();
+    drop(w);
+    drop(r);
+
+    let pid = keys::project_id(PROJECT);
+    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("对端的库必须还开得起来");
+    assert!(
+        build::ref_heads(&*b_db, pid, MAIN)
+            .expect("读 head")
+            .is_empty(),
+        "半路死的会话不许动 head"
+    );
+    assert!(
+        object::read_commit(&*b_db, pid, &head).is_err(),
+        "commit 对象压根没发过去 ⇒ 库里不该有它"
+    );
+    assert!(
+        count_blocks(&objects_dir(b_tmp.path())) <= 2,
+        "最多落下已经发过去的那两块，不许有更多"
+    );
+    drop(b_db);
+
+    // 恢复：下一次**完整**会话必须把它追平，半成品不许把站点锁死。
+    let child = Command::new(exe)
+        .args(["--root", &b_root, "agent", "--project", PROJECT])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("重起 agent");
+    let mut io = m1::Duplex::from_child(child).expect("管子两头都得在");
+    let rep =
+        session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT)).expect("崩溃之后的一次完整 push");
+    io.finish().expect("agent 该正常收尾");
+    assert!(rep.bytes_sent > 0, "第三块得补发出去");
+
+    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("再开一次对端的库");
+    assert_eq!(
+        build::ref_heads(&*b_db, pid, MAIN).expect("读 head"),
+        vec![head],
+        "追平之后 head 到位"
+    );
+    assert_eq!(
+        object::read_commit(&*b_db, pid, &head)
+            .expect("读回 commit")
+            .tree,
+        tree,
+        "追平之后的根 tree 与本端一致"
+    );
+}
+
+/// 把"这一帧必须是某一种"这件事写成一处：手工驱动协议的用例里，读错帧的报错要能看出**在等谁**。
+fn expect_frame(got: TsResult<Proto>, ok: impl Fn(&Proto) -> bool, want: &str) {
+    let p = got.unwrap_or_else(|e| panic!("该收到 {want}，读帧就失败了：{e}"));
+    if !ok(&p) {
+        panic!("该收到 {want}，收到 {p:?}");
+    }
+}
+
+

@@ -418,16 +418,19 @@ pub fn serve(
         Proto::VerifyCommit { hash } => hash,
         other => return Err(unexpected(&other, "VerifyCommit")),
     };
-    match accept(
+    let verdict = accept(
         db,
-        pid,
         cas,
-        &our_heads,
-        &their_heads,
-        &known,
-        &newest,
-        allow_mass_delete,
-    ) {
+        &Accept {
+            pid,
+            our_heads: &our_heads,
+            their_heads: &their_heads,
+            known: &known,
+            newest: &newest,
+            allow_mass_delete,
+        },
+    );
+    match verdict {
         Ok((to_heads, why)) => {
             rep.accepted = true;
             rep.reason = why;
@@ -460,19 +463,16 @@ pub fn serve(
 
 /// 接一个 commit：先确认它**闭得上**（对象齐、块在盘上），再对**新出现的**每个 commit 过
 /// FR-10 熔断，最后才动 head。顺序错了就会出现"head 指向一个取不回来的版本"。
-fn accept(
-    db: &dyn KvEngine,
-    pid: ProjectId,
-    cas: &Cas,
-    our_heads: &[Hash],
-    their_heads: &[Hash],
-    known: &BTreeSet<Hash>,
-    newest: &Hash,
-    allow: bool,
-) -> Result<(Vec<Hash>, String)> {
+///
+/// 坐标收成 [`Accept`] 不只是躲 `too_many_arguments`：这几样必须**来自同一场会话**——`known` 是本场
+/// "收之前本端可达集"，`their_heads` 是对端本场报的头。拆成一排参数就会出现"拿上一场的 known 判这一场"，
+/// 而那种错的表象是一次本该拦住的熔断放行了。
+fn accept(db: &dyn KvEngine, cas: &Cas, a: &Accept<'_>) -> Result<(Vec<Hash>, String)> {
+    let pid = a.pid;
+    let allow = a.allow_mass_delete;
     let incoming: Vec<Hash> = {
-        let now = reachable(db, pid, &[*newest], &[]);
-        let mut v: Vec<Hash> = now.difference(known).cloned().collect();
+        let now = reachable(db, pid, &[*a.newest], &[]);
+        let mut v: Vec<Hash> = now.difference(a.known).cloned().collect();
         v.sort();
         v
     };
@@ -499,12 +499,22 @@ fn accept(
             why = format!("接受 {}：{} 个对象闭合（首个提交）", keys::short(h), closed);
         }
     }
-    let mut cand: Vec<Hash> = our_heads.to_vec();
-    cand.extend_from_slice(their_heads);
-    cand.push(*newest);
+    let mut cand: Vec<Hash> = a.our_heads.to_vec();
+    cand.extend_from_slice(a.their_heads);
+    cand.push(*a.newest);
     let heads = maximal_heads(db, pid, &cand);
     build::set_ref(db, pid, build::MAIN, &heads)?;
     Ok((heads, why))
+}
+
+/// [`accept`] 的坐标，见那里的注释：**同一场会话**的四样东西。
+struct Accept<'a> {
+    pid: ProjectId,
+    our_heads: &'a [Hash],
+    their_heads: &'a [Hash],
+    known: &'a BTreeSet<Hash>,
+    newest: &'a Hash,
+    allow_mass_delete: bool,
 }
 
 /// 一棵树的闭包能不能取回来：每层清单读得到、每个 File/Symlink 有 `B` 清单、

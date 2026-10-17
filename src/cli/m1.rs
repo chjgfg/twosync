@@ -68,8 +68,30 @@ impl Write for Duplex {
 }
 
 impl Duplex {
+    /// 把一个"stdin/stdout 都是管道"的子进程拼成一根管子。
+    ///
+    /// 单独成一个构造函数不是为了好看：集成测试要用**同一个**构造去起 `twosync agent`，
+    /// 因为真 OS 管道有缓冲上限（内存管道没有），"8 MiB 的帧会不会把写端堵死"只有走这条路
+    /// 才暴露得出来。测试与生产共用一份，才不会测的是一根永远不会堵的管子。
+    pub fn from_child(mut child: Child) -> Result<Duplex> {
+        let out = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::BadInput("子进程没有 stdout：piped() 没开".to_string()))?;
+        let inp = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::BadInput("子进程没有 stdin：piped() 没开".to_string()))?;
+        Ok(Duplex {
+            r: Box::new(out),
+            w: Box::new(inp),
+            child: Some(child),
+        })
+    }
+
     /// 关掉写端并等子进程退出。`push` 用完必须调：不关 stdin，远端 `agent` 会一直等在管子上。
-    fn finish(mut self) -> Result<()> {
+    /// 公开的原因与 [`Duplex::from_child`] 同一条：测试要走完同一条收尾，不能只测半截。
+    pub fn finish(mut self) -> Result<()> {
         drop(self.w);
         match self.child.as_mut() {
             Some(c) => {
@@ -114,7 +136,7 @@ pub fn push(
     let remote_root = remote_root.unwrap_or(".");
     // 远端命令整体交给对端的 shell 解析，所以路径自己带引号。
     let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .arg(peer)
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
@@ -126,11 +148,7 @@ pub fn push(
                  对端要能免密登录，且那边装了 twosync（或换个能用的 ssh 客户端）"
             ))
         })?;
-    let mut io = Duplex {
-        r: Box::new(child.stdout.take().expect("piped stdout")),
-        w: Box::new(child.stdin.take().expect("piped stdin")),
-        child: Some(child),
-    };
+    let mut io = Duplex::from_child(child)?;
 
     let opts = PushOpts {
         project: &name,
@@ -161,7 +179,7 @@ pub fn push(
         "head(对端)  = {}",
         rep.accepted
             .iter()
-            .map(|h| keys::short(h))
+            .map(keys::short)
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -209,7 +227,7 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
                     if rep.accepted { "接受" } else { "拒绝" },
                     rep.heads_after
                         .iter()
-                        .map(|h| keys::short(h))
+                        .map(keys::short)
                         .collect::<Vec<_>>()
                         .join(",")
                 );
