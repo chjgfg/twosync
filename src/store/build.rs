@@ -31,7 +31,7 @@
 //! 所以"新 blob 才加引用、老 blob 不重复加"这条判断（`is_new_blob`）不能省，也不能推迟到
 //! GC 那轮再补——GC 看不到"本该 +1 却没 +1"的差额。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::format;
 use std::path::Path;
 
@@ -94,6 +94,17 @@ pub struct ChangeSet {
     pub add: u32,
     pub modify: u32,
     pub delete: u32,
+    /// 改名（FR-1）。配对成功后 `add`/`delete` 各自**已经减掉**，不会重复计数。
+    pub rename: u32,
+    /// 改名样本 `(旧路径, 新路径)`，上限 `SAMPLE_MAX`；全量看 `rename` 计数。
+    pub renames: Vec<(String, String)>,
+    /// 样本之外还有多少对没列出来。
+    pub rename_more: usize,
+    /// 配对窗口收下的两侧条目（带 hash 与字节数）。**有上限**，见 [`RENAME_PAIR_MAX`]。
+    pub(crate) pair_adds: Vec<(Hash, String, u64)>,
+    pub(crate) pair_dels: Vec<(Hash, String, u64)>,
+    /// 变更多到放弃配对。改名是账面与传输优化，不是正确性依赖 ⇒ 宁可放弃也不吃内存。
+    pub rename_gave_up: bool,
     /// 被删条目的 blob hash。§7.3 铁律要它：工作树删除落地前必须确认这些块还在库里。
     pub deleted_blobs: Vec<Hash>,
     pub bytes: u64,
@@ -107,8 +118,10 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
+    /// "有没有改动"必须把改名算进去：一次纯 `mv` 折叠之后 `add`/`delete` 都归零，
+    /// 如果这里漏了 `rename`，`build` 就会把它当"无改动"拒掉 ⇒ 改名永远进不了历史。
     pub fn is_empty(&self) -> bool {
-        self.add + self.modify + self.delete == 0
+        self.add + self.modify + self.delete + self.rename == 0
     }
 
     /// 记一条变更：计数永远记全，路径只留前 `SAMPLE_MAX` 条。
@@ -133,7 +146,82 @@ impl ChangeSet {
             self.sample_more += 1;
         }
     }
+
+    /// 遍历期间攒一份"能配出改名"的最小信息：`(hash, 路径, 字节)`。
+    ///
+    /// 三种 kind 都收（目录也收：目录的 hash 是子树 tree hash，**整棵子树原样搬走时两侧
+    /// hash 相同** ⇒ 一次 `mv 目录` 会配出"目录 + 它全部后代"的改名，与今天的 add/delete
+    /// 计数口径一致）。超过上限就不再收，只把"放弃了"记下来。
+    pub(crate) fn note_pairable(&mut self, what: ChangeKind, hash: &Hash, path: &str, size: u64) {
+        let cap = self.pair_adds.len().max(self.pair_dels.len()) >= RENAME_PAIR_MAX;
+        if cap {
+            self.rename_gave_up = true;
+            return;
+        }
+        match what {
+            ChangeKind::Add => self.pair_adds.push((*hash, path.to_string(), size)),
+            ChangeKind::Delete => self.pair_dels.push((*hash, path.to_string(), size)),
+            ChangeKind::Modify => {}
+        }
+    }
+
+    /// **FR-1 的改名折叠**：同一份内容（同 hash）在一处消失、另一处出现 ⇒ 记一次改名，
+    /// 而不是"一删一增"。必须在 FR-10 熔断**之前**调用：一次大规模 `mv` 折叠之后
+    /// `delete` 归零，才不会被熔断误判成"删了一半仓库"。
+    ///
+    /// 判据只有一条：hash 相等。这是 FR-1 明写的"由 `mv` 子命令**或同 blob_hash 匹配**得出"，
+    /// 不是事后猜：内容寻址保证两侧字节完全相同，改名只是路径变了。
+    /// 已知含糊之处：两份**内容相同**的东西（例如两个空目录，tree hash 都是 `empty_tree()`）
+    /// 会被配成一对改名。这不影响正确性（历史与树都一样），只影响账面。
+    pub fn fold_renames(&mut self) {
+        if self.pair_adds.is_empty() || self.pair_dels.is_empty() {
+            self.pair_adds.clear();
+            self.pair_dels.clear();
+            return;
+        }
+        let mut pool: HashMap<Hash, VecDeque<usize>> = HashMap::new();
+        for (i, (h, _, _)) in self.pair_dels.iter().enumerate() {
+            pool.entry(*h).or_default().push_back(i);
+        }
+        // 两侧都是遍历途中按同一条流收的 ⇒ 同一份输入必得同一份配对（§10.4 的差分表要能复现）。
+        let mut paired: Vec<usize> = Vec::new();
+        for (h, new, size) in self.pair_adds.iter() {
+            let Some(idxs) = pool.get_mut(h) else {
+                continue;
+            };
+            let Some(di) = idxs.pop_front() else { continue };
+            let (old, old_size) = (self.pair_dels[di].1.clone(), self.pair_dels[di].2);
+            self.add = self.add.saturating_sub(1);
+            self.delete = self.delete.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub(*size);
+            self.deleted_bytes = self.deleted_bytes.saturating_sub(old_size);
+            self.rename += 1;
+            // 内容还在新树里 ⇒ 它**不是**被删的 blob。留着会让 §7.3 那类"删除前确认块还在"
+            // 的账多算一份，FR-10 的字节闸也会虚高。
+            if let Some(pos) = self.deleted_blobs.iter().position(|x| x == h) {
+                self.deleted_blobs.remove(pos);
+            }
+            // 样本里那两条 `+`/`-` 要撤掉，否则"计数说改名、列表说增删"是两处自相矛盾的话。
+            self.sample
+                .retain(|c| !(c.what == ChangeKind::Add && c.path == *new));
+            self.sample
+                .retain(|c| !(c.what == ChangeKind::Delete && c.path == old));
+            self.sample_more = self.sample_more.saturating_sub(2);
+            if self.renames.len() < SAMPLE_MAX {
+                self.renames.push((old, new.clone()));
+            } else {
+                self.rename_more += 1;
+            }
+            paired.push(di);
+        }
+        let _ = paired;
+        self.pair_adds.clear();
+        self.pair_dels.clear();
+    }
 }
+
+/// 改名配对窗口的大小：两侧各攒这么多条。4 096 × (32 B hash + 路径 + 8) ≈ 0.5 MB。
+pub const RENAME_PAIR_MAX: usize = 4_096;
 
 /// 一条变更的样本。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -242,6 +330,14 @@ fn plan_observed_with(
     walk_readonly(db, pid, old_root, at, dir_cap, observe)
 }
 
+/// `plan`/`compare` 走完遍历之后的收尾：**先折叠改名，再交账**。
+///
+/// 顺序是判据的一部分：`build` 里 FR-10 熔断读的必须是折叠**之后**的 `delete`。
+fn finish_changes(built: &mut Built, changes: &mut ChangeSet) {
+    changes.fold_renames();
+    built.changes = std::mem::take(changes);
+}
+
 /// 工作树（按最后一次扫描）与**任意一个版本**的差：`diff --at REV` 用的就是这一条。
 ///
 /// 与 [`plan`] 同一个遍历、同一个口径，只是参照版本换了一个。`old_root = None` 的语义是
@@ -295,7 +391,7 @@ fn walk_readonly(
     built.entries = rows.live as usize;
     built.known = rows.seen_rows;
     built.epoch = rows.mark;
-    built.changes = changes;
+    finish_changes(&mut built, &mut changes);
     Ok(built)
 }
 
@@ -315,7 +411,15 @@ fn note_change(
     {
         cs.deleted_blobs.push(e.hash);
     }
-    cs.note(kind, path.to_string(), ne.or(oe).map_or(0, |e| e.size));
+    let size = ne.or(oe).map_or(0, |e| e.size);
+    cs.note(kind, path.to_string(), size);
+    // 只有 Add/Delete 能配改名，且必须拿到 hash：目录给的是 tree hash，符号链接给目标文本的 blob。
+    let (h, _) = match (kind, oe, ne) {
+        (ChangeKind::Add, _, Some(e)) => (e.hash, e.kind),
+        (ChangeKind::Delete, Some(e), _) => (e.hash, e.kind),
+        _ => return,
+    };
+    cs.note_pairable(kind, &h, path, size);
 }
 
 /// 构建并落库一个 commit。无改动时返回 `commit: None`，**不产生空提交也不移 head**。
@@ -355,7 +459,8 @@ pub fn build(
     built.entries = rows.live as usize;
     built.known = known;
     built.epoch = rows.mark;
-    built.changes = changes;
+    // 改名折叠在熔断**之前**：一次大规模 `mv` 之后 `delete` 该归零，而不是去挡 FR-10。
+    finish_changes(&mut built, &mut changes);
     if built.changes.is_empty() {
         return Ok(built); // 不产生空提交：碎 commit 会把引擎版本链白白撑大（§9.6.2）
     }
@@ -376,7 +481,9 @@ pub fn build(
             add: built.changes.add,
             modify: built.changes.modify,
             delete: built.changes.delete,
-            rename: 0, // 改名检测是 FR-17 的活，M0 收尾时补；现在一律按 add+delete 记
+            // FR-1：改名是 commit 里的一等记录，不是"事后猜"。配对规则见
+            // `ChangeSet::fold_renames`（同 hash 才算，配不上就还是 add+delete）。
+            rename: built.changes.rename,
             bytes: built.changes.bytes,
         },
     };

@@ -2,7 +2,8 @@
 //!
 //! 这一层的价值全在"什么时候不动手"：源不存在、目标已存在、路径想逃出项目目录 ——
 //! 三种都必须在 `fs::rename` **之前**拦下。改名之后库里还没记，所以用例也顺手把
-//! "下一次 commit 长什么样"钉住：账面 -1/+1，但**新块数为 0**（内容寻址的必然）。
+//! "下一次 commit 长什么样"钉住：按 FR-1 折成**改名**（`R`），且**新块数为 0**
+//! （内容寻址的必然）。折叠必须在 FR-10 熔断之前发生，否则大规模 `mv` 会被当成大规模删除。
 //!
 //! 手工验证（跑完 `rm -rf /tmp/tsm`）：
 //!
@@ -71,6 +72,28 @@ impl Site {
 
     fn exists(&self, rel: &str) -> bool {
         work(&self.root(), rel).exists()
+    }
+
+    /// 与 `commit()` 同一条路，但**不给** `--allow-mass-delete`：用来测 FR-10 会不会误拦。
+    fn commit_gated(&self) -> twosync::error::Result<build::Built> {
+        let root = self.root();
+        let db = open_store(&root, EngineKind::LsmTree).unwrap();
+        let pid = keys::project_id("p");
+        let proj = root.join("p");
+        worktree::scan(&*db, pid, &proj, false, 100).unwrap();
+        let store = Cas::new(&objects_dir(&root), cas::DEFAULT_BLOCK).unwrap();
+        build::build(
+            &*db,
+            pid,
+            &store,
+            &proj,
+            build::Meta {
+                peer: "t",
+                msg: "用例",
+                ts: 1,
+                allow_mass_delete: false,
+            },
+        )
     }
 
     /// 扫 + 提，返回这次提交的账。
@@ -151,9 +174,10 @@ fn mv_creates_the_destination_parent_and_reports_a_missing_source() {
     assert!(matches!(err, Error::BadInput(_)), "实际 {err}");
 }
 
-/// 改名进历史的样子：账面是"一删一增"，但**新块为 0**——内容寻址让改名不复制数据。
+/// **FR-1 的改名**：同一份内容换了路径 ⇒ 记一次改名，不复制数据也不占传输。
+/// 折叠之前账面是"一删一增"（`archive` 那一层是新目录，仍算一条新增）。
 #[test]
-fn a_renamed_file_commits_as_delete_plus_add_with_no_new_blocks() {
+fn a_renamed_file_commits_as_a_rename_with_no_new_blocks() {
     let site = Site::new(&[("big.bin", &[7u8; 100_000])]);
     let first = site.commit();
     assert_eq!((first.changes.add, first.changes.delete), (1, 0));
@@ -161,8 +185,26 @@ fn a_renamed_file_commits_as_delete_plus_add_with_no_new_blocks() {
 
     site.mv("big.bin", "archive/big.bin").unwrap();
     let second = site.commit();
-    assert_eq!(second.changes.delete, 1);
-    assert_eq!(second.changes.add, 2, "archive 目录本身也算一条新增");
+    let cs = &second.changes;
+    assert_eq!(
+        (cs.rename, cs.add, cs.delete),
+        (1, 1, 0),
+        "改名 1 条 + 新目录 1 条，删除侧该被折叠掉：{cs:?}"
+    );
+    assert_eq!(
+        cs.renames,
+        vec![("big.bin".to_string(), "archive/big.bin".to_string())],
+        "样本要给 `(旧, 新)`：{cs:?}"
+    );
+    assert_eq!(
+        cs.deleted_blobs.len(),
+        0,
+        "内容还在新树里 ⇒ 它不是被删的 blob"
+    );
+    assert_eq!(
+        cs.deleted_bytes, 0,
+        "改名不该记出删除字节（FR-10 的字节闸会虚高）"
+    );
     assert_eq!(
         second.blobs_new, 0,
         "同一个 blob 清单已在库里 ⇒ 不该再写一遍"
@@ -180,8 +222,54 @@ fn renaming_a_directory_moves_the_whole_subtree() {
     assert!(site.exists("d2/a.txt") && site.exists("d2/e/b.txt"));
 
     let b = site.commit();
-    // 4 而不是 2：目录条目本身也算删除（`d` 与 `d/e`），新增那侧同理。
-    assert_eq!(b.changes.delete, 4, "{:?}", b.changes.sample);
-    assert_eq!(b.changes.add, 4);
+    // 4 而不是 2：目录条目本身也各算一条（`d` 与 `d/e`）。目录的 hash 是子树 tree hash，
+    // 整棵子树原样搬走 ⇒ 两侧 hash 相同 ⇒ 连目录自己一起配成改名（FR-1）。
+    let cs = &b.changes;
+    assert_eq!((cs.rename, cs.add, cs.delete), (4, 0, 0), "{cs:?}");
+    assert!(
+        b.commit.is_some(),
+        "折叠后 add/delete 都归零：`is_empty` 漏算 rename 就会把它当无改动拒掉，改名永远进不了历史"
+    );
     assert_eq!(b.blobs_new, 0, "内容没变 ⇒ 零个新 blob");
+    assert_eq!(b.blocks_stored, 0, "整棵子树搬家也不该写一个新块");
+    let mut pairs = cs.renames.clone();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("d".to_string(), "d2".to_string()),
+            ("d/a.txt".to_string(), "d2/a.txt".to_string()),
+            ("d/e".to_string(), "d2/e".to_string()),
+            ("d/e/b.txt".to_string(), "d2/e/b.txt".to_string()),
+        ],
+        "{pairs:?}"
+    );
+}
+
+/// FR-10 的熔断看的是折叠**之后**的删除数：一次大规模 `mv`（把一半文件挪进子目录）
+/// 不该被当成"删了一半仓库"。这也是折叠必须在 `check_mass_delete` 之前的原因。
+#[test]
+fn a_mass_rename_does_not_trip_the_delete_circuit_breaker() {
+    // 30 个内容互不相同的文件：改名配对要求 hash 相同，内容撞车的文件配不出改名。
+    let names: Vec<String> = (0..30).map(|i| format!("f{i}.bin")).collect();
+    let bodies: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 64]).collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .zip(bodies.iter())
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    let site = Site::new(&files);
+    site.commit();
+    for i in 0..15 {
+        site.mv(&format!("f{i}.bin"), &format!("moved/f{i}.bin"))
+            .expect("改名本身该成功");
+    }
+    // 不给 `--allow-mass-delete`：15/30 = 50% > 20%，**没折叠就会被熔断**。
+    let b = site
+        .commit_gated()
+        .unwrap_or_else(|e| panic!("15 条改名被当成大规模删除了：{e}"));
+    assert_eq!(b.changes.delete, 0, "{:?}", b.changes);
+    assert_eq!(b.changes.rename, 15, "{:?}", b.changes);
+    // `moved` 这一层是真新增（旧树里没有对应的空/同内容目录），它不该被折掉。
+    assert_eq!(b.changes.add, 1, "{:?}", b.changes);
 }
