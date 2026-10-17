@@ -219,7 +219,27 @@ pub fn plan(db: &dyn KvEngine, pid: ProjectId) -> Result<Built> {
 
 /// `plan` 的实现，但**单层**内存上限可注入——给用例留着"超限要报错、不许 OOM"这条可测性。
 pub fn plan_capped(db: &dyn KvEngine, pid: ProjectId, dir_cap: usize) -> Result<Built> {
-    walk_readonly(db, pid, head_tree(db, pid)?, "", dir_cap)
+    plan_observed_with(db, pid, head_tree(db, pid)?, "", dir_cap, &mut |_p, _e| {})
+}
+
+/// `plan` 但**每读一条活行就回调一次**：`status` 用它顺路收集可疑目录的名单。
+pub fn plan_observed<'a>(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    observe: &mut Observe<'a>,
+) -> Result<Built> {
+    plan_observed_with(db, pid, head_tree(db, pid)?, "", MAX_DIR_ENTRIES, observe)
+}
+
+fn plan_observed_with(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    old_root: Option<Hash>,
+    at: &str,
+    dir_cap: usize,
+    observe: &mut Observe<'_>,
+) -> Result<Built> {
+    walk_readonly(db, pid, old_root, at, dir_cap, observe)
 }
 
 /// 工作树（按最后一次扫描）与**任意一个版本**的差：`diff --at REV` 用的就是这一条。
@@ -227,7 +247,7 @@ pub fn plan_capped(db: &dyn KvEngine, pid: ProjectId, dir_cap: usize) -> Result<
 /// 与 [`plan`] 同一个遍历、同一个口径，只是参照版本换了一个。`old_root = None` 的语义是
 /// "没有可比的历史"⇒ 全部按新增记，而且参照侧一次都不读。
 pub fn compare(db: &dyn KvEngine, pid: ProjectId, old_root: Option<Hash>) -> Result<Built> {
-    walk_readonly(db, pid, old_root, "", MAX_DIR_ENTRIES)
+    walk_readonly(db, pid, old_root, "", MAX_DIR_ENTRIES, &mut |_p, _e| {})
 }
 
 /// `compare` 的限定版：只比 `at` 那一棵子树（`checkout --prefix` 的坐标）。
@@ -240,7 +260,7 @@ pub fn compare_subtree(
     old_root: Option<Hash>,
     at: &str,
 ) -> Result<Built> {
-    walk_readonly(db, pid, old_root, at, MAX_DIR_ENTRIES)
+    walk_readonly(db, pid, old_root, at, MAX_DIR_ENTRIES, &mut |_p, _e| {})
 }
 
 fn walk_readonly(
@@ -249,6 +269,7 @@ fn walk_readonly(
     old_root: Option<Hash>,
     at: &str,
     dir_cap: usize,
+    observe: &mut Observe<'_>,
 ) -> Result<Built> {
     let mut rows = LiveRows::with_prefix(db, pid, at);
     let mut built = Built::default();
@@ -268,6 +289,7 @@ fn walk_readonly(
             note_change(&mut changes, kind, path, oe, ne);
             Ok(())
         },
+        observe,
     )?;
     // 这三个数只能在遍历**之后**读：迭代器是分页的，走完才是全量。
     built.entries = rows.live as usize;
@@ -327,6 +349,7 @@ pub fn build(
             note_change(&mut changes, kind, path, oe, ne);
             Ok(())
         },
+        &mut |_p, _e| {},
     )?;
     let known = rows.seen_rows;
     built.entries = rows.live as usize;
@@ -634,11 +657,12 @@ impl Walk<'_> {
         sink: &mut S,
         built: &mut Built,
         visit: &mut Visit<'_>,
+        observe: &mut Observe<'_>,
     ) -> Result<()> {
         let mut b = Builder::new(self, built)?;
         for item in &mut *rows {
             let (path, e) = item?;
-            b.row(&path, &e, sink, visit)?;
+            b.row(&path, &e, sink, visit, observe)?;
         }
         built.tree = b.finish(sink, visit)?;
         Ok(())
@@ -689,7 +713,11 @@ impl<'a, 'w> Builder<'a, 'w> {
         e: &WtEntry,
         sink: &mut dyn Sink,
         visit: &mut Visit<'_>,
+        observe: &mut Observe<'_>,
     ) -> Result<()> {
+        // 观察口在**任何分支之前**：目录行也要被看见，否则"库里记着这个目录、盘上没了"
+        // 这一类差异根本报不出来。
+        observe(path, e);
         let (parent, name) = split(path);
         self.align(parent, sink, visit)?;
         if e.kind == Kind::Dir {
@@ -976,6 +1004,13 @@ fn bump_block(db: &dyn KvEngine, pid: ProjectId, hash: Hash, size: u32) -> Resul
     tx.commit();
     Ok(())
 }
+
+/// `status` 的**观察口**：每读到一条活的 `W` 行回调一次（路径, 行）。
+///
+/// 为什么要这个口而不是让调用方自己再扫一遍 `W`：在这个引擎里多一趟分页扫描 = 多几次全库
+/// 折叠（§17 补记十），而 `plan` 本来就要把所有活行读一遍 ⇒ 顺路把行交给观察者，是拿
+/// 一份**有界**的内存换掉整趟重读。观察者自己负责只留它要的那部分（见 `worktree::reconcile`）。
+pub type Observe<'a> = dyn FnMut(&str, &WtEntry) + 'a;
 
 /// 配对遍历的回调类型。收成别名有两个理由：三处签名要重复它，而且 clippy 说得对——
 /// 这个函数指针类型已经难读到"看不出参数顺序"了，而顺序错一个是静默的语义错误。

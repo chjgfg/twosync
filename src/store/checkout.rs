@@ -192,6 +192,7 @@ fn run(ctx: &Ctx<'_>, apply: bool, old_root: Hash, at: &str) -> Result<Report> {
         &mut build::HashOnly,
         &mut built,
         &mut |kind, path, reference, worktree| job.on(kind, path, reference, worktree),
+        &mut |_p, _e| {},
     )?;
     job.rep.dirty = ctx.dirty;
     Ok(job.rep)

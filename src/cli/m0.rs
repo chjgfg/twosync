@@ -884,7 +884,7 @@ fn work_path(root: &Path, repo_path: &str) -> PathBuf {
 
 /// `status`：工作树（按最后一次扫描）与 HEAD 的差。**走 `build::plan`，不落任何盘**。
 pub fn status(cli: &Cli) -> Result<()> {
-    let (name, _) = resolve_project(cli)?;
+    let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
     // 与 scan/commit 同一把尺：融合遍历之后 NFR-1 的"内存与文件数无关"要能在**这条命令**
@@ -892,7 +892,32 @@ pub fn status(cli: &Cli) -> Result<()> {
     // 那一侧的代价必须同样可见。
     let started = Instant::now();
     let wm = allocstats::watermark();
-    let p = build::plan(&*db, pid)?;
+    // 实时那一半，第一步：走一趟盘，收"最后扫描之后被动过的目录"和那些层的名单。
+    // 用的就是 `scan` 那条 `walker(root)` ⇒ 排除语义天然一致，也不会给每个目录重造一次
+    // gitignore 查找（那件事我实测过：2 001 次构造把 `status` 从 4.1 s 拖到 12.3 s）。
+    let epoch = worktree::last_mark(&*db, pid).map_or(0, |m| m.epoch);
+    let view = if epoch == 0 {
+        worktree::DiskView::default()
+    } else {
+        worktree::view_since(&root, epoch)?
+    };
+    let suspects: Vec<String> = view.suspects.clone();
+    // 第二步：`plan` 本来要走的那一趟 `W` 流**顺路**把可疑目录的名字收上来。
+    // 不另开一趟扫描 —— 在这个引擎里"另开一趟"= 多几次全库折叠（§17 补记十）。
+    let want: std::collections::HashSet<&str> = suspects.iter().map(String::as_str).collect();
+    let mut db_names: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let p = build::plan_observed(&*db, pid, &mut |path, _e| {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if want.contains(parent) {
+            db_names
+                .entry(parent.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    })?;
+    // 第三步：纯比较，不再碰盘也不碰库。
+    let rec = worktree::reconcile(&view, &db_names);
     let peak = wm.peak_growth();
 
     println!("project   = {name}  (id={pid:#010x})");
@@ -915,12 +940,42 @@ pub fn status(cli: &Cli) -> Result<()> {
         ),
     }
     print_changes(&p.changes);
+    // 实时那一半：**只报存在性差异**。内容改了这里看不见——目录 mtime 不表达文件内容变化，
+    // 那要重算 hash 才知道（与 git 的 untracked cache 同一个限制）。
+    if epoch == 0 {
+        println!("盘上对账  = 从来没有完整扫描过 ⇒ 没有活性线可比：先 twosync scan");
+    } else if rec.suspect == 0 {
+        println!(
+            "盘上对账  = {} 个目录的 mtime 都不晚于最后扫描 ⇒ 没有漏记的增删",
+            view.dirs
+        );
+    } else {
+        let cut = if rec.truncated {
+            format!("（已达上限 {}，名单不全）", worktree::RECON_SUSPECT_MAX)
+        } else {
+            String::new()
+        };
+        println!(
+            "盘上对账  = {} 个目录在最后扫描之后被动过{cut}：未扫的新条目 {} / 盘上已没了 {} / 读不了 {}",
+            rec.suspect, rec.only_disk, rec.only_w, rec.unreadable
+        );
+        for line in &rec.sample {
+            println!("  {line}");
+        }
+        if rec.sample_more > 0 {
+            println!("  …另有 {} 条未列出", rec.sample_more);
+        }
+        // 这一句是这条命令全部的诚实所在：差异**没有**进账，`W` 才是记账真值。
+        println!(
+            "提醒      = 上面这些还没进账。要让它们成为变更：先 `scan`，再看 `status`/`commit`。"
+        );
+    }
     println!(
         "耗时        = {:.3} s   peak heap = {:.1} MiB",
         started.elapsed().as_secs_f64(),
         peak as f64 / 1048576.0
     );
-    println!("注意：比的是「最后一次扫描」与 HEAD；扫描之后又改的文件不在这里，先 scan。");
+    println!("注意：与 HEAD 的差按「最后一次扫描」算；「盘上对账」那一段才是此刻盘上的样子。");
     Ok(())
 }
 

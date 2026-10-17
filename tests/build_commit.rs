@@ -653,3 +653,69 @@ fn compare_against_any_rev_matches_the_walk_that_reads_head() {
         ]
     );
 }
+
+/// `status` 的实时那一半：**`W` 说干净，盘上说有出入**，两个都得看得见。
+///
+/// 这条钉的是整个功能的立身之处：出入**只报不进账**。§8「扫描器不许判删除」一个字没改——
+/// 真要把这次删除变成历史，还得走 `scan` → `commit`（并且照旧过 FR-10）。
+#[test]
+fn unscanned_changes_show_in_reconcile_but_not_in_the_book() {
+    let site = Site::new();
+    write(&site.proj().join("keep/a.txt"), b"a");
+    write(&site.proj().join("keep/c.txt"), b"c");
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    // 扫描之后：新增一个、删掉一个，都不再 scan。
+    write(&site.proj().join("keep/b.txt"), b"b");
+    fs::remove_file(site.proj().join("keep/a.txt")).unwrap();
+
+    // 第一步：走一趟盘选可疑层。动了 `keep/` ⇒ 它必须进来；根**也可能**进来，
+    // 因为判据带 1 s 的回写滞后余量（`MTIME_LAG`：NTFS 的父目录时间戳滞后实测几十 ms），
+    // 而用例里根是几毫秒前刚建的。多比一层只花 readdir，不影响结果。
+    let epoch = site.epoch();
+    let view = worktree::view_since(&site.proj(), epoch).unwrap();
+    assert!(
+        view.suspects.iter().any(|s| s == "keep"),
+        "被动过的那层该进可疑集合：{:?}",
+        view.suspects
+    );
+    let suspects = view.suspects.clone();
+
+    // 第二步：`plan` 本来要走的那趟 `W` 流顺路收名单（**不另开一次分页扫描**）。
+    let rows = site.db.health().total_rows;
+    let want: std::collections::HashSet<&str> = suspects.iter().map(String::as_str).collect();
+    let mut db_names: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let p = build::plan_observed(&*site.db, site.pid, &mut |path, _e| {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if want.contains(parent) {
+            db_names
+                .entry(parent.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    })
+    .unwrap();
+    assert!(
+        p.changes.is_empty(),
+        "没扫描就不该有变更进账：{:?}",
+        p.changes
+    );
+
+    // 第三步：比那一层。一增一删，名单是给人的。
+    let rec = worktree::reconcile(&view, &db_names);
+    assert_eq!((rec.only_disk, rec.only_w), (1, 1), "{rec:?}");
+    let mut got = rec.sample.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["+ keep/b.txt".to_string(), "- keep/a.txt".to_string()],
+        "路径要能直接拿去 `ls`：{:?}",
+        rec.sample
+    );
+    assert_eq!(
+        site.db.health().total_rows,
+        rows,
+        "对账是只读的：一行都不许多（§10.1 只读判据）"
+    );
+}

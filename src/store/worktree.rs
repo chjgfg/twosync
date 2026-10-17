@@ -44,6 +44,8 @@
 //! 注意语料为什么放在 `/tmp/ts3/lab/data` 而不是别处：注册表里的 `path` 是**相对 root**
 //! 的（§16.1），`check_rel_path` 明确拒绝绝对路径，所以 `--root` 和语料位置必须对得上。
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
 use std::io::Read as _;
 use std::path::Path;
@@ -219,11 +221,16 @@ pub fn scan(
 /// `require_git(false)`：没有 `.git` 的目录也要认 `.gitignore`；`hidden(false)`：隐藏文件
 /// 照样同步，只强制排除 `.git`/`.twosync`（FR-12，配置取消不了）。
 fn walker(root: &Path) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
-        .require_git(false)
-        .hidden(false)
-        .filter_entry(|e| !forced_excluded(e.file_name().to_string_lossy().as_ref()))
-        .build()
+    walk_builder(root).build()
+}
+
+/// 排除语义的唯一入口：`scan` 用它（整棵树），`list_dir` 用它（`max_depth(1)`）。
+/// **必须是同一个函数**——不然对账报的"未跟踪"会把扫描器排除掉的东西说成漏记。
+fn walk_builder(dir: &Path) -> ignore::WalkBuilder {
+    let mut b = ignore::WalkBuilder::new(dir);
+    b.require_git(false).hidden(false);
+    b.filter_entry(|e| !forced_excluded(e.file_name().to_string_lossy().as_ref()));
+    b
 }
 
 fn forced_excluded(name: &str) -> bool {
@@ -291,6 +298,214 @@ fn prev_entry(tx: &dyn storage_engines::KvTxn, key: &[u8]) -> Option<WtEntry> {
     let raw = tx.get(key)?;
     let bytes = keys::strip(&raw).ok()?;
     postcard::from_bytes(bytes).ok()
+}
+
+// ── 「扫描之后又发生了什么」：一趟整树走盘 + 只留可疑层的名单 ────────────────
+//
+// **为什么不是"两条升序流归并"**：朴素想法是 `W` 流升序、盘上也走一遍升序、两个游标对推。
+// 但**盘的 DFS 序不等于键的字节序**：`'/'`(0x2F) 在键里就是个普通字符，所以 `src`、`src.rs`、
+// `src/main.rs` 三行在库里的顺序是"目录自己 → 同名前缀的兄弟 → 子项"，而 DFS 会先钻进 `src/`。
+// 照 DFS 写归并，凡是"目录名是某个兄弟文件名前缀"的目录（`src` 与 `src.rs` 这种常见得不能再
+// 常见）就会把未扫的文件错报成"盘上已删"——一个只读命令学会撒谎，比慢更糟。
+//
+// 换形状：不比两条全局流，只比**可疑目录自己的那一层**。
+// 1. 可疑判据 = 目录自己的 mtime 晚于 `Z.epoch`（减一个回写滞后余量，见 [`MTIME_LAG`]）。这正是 git 的 untracked cache 用的失效判据
+//    （`dir.h` 里 `untracked_cache_dir { stat_data, .. }`）；实测 `stat` 约 33 µs/次 ⇒
+//    2 000 个目录 0.07 s。
+// 2. **只走一趟盘**：`walker(root)` 是前序，目录自己排在它的子项之前 ⇒ 读到目录就能当场决定
+//    "这一层要不要收名单"，收到名单的层进 `DiskView::at`，其余层的子项直接丢。
+//    这里有个用真金白银换来的教训：最早的版本给**每个目录**建一次 `walk_builder(dir)
+//    .max_depth(1)`，2 001 次构造每次都要顺着祖先链去找 `.gitignore`，实测把 `status`
+//    从 4.1 s 拖到 12.3 s（同一份库对照 HEAD）。走盘的开销在 `readdir` 之外的那套设置上。
+// 3. `W` 那一侧**复用 `status` 本来就要走的那趟流**（`build::plan_observed` 的观察口）：在这个
+//    引擎里"多一趟"= 多几次全库折叠（§17 补记十），不能白付。
+// 4. 排除语义与 `scan` **同一条流**（就是那个 `walker(root)`，不是另起一次遍历），所以被
+//    `.gitignore`/强制排除挡住的东西不会在这里冒出来变成"未跟踪"。两份账不一致是静默的。
+//
+// 这份结果**只进打印，绝不进建树**：§8「扫描器不许判删除」那条防线一个字不改。
+
+/// 一趟走盘的产物：可疑目录 + 每一层盘上的名字。
+#[derive(Debug, Default)]
+pub struct DiskView {
+    /// 可疑目录（相对路径，`""` = 根），升序。名字表在 [`at`](Self::at) 里。
+    pub suspects: Vec<String>,
+    /// `目录 → 该层盘上子项的名字（升序）`。**只有可疑层才有条目**，所以这是
+    /// O(可疑层的子项数) 而不是 O(文件数)。
+    pub at: BTreeMap<String, Vec<String>>,
+    /// 比过 mtime 的目录数（给"这一趟花在哪"一个可核对的数）。
+    pub dirs: usize,
+    /// `stat` 不了的条目：这一层没法比，两边都不算（与扫描器的 `deferred` 同一把尺）。
+    pub unreadable: usize,
+    /// 可疑层多到上限，后面的层不再收名单（只报计数）。
+    pub truncated: bool,
+}
+
+/// 名单上限：够诊断用，又不让对账的记忆变成 O(变更量)。
+const RECON_SAMPLE: usize = 30;
+/// 可疑目录超过这个数就只报计数不报名单——再往前就是 O(全树) 内存了。
+///
+/// `pub` 是给命令层判断"名单是不是被截了"用的：不暴露这个数，`status` 就只能撒谎说名单是全的。
+pub const RECON_SUSPECT_MAX: usize = 512;
+
+/// 一趟对账的账。口径与 `build::ChangeSet` 一致：计数全量，名单有界。
+#[derive(Debug, Default)]
+pub struct Reconciled {
+    pub suspect: usize,
+    /// 盘上有、`W` 没记：新建还没扫，或在一次没扫完的扫描之后出现。
+    pub only_disk: u64,
+    /// `W` 里有（且活着）、盘上已经没有了。**只是告知**：删除要等下一轮扫描才进账。
+    pub only_w: u64,
+    /// 走盘时读不了的条目数（继承扫描器的判据：不许当成"没有"）。
+    pub unreadable: u64,
+    pub sample: Vec<String>,
+    pub sample_more: usize,
+    pub truncated: bool,
+}
+
+impl Reconciled {
+    fn note(&mut self, line: String) {
+        if self.sample.len() < RECON_SAMPLE {
+            self.sample.push(line);
+        } else {
+            self.sample_more += 1;
+        }
+    }
+}
+
+/// 目录 mtime 的**回写滞后**余量。
+///
+/// 实测（Windows / NTFS / 本机）：往 `keep/` 里写一个文件之后，紧接着用 `walkdir` 缓存的
+/// metadata 读到该目录 mtime = epoch **− 1.3 ms**，而几十毫秒后再 `fs::metadata` 读到的是
+/// epoch **+ 39.5 ms**——父目录的时间戳是**滞后**更新的。所以判据必须是
+/// `mtime > epoch − 余量` 而不是 `> epoch`：误差只会往"报旧"这一侧偏，余量放在前面就是
+/// 宁可多比几层（只花钱在 readdir），不可漏比（漏了就是`status` 撒谎）。
+/// 1 s 是刻意宽松的：这台机器上量到的滞后是几十毫秒级。
+/// git 的 untracked cache 撞的是同一堵墙，它的文档原话是
+/// "Before setting it to `true`, you should check that mtime is working properly on your system"。
+const MTIME_LAG: i64 = 1_000_000_000;
+
+/// 走一趟 `root`，把"扫描之后被动过的目录"和**那些目录的子项名单**一起收回来。
+///
+/// `epoch` 是那一轮扫描**开始时**取的戳，所以判据用 `>`：扫描期间被人动过的目录也算可疑——
+/// 宁可多比一层，不可漏。根目录自己单独 `stat`（`walker` 的第一条就是根，`rel_path` 给它 `None`）。
+pub fn view_since(root: &Path, epoch: i64) -> Result<DiskView> {
+    let mut out = DiskView::default();
+    match fs::metadata(root) {
+        Ok(md) if mtime_of(&md) > epoch - MTIME_LAG => open_layer(&mut out, ""),
+        Ok(_) => {}
+        // 根读不了：没什么可比的，但要说出来（不许静默变成"盘是空的"）。
+        Err(_) => {
+            out.unreadable += 1;
+            return Ok(out);
+        }
+    }
+
+    // 前序：目录自己先于它的子项 ⇒ 决定"要不要收这一层"和"收这一层的名字"在同一条流上完成。
+    for found in walker(root) {
+        let Ok(entry) = found else {
+            out.unreadable += 1;
+            continue;
+        };
+        let Some(rel) = rel_path(root, entry.path()) else {
+            continue;
+        };
+        let Ok(md) = entry.metadata() else {
+            out.unreadable += 1;
+            continue;
+        };
+        let is_dir = md.is_dir() && !md.is_symlink();
+        if is_dir {
+            out.dirs += 1;
+            if mtime_of(&md) > epoch - MTIME_LAG {
+                open_layer(&mut out, &rel);
+            }
+        }
+        // 子项（含目录自己那条）只在其父层被收时才留下。
+        let (parent, name) = rel
+            .rsplit_once('/')
+            .map_or(("", rel.as_str()), |(p, n)| (p, n));
+        if let Some(list) = out.at.get_mut(parent) {
+            list.push(name.to_string());
+        }
+    }
+    for list in out.at.values_mut() {
+        list.sort();
+    }
+    out.suspects.sort();
+    Ok(out)
+}
+
+/// 把 `rel` 这一层登记成可疑层（并开好收名单的槽）。超上限就只报计数。
+///
+/// 同一个目录被登记两次是可能的（根先登一次，走到根那条时又登一次）吗？不会：根由
+/// `fs::metadata` 单独处理，`walker` 给的根那条 `rel_path` 是 `None` ⇒ 不进循环。
+/// 已有的键走 `Occupied` 分支，只保证槽存在，不会重复进 `suspects`。
+fn open_layer(out: &mut DiskView, rel: &str) {
+    if out.at.contains_key(rel) {
+        return;
+    }
+    if out.suspects.len() >= RECON_SUSPECT_MAX {
+        out.truncated = true;
+        return;
+    }
+    out.suspects.push(rel.to_string());
+    out.at.insert(rel.to_string(), Vec::new());
+}
+
+/// 把盘上那一层与库里那一层比掉。**纯比较，不碰盘也不碰库**（所以它可单测）。
+///
+/// `db_names` 是 `status` 在同一路 `W` 流里按父目录收上来的：同一个目录的行按键序到达，
+/// 尾巴就是名字升序 ⇒ 一层内部可以放心两游标归并，不存在 [`view_since`] 开头那个跨层交错。
+pub fn reconcile(view: &DiskView, db_names: &BTreeMap<String, Vec<String>>) -> Reconciled {
+    let mut rep = Reconciled {
+        suspect: view.suspects.len(),
+        unreadable: view.unreadable as u64,
+        truncated: view.truncated,
+        ..Default::default()
+    };
+    let empty = Vec::new();
+    for rel in &view.suspects {
+        let disk = view.at.get(rel).unwrap_or(&empty);
+        let db = db_names.get(rel).unwrap_or(&empty);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < disk.len() && j < db.len() {
+            match disk[i].cmp(&db[j]) {
+                Ordering::Less => {
+                    rep.only_disk += 1;
+                    rep.note(format!("+ {}", lead(&disk[i], rel)));
+                    i += 1;
+                }
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    rep.only_w += 1;
+                    rep.note(format!("- {}", lead(&db[j], rel)));
+                    j += 1;
+                }
+            }
+        }
+        // 尾巴：一边耗尽之后剩下的全是差异。
+        for d in &disk[i..] {
+            rep.only_disk += 1;
+            rep.note(format!("+ {}", lead(d, rel)));
+        }
+        for b in &db[j..] {
+            rep.only_w += 1;
+            rep.note(format!("- {}", lead(b, rel)));
+        }
+    }
+    rep
+}
+
+/// 样本里的路径：顶层不带前缀，子目录带上目录名，让人能直接 `ls`。
+fn lead(name: &str, rel: &str) -> String {
+    if rel.is_empty() {
+        name.to_string()
+    } else {
+        format!("{rel}/{name}")
+    }
 }
 
 /// 最近一次**完整**扫描的标记。`None` = 从没完整跑完过 ⇒ `commit` 不该认为有任何活行。
