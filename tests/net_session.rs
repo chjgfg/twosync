@@ -33,6 +33,8 @@ use twosync::store::worktree;
 use twosync::utils::{objects_dir, open_store, site_id};
 
 const PROJECT: &str = "shared";
+/// §10.4 差分表那一臂用的项目名（语料是 `D:\ts10g\dt\a\lab`，与上面那套内存管道用例无关）。
+const PROJECT_DT: &str = "lab";
 
 // ── 内存管子 ────────────────────────────────────────────────────────────────
 
@@ -882,4 +884,87 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
     let rep = session::push(&mut io, &*a.db, &a.cas(), &o).expect("forget 之后该重新接受");
     assert!(rep.first_contact, "重新确认就该再报一次首连");
     io.finish().expect("agent 收尾");
+}
+
+/// §10.4 差分表里 **twosync 那一列的"传输字节"**。挂 `#[ignore]`：它要预先造好的语料，
+/// 不是每次 `cargo test` 都该跑的测量。跑法：
+///
+/// ```text
+/// node D:\ts10g\gendt.js 'D:\ts10g\dt\a\lab'                 # 512 MiB 大文件 + 200×250 KiB
+/// twosync --root D:\ts10g\dt\a project add lab && scan && commit -m base
+/// cargo test --test net_session -- --ignored --nocapture transfer_bytes_for_the_table
+/// ```
+///
+/// 为什么这条放在测试里而不是命令行：本机没有 sshd（§11.0 那一格），`push` 起不了真管子。
+/// 但**传输字节是协议层的读数**，与管子是 ssh 还是本地进程无关——这条走的正是
+/// `Duplex::from_child` 那根真 OS 管道，所以它是实测，不是从 CAS 增量推算出来的。
+#[test]
+#[ignore = "要 D:/ts10g/dt 上预先造好的语料；§10.4 差分表专用"]
+fn transfer_bytes_for_the_table() {
+    // 正斜杠：Windows 的路径 API 认它，而写在字符串里不用转义（反斜杠在 Rust 源码里得写两遍）。
+    let a = PathBuf::from(std::env::var("TS_DT_A").unwrap_or_else(|_| "D:/ts10g/dt/a".into()));
+    let b = PathBuf::from(std::env::var("TS_DT_B").unwrap_or_else(|_| "D:/ts10g/dt/b".into()));
+    let db = open_store(&a, EngineKind::LsmTree).expect("开 a 的库");
+    let pid = keys::project_id(PROJECT_DT);
+    let cas_a = Cas::new(&objects_dir(&a), cas::DEFAULT_BLOCK).expect("a 的 CAS");
+
+    // ① 首推：对面是空站 ⇒ 这一次的字节数就是"全量"的参照
+    let mut io = agent_child(EXE, &b, PROJECT_DT);
+    let o = PushOpts { project: PROJECT_DT, peer_id: b"dt-a", peer_name: b"dt-b", ..Default::default() };
+    let first = session::push(&mut io, &*db, &cas_a, &o).expect("首推");
+    io.finish().expect("agent 收尾");
+    println!(
+        "DT_PUSH1 blocks={} bytes={} ({:.1} MiB) commits={}",
+        first.blocks_sent,
+        first.bytes_sent,
+        first.bytes_sent as f64 / 1048576.0,
+        first.commits
+    );
+
+    // ② 与 twosync/git 两臂**同一形状**的变更，再扫再提，然后第二次推。
+    //
+    // **尺子自检**：先读回那 4 个字节，确认写下去的确实与原来不同。差分表曾经栽过一次——
+    // 第二臂跑在第一臂已经改过的语料上，git 于是"3.75 s 只涨 42 KiB"，看着像它的胜利，
+    // 其实是实验被污染了（§10.4 的读数是 0 也要先证明变更落到了盘上）。
+    let lab = a.join(PROJECT_DT);
+    let off = 128 * 1024 * 1024;
+    let mut big = fs::File::options().read(true).write(true).open(lab.join("big.bin")).expect("开 big.bin");
+    use std::io::{Seek, SeekFrom};
+    let mut before = [0u8; 4];
+    big.seek(SeekFrom::Start(off)).expect("seek");
+    big.read_exact(&mut before).expect("读回补丁区");
+    let patch = vec![0x5cu8; 1024 * 1024];
+    big.seek(SeekFrom::Start(off)).expect("seek back");
+    big.write_all(&patch).expect("改 1 MiB");
+    let mut after = [0u8; 4];
+    big.seek(SeekFrom::Start(off)).expect("seek verify");
+    big.read_exact(&mut after).expect("读回验证");
+    drop(big);
+    assert_ne!(before.to_vec(), after.to_vec(), "补丁没落到盘上 ⇒ 这一轮的'增量'是假的");
+    let small_path = lab.join("many").join("d00").join("f0.bin");
+    let mut sb = fs::read(&small_path).expect("读小文件");
+    sb[0] = sb[0].wrapping_add(1);
+    fs::write(&small_path, &sb).expect("写小文件");
+
+    worktree::scan(&*db, pid, &lab, false, 2000).expect("scan");
+    build::build(
+        &*db,
+        pid,
+        &cas_a,
+        &lab,
+        Meta { peer: "dt", msg: "incr1mib", ts: 2, allow_mass_delete: true },
+    )
+    .expect("commit");
+
+    let mut io = agent_child(EXE, &b, PROJECT_DT);
+    let second = session::push(&mut io, &*db, &cas_a, &o).expect("第二推");
+    io.finish().expect("agent 收尾");
+    println!(
+        "DT_PUSH2 blocks={} bytes={} ({:.1} MiB) commits={} skipped={}",
+        second.blocks_sent,
+        second.bytes_sent,
+        second.bytes_sent as f64 / 1048576.0,
+        second.commits,
+        second.blocks_skipped
+    );
 }
