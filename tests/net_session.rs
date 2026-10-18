@@ -467,10 +467,15 @@ fn an_incremental_push_sends_only_the_changed_blocks() {
     let (rep, served) = round_ok(&a, &b, &opts(PROJECT));
     assert_eq!(rep.commits, 1, "只推那一个新 commit");
     assert_eq!(rep.blocks_sent, 1, "改一个字节 ⇒ 上线一个块，不是六个");
+    // **差集之后 `blocks_skipped` 该是 0**，而这不是"去重没了"：另外 5 个文件的清单压根没被收集，
+    // 所以连问都没问（`need` 里只有那个新块）。"问过但对面已有"那种跳过只在**一份清单内部**还出现，
+    // 下面 `a_changed_blob_still_negotiates_its_unchanged_blocks` 钉的就是那一格。
     assert_eq!(
-        rep.blocks_skipped, 5,
-        "新 commit 一共引用 6 个块，对端已经有另外 5 个 ⇒ 这才是去重的读数（协商回来的账）"
+        rep.blocks_skipped, 0,
+        "未变的文件不再进 want/have 名单：{rep:?}"
     );
+    assert_eq!(rep.blobs_sent, 1, "六份清单里只有变了的那一份要发：{rep:?}");
+    assert_eq!(rep.trees_sent, 2, "只有 d3 与 root 这两层变了：{rep:?}");
     assert_eq!(
         served.bytes_in,
         rep.bytes_sent,
@@ -479,6 +484,58 @@ fn an_incremental_push_sends_only_the_changed_blocks() {
     assert_eq!(b.block_count(), a.block_count(), "对端块数追平本端");
     assert_eq!(b.heads(), a.heads(), "两边 head 追平");
 }
+
+/// 差集优化之后 `blocks_skipped` 还剩什么可跳：**同一份清单里那些没动过的块**。
+///
+/// 为什么单独一条：上面那条用例改完之后 `blocks_skipped` 变成 0（另外 5 个文件的清单根本没被收集，
+/// 连问都没问），如果只看那一条，"只传脏块"这件事就退化成"整份文件的重发也没省"。定长 4 MiB 切块下
+/// 改中间那一块 ⇒ 前后两块逐字节相同 ⇒ 新清单引用 3 块、问过 3 块、对面已有 2 块、上线 1 块。
+/// 这一条把 FR-5 真正的意思钉住：**省的是块，不是文件**。
+#[test]
+fn a_changed_blob_still_negotiates_its_unchanged_blocks() {
+    let a = Site::open();
+    let b = Site::open();
+    // 9 MiB ⇒ 三块：4 + 4 + 1（块与块内容互不相同，`body` 的种子保证）
+    let nine = body(9, 9 * 1024 * 1024);
+    a.commit(&[("big.bin", &nine)], 1);
+    round_ok(&a, &b, &opts(PROJECT));
+
+    // 改第二块中间的一个字节 ⇒ 只有这一块变脏
+    let victim = a.proj().join("big.bin");
+    let mut raw = fs::read(&victim).expect("读原文件");
+    let off = 5 * 1024 * 1024;
+    raw[off] ^= 0xFF;
+    fs::write(&victim, &raw).expect("改一个字节");
+    worktree::scan(&*a.db, a.pid, &a.proj(), false, 500).expect("scan");
+    let store = a.cas();
+    let built = build::build(
+        &*a.db,
+        a.pid,
+        &store,
+        &a.proj(),
+        Meta {
+            peer: "a",
+            msg: "改中间那块",
+            ts: 2,
+            allow_mass_delete: true,
+        },
+    )
+    .expect("增量提交");
+    assert_eq!(built.blocks_stored, 1, "本端只新写一块（另外两块内容没变）");
+
+    let (rep, served) = round_ok(&a, &b, &opts(PROJECT));
+    assert_eq!(rep.blocks_sent, 1, "上线的只有脏掉那一块：{rep:?}");
+    assert_eq!(
+        rep.blocks_skipped, 2,
+        "同一份清单里那两个未变的块问过、对面已有 ⇒ 这才是 want/have 的账：{rep:?}"
+    );
+    assert_eq!(rep.blobs_sent, 1, "只有一份清单变了：{rep:?}");
+    assert_eq!(rep.trees_sent, 1, "文件在项目根，只有 root 这一层：{rep:?}");
+    assert_eq!(served.bytes_in, rep.bytes_sent, "两边对账");
+    assert_eq!(b.block_count(), a.block_count(), "对端块数追平本端");
+    assert_eq!(b.heads(), a.heads(), "两边 head 追平");
+}
+
 
 /// 本地删掉一大半再提交：本端提得动（`allow_mass_delete` 是发起方自己的选择），
 /// **对端必须拒**，而且拒绝的是那个 commit —— 之前的历史仍可用。
@@ -1317,4 +1374,154 @@ fn the_agent_refuses_a_registered_but_unpaired_project() {
         a.heads(),
         "配上对之后 head 追平了"
     );
+}
+
+/// 套在管子外面的字节计数器。**为什么要有这么一层**：判据问的是"传输量"，而
+/// `Report.bytes_sent` 只累加**块段的裸字节**（`session.rs` 里那句 `rep.bytes_sent += body.len()`），
+/// 协商帧（`WantHave`/`MissingBlocks`）、清单帧与 commit 帧都不在它里面。12 GiB 站点上这部分只有
+/// 几十 KiB 量级，但"大概只有"不能写进表 ⇒ 这一条自己数总字节，两个数一起报。
+struct Wire {
+    io: m1::Duplex,
+    out: u64,
+}
+
+impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.io.read(buf)
+    }
+}
+
+impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.io.write(buf)?;
+        self.out += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
+    }
+}
+
+impl Wire {
+    /// 收尾并交出累计写出的字节。`Duplex::finish` 要**拿走**管子（它得关掉写端等子进程退出），
+    /// 所以计数只能在收尾这一步一起交出来。
+    fn finish(self) -> TsResult<u64> {
+        let out = self.out;
+        self.io.finish()?;
+        Ok(out)
+    }
+}
+
+/// §11 的 M1 判据里那一格 **"10 GB 文件改 1 MB ⇒ 传输 ≤ 8 MB"的量级读数**（机制在同机 6 文件那把
+/// 上早就过了：改 1 字节 ⇒ 传 1 块；这里要的是 12 GiB 站点上的绝对数 + 协商开销不随规模爆掉的证据）。
+/// 挂 `#[ignore]`：它要一个 12 GiB 的站点与一个已经追平到基线的对端，setup 见下面。
+///
+/// # 站点是怎么搭起来的（这一步的口径必须写清楚，否则读数会被误读成"首建库很快"）
+///
+/// 对端 `D:/ts10p` **不是经会话填出来的**，而是：
+/// - `.twosync/objects` 用 `cp -al` **硬链**到本端的块文件（21 794 个，一个字节都不多占盘；
+///   CAS 是写一次不改的，所以共享 inode 安全 —— 收到新块是"新建文件"，不会动到本端那份）；
+/// - `.twosync/db` 冷拷贝（26 MiB）⇒ 对端的 head 与全部 `B`/`T`/`K` 账就是本端的基线；
+/// - 然后两边各跑一次 `project pair`（§9.5.3）。
+///
+/// ⇒ **这一格测的是"增量那一趟上线多少字节"，不含首份全量**；首份全量的代价在 §11.1 与 §11.2 里另有读数。
+///
+/// # 两臂故意差在块边界上（判据的上限就是照这个形状写的）
+///
+/// | 臂 | 改动 | 脏块 | 期望上线 |
+/// |---|---|---|---|
+/// | aligned | 1 MiB 全落在同一个 4 MiB 块内 | 1 | 4 MiB + 帧 |
+/// | cross | 1 MiB 跨两个 4 MiB 块（各沾 512 KiB） | 2 | 8 MiB + 帧 ⇒ **正好贴着上限** |
+///
+/// # 两个自己证明对照做成了（§10.4 栽过一次：变更没落盘就把"增量"读成 0）
+///
+/// ① `blocks_skipped` 必须远大于 0 ⇒ 对端**真的已经**有其余那些块，否则这一推就是全量；
+/// ② 会话之后对端的 head 必须前移、根 tree 与本端一致 ⇒ "传到了"而不是"传了没生效"。
+///
+/// 跑法（变更与提交都在命令行上做：那两腿是 35 s / 71 s 量级，失败时要能单独重跑，不该塞进测量用例）：
+///
+/// ```text
+/// node D:\ts10g\mut10g.js D:\ts10g\lab aligned
+/// twosync --root D:/ts10g --project lab scan
+/// twosync --root D:/ts10g --project lab commit -m arm-aligned
+/// TS_BIG_CEIL_MIB=5 cargo test --test net_session -- --ignored --nocapture incremental_transfer_at_ten_gib
+/// ```
+#[test]
+#[ignore = "要 D:/ts10g（12 GiB 站点）与 D:/ts10p（对端：块仓硬链 + db 冷拷贝到基线）；§11 的增量传输量级读数专用"]
+fn incremental_transfer_at_ten_gib() {
+    let a = PathBuf::from(std::env::var("TS_BIG_A").unwrap_or_else(|_| "D:/ts10g".into()));
+    let b = PathBuf::from(std::env::var("TS_BIG_B").unwrap_or_else(|_| "D:/ts10p".into()));
+    let name = std::env::var("TS_BIG_PROJ").unwrap_or_else(|_| "lab".to_string());
+    let ceil_mib: f64 = std::env::var("TS_BIG_CEIL_MIB")
+        .ok()
+        .map(|v| v.parse().expect("TS_BIG_CEIL_MIB 要是一个数"))
+        .unwrap_or(8.0);
+
+    let pid = keys::project_id(&name);
+    let db = open_store(&a, EngineKind::LsmTree).expect("开本端的库");
+    let cas_a = Cas::new(&objects_dir(&a), cas::DEFAULT_BLOCK).expect("本端 CAS");
+    let a_heads = build::all_ref_heads(&*db, pid, None).expect("本端 head");
+    assert!(!a_heads.is_empty(), "本端没有 head ⇒ 这一格没得测");
+
+    // 对端在推之前的样子：块数与 head（推之后拿这两个数做对照）
+    let blocks_before = count_blocks(&objects_dir(&b));
+    let b_db0 = open_store(&b, EngineKind::LsmTree).expect("开对端的库");
+    let b_heads_before = build::all_ref_heads(&*b_db0, pid, None).expect("对端 head");
+    drop(b_db0);
+
+    let mut wire = Wire { io: agent_child(EXE, &b, &name), out: 0 };
+    let o = PushOpts {
+        project: &name,
+        peer_id: b"ten-gib-site",
+        peer_name: b"ten-gib-peer",
+        ..Default::default()
+    };
+    let rep = session::push(&mut wire, &*db, &cas_a, &o).expect("增量推送");
+    let wire_bytes = wire.finish().expect("agent 收尾");
+
+    println!(
+        "TEN_GIB blocks_sent={} skipped={} blob帧={} tree帧={} commits={}\n\
+         TEN_GIB 块裸字节={} B ({:.2} MiB)\n\
+         TEN_GIB 管子总字节={} B ({:.2} MiB)  ← 含协商/清单/commit 帧",
+        rep.blocks_sent,
+        rep.blocks_skipped,
+        rep.blobs_sent,
+        rep.trees_sent,
+        rep.commits,
+        rep.bytes_sent,
+        rep.bytes_sent as f64 / 1048576.0,
+        wire_bytes,
+        wire_bytes as f64 / 1048576.0,
+    );
+
+    // ── 对照 ①：对端不是空的，否则"增量"是假的 ──
+    assert!(rep.blocks_skipped >= 1000, "对端应该已经有其余那些块：{rep:?}");
+    assert!(rep.commits >= 1, "本端一个新 commit 都没推 ⇒ 变更根本没进历史：{rep:?}");
+    assert!(rep.blocks_sent >= 1, "脏块一个都没发 ⇒ 这一刀没落到盘上：{rep:?}");
+    assert!(
+        (rep.bytes_sent as f64) <= ceil_mib * 1048576.0,
+        "块裸字节 {:.2} MiB 超过上限 {ceil_mib} MiB",
+        rep.bytes_sent as f64 / 1048576.0
+    );
+    assert!(
+        (wire_bytes as f64) <= ceil_mib * 1048576.0 + 1048576.0,
+        "管子总字节 {:.2} MiB 超了（上限 {ceil_mib} MiB + 1 MiB 帧开销）",
+        wire_bytes as f64 / 1048576.0
+    );
+
+    // ── 对照 ②：推过去了、也生效了 ──
+    assert_eq!(
+        count_blocks(&objects_dir(&b)),
+        blocks_before + rep.blocks_sent,
+        "对端的块数应该正好长出这么多"
+    );
+    let b_db = open_store(&b, EngineKind::LsmTree).expect("推完再开对端的库");
+    let b_heads = build::all_ref_heads(&*b_db, pid, None).expect("对端 head");
+    assert_ne!(b_heads, b_heads_before, "对端 head 必须前移");
+    assert_eq!(b_heads, a_heads, "两边 head 应该追平");
+    for h in &a_heads {
+        let ta = object::read_commit(&*db, pid, h).expect("本端 commit").tree;
+        let tb = object::read_commit(&*b_db, pid, h).expect("对端 commit").tree;
+        assert_eq!(ta, tb, "根 tree 必须一致（{h:?}）");
+    }
 }

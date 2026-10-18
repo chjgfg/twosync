@@ -273,27 +273,26 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
     rep.commits = to_send.len();
 
     // ④ 收集要运的对象与块。清单先攒在手里，分帧时按估算切（编码器还会兜一次真上限）。
-    let mut trees: BTreeMap<Hash, Vec<object::TreeEntry>> = BTreeMap::new();
-    let mut blobs: BTreeMap<Hash, cas::Blob> = BTreeMap::new();
-    let mut block_size: BTreeMap<Hash, u32> = BTreeMap::new();
-    let mut need: Vec<Hash> = Vec::new();
-    let mut commits: Vec<object::Commit> = Vec::new();
+    //
+    // **送差集，不是送整棵树**（§17 补记廿三：12 GiB 站点上这一条值 3 MiB 管子与两万次对端写盘）。
+    // 块有 `want/have` 协商，所以脏块只发一次；清单原来没有协商 ⇒ 每次推送都把待发 commit 的**全部**
+    // `B`/`T` 重新发一遍，于是"改 1 MiB"变成"发 20 011 份清单"。现在拿亲代当基线，同名同 hash 的
+    // 子项整块跳过（那一棵子树逐字节相同 ⇒ 对面早就有）。
+    let mut out = Outbound::default();
     for h in &to_send {
         let c = object::read_commit(db, pid, h)?;
-        collect_tree(
-            db,
-            pid,
-            &c.tree,
-            &mut trees,
-            &mut blobs,
-            &mut block_size,
-            &mut need,
-        )?;
-        commits.push(c);
+        let base = c
+            .parents
+            .iter()
+            .find(|p| theirs_reachable.contains(*p))
+            .map(|p| object::read_commit(db, pid, p).map(|pc| pc.tree))
+            .transpose()?;
+        collect_changed(db, pid, &c.tree, base.as_ref(), &mut out)?;
+        out.commits.push(c);
     }
     // ⑤ 块协商。配额按**协商之后**真正要上线的字节算（见下面 `send_bytes`），
     // 所以这里不先估一份"想要的总量"——那个数在对面有库存时永远是高的。
-    for chunk in chunk_hashes(&need) {
+    for chunk in chunk_hashes(&out.need) {
         frame::encode(io, &Proto::WantHave { want: chunk })?;
     }
     frame::encode(io, &Proto::HaveDone)?;
@@ -307,11 +306,16 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
         }
     }
 
-    let to_write: Vec<Hash> = need.iter().cloned().filter(|h| missing.contains(h)).collect();
-    rep.blocks_skipped = need.len() - to_write.len();
+    let to_write: Vec<Hash> = out
+        .need
+        .iter()
+        .cloned()
+        .filter(|h| missing.contains(h))
+        .collect();
+    rep.blocks_skipped = out.need.len() - to_write.len();
     let send_bytes: u64 = to_write
         .iter()
-        .map(|h| *block_size.get(h).unwrap_or(&0) as u64)
+        .map(|h| *out.block_size.get(h).unwrap_or(&0) as u64)
         .sum();
     if send_bytes > opts.max_block_bytes {
         frame::encode(
@@ -342,14 +346,14 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
             },
         )?;
         for h in &to_write {
-            let size = *block_size.get(h).unwrap_or(&0);
+            let size = *out.block_size.get(h).unwrap_or(&0);
             let body = cas.read_block(h, size)?;
             frame::write_segment(io, h, &body)?;
             rep.blocks_sent += 1;
             rep.bytes_sent += body.len() as u64;
         }
     }
-    for frame_body in pack_objects(&blobs, &trees, &commits) {
+    for frame_body in pack_objects(&out) {
         // 计数按**对象**数，不按帧数：一帧能装多少是 `MAX_FRAME` 决定的实现细节，
         // 拿帧数当"传了几份清单"会在大包库上少报一个量级（分帧边界一动，读数就跟着跳）。
         if let Proto::PushObjects {
@@ -789,55 +793,98 @@ pub fn topo_pending(
     out
 }
 
-fn collect_tree(
+/// 一趟 push 要运出去的东西。**四个累加器收成一个结构**不是为了好看：
+/// `collect_changed` 原来要接 8 个参数（clippy 直接拒绝），而那四个本来就同生同死——
+/// 它们是"这一场会话的差集"这一个概念的四格账。
+#[derive(Default)]
+struct Outbound {
+    /// 要送的对端缺失的块（问过 `want/have` 的那些）
+    need: Vec<Hash>,
+    /// 每个 need 块的 size，用来算配额与 `PushBlocks` 的 `bytes`
+    block_size: BTreeMap<Hash, u32>,
+    blobs: BTreeMap<Hash, cas::Blob>,
+    trees: BTreeMap<Hash, Vec<object::TreeEntry>>,
+    commits: Vec<object::Commit>,
+}
+
+/// 只收集"**对端还没有**"的那部分对象。
+///
+/// `base` = 对端**已经有**的那一棵树（本端这个 commit 的亲代，且它落在对端自报的 head/祖先闭包里）。
+/// 判据是"**同名的子项 kind 与 hash 都相同**"⇒ 那一整棵子树逐字节相同 ⇒ 对面早就有它，连一个 blob 都不
+/// 必去读。`base = None`（首个提交、或分叉来的 commit 亲代不在对端那边）就退回"整棵树都送"。
+///
+/// **为什么安全**：跳过发送 = 假设对端真有。假设错了也不是静默的历史错乱——收端的
+/// [`verify_closure`] 会把新 commit 的整棵树重新走一遍并逐块查盘，缺一个就整个 commit 拒掉。
+/// 所以"对端自报的祖先"只被用来**省字节**，不当信任依据（那条限制在 §15.21 与 §9.5.2）。
+///
+/// **为什么必须是这一条而不是"清单也做一次 want/have"**：后者要加两种帧、且把一次往返压到每个对象上；
+/// 而差集在我们自己手里就能算出来（两棵树本来就在本端库上），一次网络往返都不多。
+fn collect_changed(
     db: &dyn KvEngine,
     pid: ProjectId,
     root: &Hash,
-    trees: &mut BTreeMap<Hash, Vec<object::TreeEntry>>,
-    blobs: &mut BTreeMap<Hash, cas::Blob>,
-    block_size: &mut BTreeMap<Hash, u32>,
-    need: &mut Vec<Hash>,
+    base: Option<&Hash>,
+    out: &mut Outbound,
 ) -> Result<()> {
-    let mut stack = vec![*root];
-    while let Some(h) = stack.pop() {
-        if trees.contains_key(&h) {
+    // 栈里每一项是"(要展开的新树, 对端已有的同一位置的老树)"。深度优先，同层只读两棵树。
+    let mut stack: Vec<(Hash, Option<Hash>)> = Vec::new();
+    let level = |h: Hash, b: Option<Hash>, stack: &mut Vec<(Hash, Option<Hash>)>| {
+        if b == Some(h) {
+            return; // 这一整棵一字未动
+        }
+        stack.push((h, b));
+    };
+    level(*root, base.copied(), &mut stack);
+    while let Some((h, b)) = stack.pop() {
+        if out.trees.contains_key(&h) {
             continue;
         }
         let entries = object::read_tree(db, pid, &h)?;
+        let older = match &b {
+            Some(bh) if *bh != h => Some(object::read_tree(db, pid, bh)?),
+            _ => None,
+        };
         for e in entries.iter() {
+            let old = older
+                .as_ref()
+                .and_then(|list| list.iter().find(|o| o.name == e.name));
+            // 同名、同类型、同 hash ⇒ 那一整块对面早就有，不必再问
+            if let Some(o) = old
+                && o.kind == e.kind
+                && o.hash == e.hash
+            {
+                continue;
+            }
             match e.kind {
-                Kind::Dir => stack.push(e.hash),
+                Kind::Dir => level(e.hash, old.map(|o| o.hash), &mut stack),
                 Kind::File | Kind::Symlink => {
-                    if blobs.contains_key(&e.hash) {
+                    if out.blobs.contains_key(&e.hash) {
                         continue;
                     }
                     let blob = build::read_blob(db, pid, &e.hash)?;
-                    for b in blob.blocks.iter().filter(|b| !b.zero) {
+                    for blk in blob.blocks.iter().filter(|x| !x.zero) {
                         // 块在多个文件里出现只问一次：`block_size` 的键集合就是"要问过对端
                         // 哪些块"的判据，Vacant 那一支才是第一次见到它。
                         if let std::collections::btree_map::Entry::Vacant(v) =
-                            block_size.entry(b.hash)
+                            out.block_size.entry(blk.hash)
                         {
-                            v.insert(b.size);
-                            need.push(b.hash);
+                            v.insert(blk.size);
+                            out.need.push(blk.hash);
                         }
                     }
-                    blobs.insert(e.hash, blob);
+                    out.blobs.insert(e.hash, blob);
                 }
             }
         }
-        trees.insert(h, entries);
+        // 走到这一层说明它变了（没变的早在上面跳掉了）⇒ 要送。
+        out.trees.insert(h, entries);
     }
     Ok(())
 }
 
 /// 按估算尺寸把对象切成多帧。估算而不是精确编码长度：省掉"每加一条就重编一次"的 O(n²)，
 /// 而真超限时编码器自己会兜（返回 `BadInput`），所以估小了也只是多切一帧，不会发出解不出的帧。
-fn pack_objects(
-    blobs: &BTreeMap<Hash, cas::Blob>,
-    trees: &BTreeMap<Hash, Vec<object::TreeEntry>>,
-    commits: &[object::Commit],
-) -> Vec<Proto> {
+fn pack_objects(pending: &Outbound) -> Vec<Proto> {
     let budget = (frame::MAX_FRAME / 2) as usize;
     let mut out = Vec::new();
     let mut cur_blobs: Vec<cas::Blob> = Vec::new();
@@ -852,7 +899,7 @@ fn pack_objects(
             });
         }
     };
-    for b in blobs.values() {
+    for b in pending.blobs.values() {
         let cost = 40 + b.blocks.len() * 41;
         if used + cost > budget {
             flush(&mut cur_blobs, &mut cur_trees);
@@ -861,7 +908,7 @@ fn pack_objects(
         used += cost;
         cur_blobs.push(b.clone());
     }
-    for t in trees.values() {
+    for t in pending.trees.values() {
         let cost: usize = t.iter().map(|e| e.name.len() + 45).sum();
         if used + cost > budget {
             flush(&mut cur_blobs, &mut cur_trees);
@@ -871,11 +918,11 @@ fn pack_objects(
         cur_trees.push(t.clone());
     }
     flush(&mut cur_blobs, &mut cur_trees);
-    if !commits.is_empty() {
+    if !pending.commits.is_empty() {
         out.push(Proto::PushObjects {
             blobs: Vec::new(),
             trees: Vec::new(),
-            commits: commits.to_vec(),
+            commits: pending.commits.clone(),
         });
     }
     out
