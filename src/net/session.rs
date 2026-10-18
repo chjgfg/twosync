@@ -834,9 +834,12 @@ pub fn maximal_heads(db: &dyn KvEngine, pid: ProjectId, candidates: &[Hash]) -> 
     uniq.sort();
     uniq.dedup();
     // 每个候选的可达集只算一次：头数是个位数（§4.1"只增不减"是有限集合，不是全历史）。
+    // 而且**所有候选共用同一份亲代索引**（一次 `c|p` 前缀扫）：原来每个候选走一遍
+    // `reachable`，而门面每次读调用折一遍全库（§9.6.1）⇒ 候选数 × 一次全库折。
+    let index = object::parent_index(db, pid).unwrap_or_default();
     let reach: Vec<BTreeSet<Hash>> = uniq
         .iter()
-        .map(|c| reachable(db, pid, std::slice::from_ref(c), &[]))
+        .map(|c| history::reachable_from(&index, std::slice::from_ref(c), &[]))
         .collect();
     uniq.iter()
         .enumerate()
@@ -863,11 +866,13 @@ pub fn topo_pending(
     todo.sort();
     let mut done: BTreeSet<Hash> = skip.clone();
     let mut out = Vec::with_capacity(todo.len());
+    // 亲代索引**一次装好**（同一场会话里这里与 `maximal_heads` 各折一遍全库，不再按提交数折）
+    let index = object::parent_index(db, pid).unwrap_or_default();
     while !todo.is_empty() {
         let mut ready = Vec::new();
         let mut rest = Vec::new();
         for h in todo.iter().copied() {
-            let parents = object::parents_of(db, pid, &h).unwrap_or_default();
+            let parents = index.get(&h).cloned().unwrap_or_default();
             if parents.iter().all(|p| done.contains(p)) {
                 ready.push(h);
             } else {

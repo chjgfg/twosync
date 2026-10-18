@@ -213,6 +213,47 @@ pub fn parents_of(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Vec<
     Ok(out)
 }
 
+/// 本项目的**整个亲代索引**：`child → [parent…]`，**一次** `c|p` 前缀扫装进内存。
+///
+/// 为什么要它（§15.22、§17 补记廿五）：门面**每次读调用都折一遍全库**（§9.6.1），而历史遍历
+/// 原来每走一步就 `parents_of` 一次 ⇒ 一次 0 字节的推送在 12 GiB 站点上要 ~90 次折 ≈ 130 s。
+/// 亲代索引是整个 push/log/GC 路径里**唯一既小又常被整份需要**的索引：一行 = 32 B 键尾 + 32 B 值，
+/// 十万个提交也只有 ~10 MB，而换来的是"一次折代替 N 次折"。
+///
+/// 内存形状要如实说：这是 `O(提交数)`。百万提交级别的站点要改成按 head 分段加载（记进 §15）。
+pub fn parent_index(db: &dyn KvEngine, pid: ProjectId) -> Result<BTreeMap<Hash, Vec<Hash>>> {
+    let mut prefix = vec![keys::TAG_PARENT];
+    prefix.extend_from_slice(&pid.to_be_bytes());
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let mut out: BTreeMap<Hash, Vec<Hash>> = BTreeMap::new();
+    for r in rows {
+        // 键尾是 `child(32) + ordinal(4)`； ordinal 的存在就是为了一个提交能有多个亲代（§7.1 合并）。
+        let tail = match r.key.get(prefix.len()..) {
+            Some(t) if t.len() == 36 => t,
+            _ => continue,
+        };
+        let mut child = [0u8; 32];
+        child.copy_from_slice(&tail[..32]);
+        // ordinal 决定同一 child 下亲代的先后（0 = 第一个亲代，合并提交里那是"主亲代"）。
+        let ord = u32::from_be_bytes([tail[32], tail[33], tail[34], tail[35]]);
+        let Some(v) = &r.value else { continue };
+        let parent = dec::<Hash>(v, "parent")?;
+        let slot = out.entry(child).or_default();
+        while slot.len() <= ord as usize {
+            slot.push([0u8; 32]); // 占位，保证下标就是 ordinal（缺号不会静默挪位）
+        }
+        slot[ord as usize] = parent;
+    }
+    for (_, list) in out.iter_mut() {
+        // 去掉占位：上面那步可能让 `slot[..k]` 留空（例如索引被半路删过——那是不变量 (g) 的病，
+        // 这里不掩盖，但也不把占位当亲代返回）。
+        list.retain(|h| *h != [0u8; 32]);
+    }
+    Ok(out)
+}
+
 /// 同一层里**折叠后相等**的两个名字（`README.md` 与 `Readme.md`）。给第一对，按字节序确定。
 ///
 /// 只在目标盘大小写不敏感时才是错误（§8：报错拒绝，绝不静默覆盖）。在大小写敏感的文件系统

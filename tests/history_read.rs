@@ -354,3 +354,54 @@ fn tilde_on_a_multi_head_ref_is_ambiguous() {
         vec![base]
     );
 }
+
+/// `parent_index` 必须把**序数**留着：合并提交的第一个亲代（ordinal 0）是"主亲代"，
+/// `topo_pending` 与 §7.1 的合并语义都按下标取它。顺序丢了就是静默的历史错乱。
+#[test]
+fn the_parent_index_keeps_ordinal_order_including_merges() {
+    let (_d, engine) = db();
+    let tree = object::put_tree(&*engine, PID, &[file("a", 1, 1)]).unwrap();
+    let g = commit(&*engine, PID, &[], &tree, 100);
+    let l = commit(&*engine, PID, &[g], &tree, 200);
+    let r = commit(&*engine, PID, &[g], &tree, 300);
+    // 一个真合并：两个亲代，故意按 (r, l) 的顺序写进去 ⇒ 索引必须按 ordinal 还回 (r, l)
+    let m = commit(&*engine, PID, &[r, l], &tree, 400);
+
+    let index = object::parent_index(&*engine, PID).unwrap();
+    assert_eq!(index.get(&m).unwrap(), &vec![r, l], "ordinal 就是下标，不许按 hash 排序");
+    assert_eq!(index.get(&l).unwrap(), &vec![g]);
+    assert_eq!(index.get(&r).unwrap(), &vec![g]);
+    assert!(index.get(&g).is_none(), "根提交没有亲代行");
+
+    // 闭包（纯函数那份）走同样的图：合并的两个亲代都要到根
+    let got = history::reachable_from(&index, &[m], &[]);
+    assert_eq!(got, [m, r, l, g].into_iter().collect::<std::collections::BTreeSet<_>>());
+}
+
+/// 一次前缀扫换来的那条路径必须与"逐步点查亲代"**等价**——这条断言是这次改写的安全带：
+/// 差一个 commit 就等于 GC 少标一个保留集对象（把活数据判成垃圾）。
+#[test]
+fn the_one_scan_closure_equals_the_step_by_step_walk() {
+    let (_d, engine) = db();
+    let tree = object::put_tree(&*engine, PID, &[file("a", 1, 1)]).unwrap();
+    let g = commit(&*engine, PID, &[], &tree, 100);
+    let a1 = commit(&*engine, PID, &[g], &tree, 200);
+    let a2 = commit(&*engine, PID, &[a1], &tree, 300);
+    let b1 = commit(&*engine, PID, &[g], &tree, 400);
+    let m = commit(&*engine, PID, &[a2, b1], &tree, 500);
+    build::set_ref(&*engine, PID, build::MAIN, &[m, b1]).unwrap();
+
+    // 两个 head（`m` 与还挂着的 `b1`）+ 一份"外部也算已知"的种子，形状与 push 那边一致
+    let heads = [m, b1];
+    let extra = [a1];
+    let strict = history::reachable_strict(&*engine, PID, &heads, &extra).unwrap();
+    let index = object::parent_index(&*engine, PID).unwrap();
+    assert_eq!(
+        strict,
+        history::reachable_from(&index, &heads, &extra),
+        "一次性装索引的那份必须与严格遍历同一份集合"
+    );
+    assert_eq!(strict.len(), 5, "m/a2/a1/b1/g 五个：{strict:?}");
+    // 缺亲代行（不变量 (g) 坏了）时闭包只少走那一截，不许 panic
+    assert!(history::reachable_from(&index, &[g], &[]).contains(&g), "根也要在集合里");
+}

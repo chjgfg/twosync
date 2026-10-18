@@ -151,6 +151,22 @@ pub fn reachable_strict(
     heads: &[Hash],
     extra: &[Hash],
 ) -> Result<BTreeSet<Hash>> {
+    // **一次** `c|p` 前缀扫装好整个亲代索引，然后在内存里走闭包（[`reachable_from`]）。
+    // 原来每往前一步就一次前缀扫，而门面每次读调用折一遍全库（§9.6.1）⇒ 12 GiB 站点上一次
+    // "0 字节可推"的会话光历史遍历就烧掉 ~90 次折（§15.22、§17 补记廿五）。
+    Ok(reachable_from(&object::parent_index(db, pid)?, heads, extra))
+}
+
+/// 纯函数版闭包：给定亲代索引，从 `heads` + `extra` 走完可达集，**一次引擎调用都不做**。
+///
+/// 分出来有两个用处：① `reachable_strict` 只负责"怎么把索引搬进内存"，闭包本身可单测；
+/// ② `net::session` 那边（`maximal_heads` / `topo_pending`）要在**同一份索引**上算好几个闭包，
+/// 那样才是"一次折"而不是"每算一次折一遍全库"。
+pub fn reachable_from(
+    index: &std::collections::BTreeMap<Hash, Vec<Hash>>,
+    heads: &[Hash],
+    extra: &[Hash],
+) -> BTreeSet<Hash> {
     let mut seen = BTreeSet::new();
     let mut q: VecDeque<Hash> = VecDeque::new();
     for h in heads.iter().chain(extra.iter()) {
@@ -159,13 +175,13 @@ pub fn reachable_strict(
         }
     }
     while let Some(h) = q.pop_front() {
-        for p in object::parents_of(db, pid, &h)? {
-            if seen.insert(p) {
-                q.push_back(p);
+        for p in index.get(&h).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if seen.insert(*p) {
+                q.push_back(*p);
             }
         }
     }
-    Ok(seen)
+    seen
 }
 
 /// 一棵树的闭包里出现过的**全部对象**：commit 的 tree、每一层 tree、每一个 blob。
