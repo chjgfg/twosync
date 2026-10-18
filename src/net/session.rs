@@ -27,6 +27,9 @@
 //!
 //! 中途崩溃留下的是"没人引用的 `B`/`K` 行 + 已经落盘但没被引用的块"。那**不是损坏**：
 //! §9.3 的引用计数 GC 干的就是这个（FR-13 的"半成品"由 journal 重放/丢弃，那是 M1 后半）。
+//! 这条承诺现在**有用例兑着**：`tests/net_session.rs::objects_that_land_without_verify_are_gc_garbage`
+//! 把对端掐在"对象全进库、`VerifyCommit` 没到"那一刻，然后要求 `sweep` 把 `C`/`T`/`B`/`K` 收成零、
+//! 第二趟把块文件删净、站点还能被一次完整 push 追平。
 //!
 //! # 为什么接收侧要检查 `legal_name`
 //!
@@ -533,9 +536,25 @@ pub fn serve(
     }
 
     // 验收：闭合性 + 熔断 + head 前移。
-    let newest = match frame::decode(io)? {
-        Proto::VerifyCommit { hash } => hash,
-        other => return Err(unexpected(&other, "VerifyCommit")),
+    //
+    // **这一读的 EOF 与"管子干净收尾"是两件事**，所以要单独报成错误而不是被 `agent` 的 EOF 短路咽掉：
+    // 走到这里意味着块与清单**都已经进库**（`adopt_blob` 落过 `B`/`K` 行），只差最后一道闸。
+    // 对端在这之后把连接断了，本站点就留下一整套没有任何 ref 可达的对象——那是垃圾而不是损坏，
+    // 但它必须**看得见**（否则 `agent` 报"正常退出"，而实际上有一场会话被截断过）。
+    // 回收由 §9.3 的 mark-sweep 负责：保留集是"全部 ref 的可达闭包"，这一整套不在里面。
+    let newest = match frame::decode(io) {
+        Ok(Proto::VerifyCommit { hash }) => hash,
+        Ok(other) => return Err(unexpected(&other, "VerifyCommit")),
+        Err(e) => {
+            if matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof) {
+                return Err(Error::BadInput(
+                    "会话在 `VerifyCommit` 之前管子到尾：块与清单已经收下、head 一步没动 ⇒ \
+                     库里现在有一整套**没有人引用**的对象，`gc --sweep --apply` 会把它收掉（§9.3）\n  \
+                     这不算会话失败：动 head 是最后一步，没走完 = 什么都没生效（FR-13）".to_string(),
+                ));
+            }
+            return Err(e);
+        }
     };
     let verdict = accept(
         db,

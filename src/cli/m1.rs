@@ -228,6 +228,9 @@ pub fn push(
 ///
 /// 一条连接上连续服务多场会话 ⇒ FR-19 的"20 个 project 一轮只 1 次认证"。管子 EOF
 /// 就是"对端挂了"，正常退出（不是错误，别报成会话失败）。
+/// **唯一的例外**："块与清单都已收下、只差 `VerifyCommit`"那一读上的 EOF——那里断 = 库里留下
+/// 一整套无人可达的对象，会话层把它报成 `BadInput`（不是 `Io(UnexpectedEof)`），于是走错误分支、
+/// 非零退出，stderr 原话写着"`gc --sweep --apply` 会把它收掉"（§9.3、`net::session` 那段注释）。
 pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
     let db = cli.store()?;
     let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;

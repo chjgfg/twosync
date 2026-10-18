@@ -26,6 +26,7 @@ use twosync::net::frame::{self, Proto, PROTO_VER};
 use twosync::net::session::{self, PushOpts, Report, ServeReport};
 use twosync::store::build::{self, MAIN, Meta};
 use twosync::store::cas::{self, Cas};
+use twosync::store::gc;
 use twosync::store::history;
 use twosync::store::keys;
 use twosync::store::object;
@@ -674,7 +675,7 @@ fn push_over_a_real_child_process_and_pipes() {
 }
 
 /// §10.2 的第一刀：**对端在会话中途被杀**。FR-13 的承诺是"动 head 是最后一步"，所以半路死的对端
-/// 必须留下三样东西：head 不动、清单不进库、落下的块只是孤块（等块级 GC，那一半还没做）。
+/// 必须留下三样东西：head 不动、清单不进库、落下的块只是孤块（块级回收已经做了，见下面第二刀与 §9.3）。
 /// 更要紧的是**下一次完整 push 能追平**——半成品不许把站点锁死。
 ///
 /// 这一条**手工驱动协议**而不用 `session::push`：要的就是"只发两个段然后杀掉"这个精确时刻，
@@ -800,7 +801,47 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
         count_blocks(&objects_dir(b_tmp.path())) <= 2,
         "最多落下已经发过去的那两块，不许有更多"
     );
+
+    // 块文件落了两块，但**账上一行都不该有**：`serve` 只在清单到达时才 `adopt_blob`（写 `B`/`K`），
+    // 而清单在这一刀之后才会在网络上出现。这一条盯的就是"半应用的历史"里最危险的那种——
+    // 文件在、账也在、而 commit 不在 ⇒ 那才是需要 GC 判断的悬空态。
+    let (krows, brows) = {
+        let tx = b_db.begin();
+        let k = tx.prefix_scan(&{
+            let mut p = vec![keys::TAG_BLOCK];
+            p.extend_from_slice(&pid.to_be_bytes());
+            p
+        });
+        let b = tx.prefix_scan(&{
+            let mut p = vec![keys::TAG_BLOB];
+            p.extend_from_slice(&pid.to_be_bytes());
+            p
+        });
+        tx.commit();
+        (k.len(), b.len())
+    };
+    assert!(krows == 0, "崩在清单之前 ⇒ `K` 行该是 0 行，实际 {krows}");
+    assert!(brows == 0, "崩在清单之前 ⇒ `B` 行该是 0 行，实际 {brows}");
     drop(b_db);
+
+    // §12 那条"直接去撞 `storage-engines` 的 WAL 恢复"的狗粮项：**崩过的站点重新打开跑 FR-21 自检**。
+    // 起子进程而不是在测试里调 `m0::doctor`——FR-21 说的就是"进程启动时"那一次，同进程里再开一个
+    // 句柄走不到那条路径（而且上一个句柄还开着会撞库锁，见 `tests/gc_sweep.rs` 那条 `WouldBlock`）。
+    let out = Command::new(EXE)
+        .args(["--root", &b_tmp.path().to_string_lossy(), "doctor"])
+        .output()
+        .expect("崩过的站点跑 doctor");
+    let rep = String::from_utf8_lossy(&out.stdout).to_string();
+    println!("doctor(崩溃之后) = {}", rep.replace('\n', " | "));
+    assert!(
+        out.status.success(),
+        "重开一个崩过的站点必须起得来，stderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(rep.contains("engine      = lsm_tree"), "读数缺行：{rep}");
+    // `active_txns` 是**新句柄**的账，本来就归 0 ⇒ 这一格证明的是"WAL 恢复之后库能干净重开"，
+    // 不是"崩掉的那个进程没留残留事务"（后者在同进程里根本观测不到，别把它读成已验证）。
+    assert!(rep.contains("active_txns = 0"), "重开之后不该看得见活跃事务：{rep}");
 
     // 恢复：下一次**完整**会话必须把它追平，半成品不许把站点锁死。
     let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
@@ -821,6 +862,220 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
             .tree,
         tree,
         "追平之后的根 tree 与本端一致"
+    );
+}
+
+/// §10.2 的**第二刀**：清单、tree、commit **都已经进库**了，`VerifyCommit` 还没到就对端就没了。
+///
+/// 这一刀的残留与第一刀根本不同：第一刀只留下"没人引用的块文件"（账上一个字节都没写），
+/// 这一刀留下的是**一整套对象**——`C`/`T`/`B` 行齐全、`K` 账也加了、块也落盘了，只是**没有任何 ref 指着它**。
+/// 于是它同时验三件硬事：
+/// 1. `VerifyCommit` 是唯一动 head 的闸（对象齐了 head 也不许动）；
+/// 2. §9.3 的 mark-sweep 判垃圾用的是"**全部 ref 的可达闭包**"⇒ 这一整套必须被回收，
+///    包括 `K` 账与块文件（`session.rs` 模块头那句"中途崩溃留下的是没人引用的 `B`/`K` 行，
+///    §9.3 的引用计数 GC 干的就是这个"到这里才第一次被用例兑现）；
+/// 3. 回收之后站点还能被一次完整 push 追平（GC 不许把站点做废）。
+///
+/// **这一刀不用 `kill`，用的是"发完对象帧就关掉写端"**，理由是一条关于测试台架的硬事实：
+/// `kill` 的时刻我们**观测不到**对端读到哪儿了。这一条第一版写的就是 `child.kill()`，
+/// 结果"commit 行确实在库里"当场失败——进程在读到那帧之前就被杀了，于是断言的其实是"什么都没落"，
+/// 与第一刀重复。**要断言"没落"可以用 `kill`，要断言"已落"必须有一个确定性同步点**；
+/// 管子对读方的 EOF 就是这样的点：进管子的字节会先被读完，然后才到尾。
+#[test]
+fn objects_that_land_without_verify_are_gc_garbage() {
+    let a = Site::open();
+    let files = seed(3);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    let head = a.commit(&refs, 1).commit.expect("用例首轮必有提交");
+    let tree = object::read_commit(&*a.db, a.pid, &head)
+        .expect("读 commit")
+        .tree;
+
+    // 逐层收对象：root tree + 每个子目录的 tree（`seed` 是 `d{i}/f{i}.bin` ⇒ 4 棵树）、
+    // 每个文件的清单、以及 commit 本体。块的 `(hash,size)` 从清单里取。
+    let mut queue: VecDeque<keys::Hash> = vec![tree].into_iter().collect();
+    let mut trees: Vec<Vec<object::TreeEntry>> = Vec::new();
+    let mut blobs: Vec<cas::Blob> = Vec::new();
+    let mut blocks: Vec<(keys::Hash, u32)> = Vec::new();
+    while let Some(h) = queue.pop_front() {
+        let entries = object::read_tree(&*a.db, a.pid, &h).expect("读 tree");
+        for e in &entries {
+            match e.kind {
+                keys::Kind::Dir => queue.push_back(e.hash),
+                keys::Kind::File => {
+                    let b = build::read_blob(&*a.db, a.pid, &e.hash).expect("读 blob");
+                    for blk in &b.blocks {
+                        blocks.push((blk.hash, blk.size));
+                    }
+                    blobs.push(b);
+                }
+                _ => {}
+            }
+        }
+        trees.push(entries);
+    }
+    let commit = object::read_commit(&*a.db, a.pid, &head).expect("读 commit");
+    assert_eq!(blobs.len(), 3, "三个文件三份清单：{blobs:?}");
+    assert_eq!(trees.len(), 4, "root + 三个子目录：{}", trees.len());
+    assert_eq!(blocks.len(), 3, "一份清单一块：{blocks:?}");
+
+    let b_tmp = tempfile::tempdir().expect("对端站点");
+    register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
+    let mut child = Command::new(EXE)
+        .args([
+            "--root",
+            &b_tmp.path().to_string_lossy(),
+            "agent",
+            "--project",
+            PROJECT,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("起不了 agent 子进程");
+    let mut w = child.stdin.take().expect("piped stdin");
+    let mut r = child.stdout.take().expect("piped stdout");
+    // stderr 要**在 wait 之前 take 走**：这一刀的报错文本就是本用例的断言对象——截断必须看得见。
+    let mut err = child.stderr.take().expect("piped stderr");
+
+    // 这里**不用闭包**包 `send`：闭包会一直握着 `&mut w`，后面 `write_segment(&mut w, ..)` 与
+    // `w.flush()` 就借用冲突了（编译器说得对——两根写头本来就该串着用）。
+    frame::encode(
+        &mut w,
+        &Proto::Hello {
+            proto_ver: PROTO_VER,
+            peer_id: b"crash2".to_vec(),
+            caps: u32::MAX,
+        },
+    )
+    .expect("发 Hello");
+    expect_frame(frame::decode(&mut r), |p| matches!(p, Proto::Hello { .. }), "Hello");
+    frame::encode(
+        &mut w,
+        &Proto::BeginSession {
+            project: PROJECT.to_string(),
+            pid: a.pid,
+            my_heads: vec![head],
+        },
+    )
+    .expect("发 BeginSession");
+    expect_frame(
+        frame::decode(&mut r),
+        |p| matches!(p, Proto::HeadsState { .. }),
+        "HeadsState",
+    );
+    frame::encode(
+        &mut w,
+        &Proto::WantHave {
+            want: blocks.iter().map(|(h, _)| *h).collect(),
+        },
+    )
+    .expect("发 WantHave");
+    frame::encode(&mut w, &Proto::HaveDone).expect("发 HaveDone");
+    let mut missing: Vec<keys::Hash> = Vec::new();
+    loop {
+        match frame::decode(&mut r).expect("读 MissingBlocks") {
+            Proto::MissingBlocks { hashes } => missing.extend(hashes),
+            Proto::MissingDone => break,
+            other => panic!("该收 MissingBlocks/MissingDone，收到 {other:?}"),
+        }
+    }
+    assert_eq!(missing.len(), 3, "空站当对端 ⇒ 三块全缺");
+
+    let bytes: u64 = blocks.iter().map(|(_, s)| *s as u64).sum();
+    frame::encode(&mut w, &Proto::PushBlocks { count: 3, bytes }).expect("发 PushBlocks");
+    for (h, size) in &blocks {
+        let body = a.cas().read_block(h, *size).expect("读本端块");
+        frame::write_segment(&mut w, h, &body).expect("发块段");
+    }
+    // 对象也全发过去：四棵树 + 三份清单 + commit 本体，然后 `ObjectsDone`。
+    frame::encode(
+        &mut w,
+        &Proto::PushObjects {
+            blobs,
+            trees,
+            commits: vec![commit],
+        },
+    )
+    .expect("发 PushObjects");
+    frame::encode(&mut w, &Proto::ObjectsDone).expect("发 ObjectsDone");
+    w.flush().expect("flush");
+    // **掐在这里**：`VerifyCommit` 还没发出去。关写端 ⇒ 对端把管子里的帧全读完，然后在等
+    // `VerifyCommit` 那一读上撞到管子到尾 ⇒ 它退出，而**动 head 那一步永远没执行**。
+    drop(w);
+    let status = child.wait().expect("等对端把管子读完");
+    let mut log = String::new();
+    err.read_to_string(&mut log).expect("读 agent 的 stderr");
+    drop(r);
+    assert!(
+        !status.success(),
+        "半路到尾的会话该让 agent 非零退出（那不是『管子干净到尾』的正常收尾），stderr = {log}"
+    );
+    assert!(
+        log.contains("没有人引用") || log.contains("gc --sweep"),
+        "截断要在 stderr 上说清楚'留下了什么、谁来收'，实际是：{log}"
+    );
+
+    let pid = keys::project_id(PROJECT);
+    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("崩过的库要能重开");
+    let cas = Cas::new(&objects_dir(b_tmp.path()), cas::DEFAULT_BLOCK).expect("对端 CAS");
+    assert!(
+        build::ref_heads(&*b_db, pid, MAIN)
+            .expect("读 head")
+            .is_empty(),
+        "对象齐了也不许动 head：`VerifyCommit` 是唯一那道闸"
+    );
+    assert!(
+        object::read_commit(&*b_db, pid, &head).is_ok(),
+        "这一刀的残留**就是**一整套对象：commit 行此刻确实在库里"
+    );
+    assert_eq!(count_blocks(&objects_dir(b_tmp.path())), 3, "三块都落了盘");
+    let count = |tag: u8| -> usize {
+        let mut p = vec![tag];
+        p.extend_from_slice(&pid.to_be_bytes());
+        let tx = b_db.begin();
+        let n = tx.prefix_scan(&p).len();
+        tx.commit();
+        n
+    };
+    assert_eq!(count(keys::TAG_BLOB), 3, "`B` 行");
+    assert_eq!(count(keys::TAG_TREE), 4, "`T` 行");
+    assert_eq!(count(keys::TAG_COMMIT), 1, "`C` 行");
+    assert_eq!(count(keys::TAG_BLOCK), 3, "`K` 行（adopt_blob 加过 refcnt）");
+
+    // ── §9.3：这一整套没有任何 ref 可达 ⇒ sweep 该把它全收掉 ──
+    let plan = gc::sweep(&*b_db, &cas, pid, false).expect("收崩残留");
+    assert_eq!(plan.commits_kept, 0, "保留集是空的（没有任何 ref）：{plan:?}");
+    assert_eq!(plan.commits_dropped, 1, "{plan:?}");
+    assert_eq!(plan.trees_dropped, 4, "{plan:?}");
+    assert_eq!(plan.blobs_dropped, 3, "{plan:?}");
+    assert_eq!(plan.blocks_pending, 3, "三块全归零：{plan:?}");
+    assert_eq!(
+        count(keys::TAG_BLOCK),
+        3,
+        "sweep 只记账 ⇒ `K` 行还在，等第二趟"
+    );
+    let ul = gc::unlink_pending(&*b_db, &cas, pid, usize::MAX, false).expect("第二趟");
+    assert_eq!(ul.files, 3, "{ul:?}");
+    assert_eq!(gc::pending_total(&*b_db, pid).expect("读表"), (0, 0));
+    drop(b_db);
+    assert_eq!(count_blocks(&objects_dir(b_tmp.path())), 0, "GC 之后块仓该是空的");
+
+    // ── 站点没被做废：一次完整 push 照样追平 ──
+    let a_db = &*a.db;
+    let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
+    let rep = session::push(&mut io, a_db, &a.cas(), &opts(PROJECT)).expect("GC 之后的一次完整 push");
+    io.finish().expect("agent 该正常收尾");
+    assert_eq!(rep.blocks_sent, 3, "块被 GC 删掉了 ⇒ 这次得重发：{rep:?}");
+    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("再开一次");
+    assert_eq!(
+        build::ref_heads(&*b_db, pid, MAIN).expect("读 head"),
+        vec![head],
+        "追平之后 head 到位"
     );
 }
 
