@@ -101,9 +101,10 @@ pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
                     " "
                 };
                 println!(
-                    "{mark} {name:20} id={:#010x}  {}",
+                    "{mark} {name:20} id={:#010x}  {}  对端={}",
                     keys::project_id(name),
-                    p.path
+                    p.path,
+                    p.peer_path.as_deref().unwrap_or("(未配对)")
                 );
             }
         }
@@ -111,6 +112,35 @@ pub fn project(cli: &Cli, cmd: &ProjectCmd) -> Result<()> {
             reg.select(name)?;
             reg.save(&cli.root)?;
             println!("当前项目 = {name}");
+        }
+        ProjectCmd::Pair { name, peer_root } => {
+            // 原样存对端路径（那是**对端**的写法），只把 Windows 的反斜杠留成它自己的样子：
+            // 校验它等于替对端决定规矩，而对端可能是 Linux。空串要挡——空路径会让 push 拼出
+            // `--root ""`，那是往一个谁都说不清的地方写。
+            if peer_root.trim().is_empty() {
+                return Err(Error::BadInput(
+                    "对端站点根不能是空的；给对端 `twosync --root <目录>` 用的那个 <目录>".to_string(),
+                ));
+            }
+            reg.pair(name, peer_root)?;
+            reg.save(&cli.root)?;
+            println!("已配对 {name} → 对端站点根 {peer_root}");
+            println!(
+                "注意      = 只配本端还不够：§9.5.3 要**两边都确认**。对端也得在那台机器上跑一次\
+                 `twosync --root <对端根> project pair {name} <本端站点根>`"
+            );
+        }
+        ProjectCmd::Unpair { name } => {
+            let had = reg.unpair(name)?;
+            reg.save(&cli.root)?;
+            println!(
+                "{}",
+                if had {
+                    format!("已取消 {name} 的配对（历史、CAS、工作树都没动；push 会先拒，直到重新 pair）")
+                } else {
+                    format!("{name} 本来就没配对")
+                }
+            );
         }
         ProjectCmd::Remove { name, purge } => {
             // 先判 `--purge` 再动手：回收还不支持，不能把注册表改了才说后半截没做。

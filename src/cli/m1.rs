@@ -101,8 +101,9 @@ impl Duplex {
                 let status = c.wait()?;
                 if !status.success() {
                     return Err(Error::BadInput(format!(
-                        "ssh 退出码 {status}：会话帧已经报完，但对端进程非零退出 ⇒ \
-                         真实原因在**远端**的 stderr 里（agent 的诊断都写那一侧）"
+                        "对端进程退出码 {status}：会话帧已经报完，但它非零退出 ⇒ \
+                         真实原因在**远端**的 stderr 里（agent 的诊断都写那一侧）。两种非零退出要分得开：\
+                         项目级拒绝（没注册/没配对）走这一支，commit 级拒绝（FR-10 熔断）是正常收尾、退出码 0"
                     )));
                 }
                 Ok(())
@@ -136,7 +137,7 @@ pub fn push(
         )));
     }
 
-    let remote_root = remote_root.unwrap_or(".");
+    let remote_root = paired_root(cli, &name, remote_root)?;
     // 远端命令整体交给对端的 shell 解析，所以路径自己带引号。
     let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
     let child = Command::new("ssh")
@@ -224,13 +225,16 @@ pub fn push(
 pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
     let db = cli.store()?;
     let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
-    let allowed: Vec<String> = match only {
-        Some(n) => vec![n.to_string()],
-        None => {
-            let reg = crate::cli::registry::Registry::load(&cli.root)?;
-            reg.projects.keys().cloned().collect()
-        }
-    };
+    // 白名单 = 本端注册表（`--project` 再收窄到那一个）。注册表一定要读：§9.5.3 的配对记录就在
+    // 里面，只看"名字在不在"等于没查配对。
+    let mut projects = crate::cli::registry::Registry::load(&cli.root)?.projects;
+    if let Some(n) = only {
+        projects = projects
+            .into_iter()
+            .filter(|(name, _)| name == n)
+            .collect::<std::collections::BTreeMap<_, _>>();
+    }
+    let projects = projects;
     // 服务端在 Hello 里报的是**本站点的身份**（`.twosync/site-id`），不是环境变量：
     // 发起端的 TOFU 表要绑的是一个稳定的东西，而"谁调用我时传什么"是可以随便改的。
     let site = site_id(&cli.root)?;
@@ -244,8 +248,17 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
 
     let mut sessions = 0usize;
     loop {
-        let mut resolve = |name: &str| -> Option<u32> {
-            allowed.iter().any(|n| n == name).then(|| keys::project_id(name))
+        let mut resolve = |name: &str| -> std::result::Result<u32, String> {
+            let Some(p) = projects.get(name) else {
+                return Err("本端没注册这个项目：先 `project add`（§9.5.3 绝不自动建目录）".to_string());
+            };
+            // 注册了不等于愿意收：本端也得配过对（两边各一次 = "两边都确认"）。
+            if p.peer_path.is_none() {
+                return Err(format!(
+                    "本端注册了但没配对：先 `project pair {name} <对端站点根>`"
+                ));
+            }
+            Ok(keys::project_id(name))
         };
         match session::serve(&mut io, &*db, &cas, &site, !0, &mut resolve, false) {
             Ok(rep) => {
@@ -481,4 +494,35 @@ pub fn peer(cli: &Cli, cmd: PeerCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// §9.5.3 的发起端那一半：**没配对的项目推不出去**。单独成一个函数不是为了好看，是因为
+/// 这条判断必须能被测到——`push` 剩下的部分要 ssh，而这半截不需要。
+///
+/// `--remote-root` 只允许改"写到哪个目录"，**不能代替配对**：能不能写仍然由对端那一侧的
+/// 配对记录决定（两边各确认一次）。覆盖与记录不一致时打印一句再照办——人会拿它连测试站点，
+/// 静默拒绝比警告更烦人，但这句话必须留下，否则改了路径却以为配对生效。
+pub fn paired_root(cli: &Cli, name: &str, over: Option<&str>) -> Result<String> {
+    let reg = crate::cli::registry::Registry::load(&cli.root)?;
+    let paired = match reg.projects.get(name) {
+        Some(p) => p.peer_path.clone(),
+        None => return Err(Error::Registry(format!("没有项目 {name}；先 project add"))),
+    };
+    let Some(paired) = paired else {
+        return Err(Error::BadInput(format!(
+            "项目 {name:?} 还没配对，推不出去：先 `project pair {name} <对端站点根>`（§9.5.3）。\n  \
+             --remote-root 不能代替这一步——它只决定写到哪个目录，不决定对端愿不愿意收"
+        )));
+    };
+    match over {
+        Some(o) if o != paired.as_str() => {
+            println!(
+                "注意      = 远端站点根用了 --remote-root {o}，与配对记录 {paired} 不一致；\
+                 只影响写到哪个目录，配对本身仍然算数"
+            );
+            Ok(o.to_string())
+        }
+        Some(o) => Ok(o.to_string()),
+        None => Ok(paired),
+    }
 }

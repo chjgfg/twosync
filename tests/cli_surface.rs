@@ -118,3 +118,38 @@ fn version_reports_effective_values_with_their_source() {
     let db = open_store(&site.root(), EngineKind::LsmTree).unwrap();
     assert_eq!(db.health().total_rows, 0, "version 不该碰库");
 }
+
+/// §9.5.3 的发起端那一半：`push` 的目标目录来自**配对记录**，而不是随手给的一个路径。
+/// 这条判断单独可测，是因为 `push` 剩下的部分要 ssh，而这半截不要。
+#[test]
+fn push_needs_a_pairing_and_remote_root_cannot_replace_it() {
+    use twosync::cli::m1;
+    use twosync::cli::registry::Registry;
+
+    let site = Site::new(&[("a.bin", b"x".as_slice())]);
+    let cli = site.cli();
+
+    // 注册了但没配对 ⇒ 拒，并且报错里必须给出"怎么办"
+    let e = m1::paired_root(&cli, "p", None).expect_err("没配对就该拒");
+    let msg = e.to_string();
+    assert!(msg.contains("还没配对") && msg.contains("project pair"), "报错要给出路：{msg}");
+
+    // 拿 `--remote-root` 也绕不过去：它改的是"写到哪个目录"，不是"对端愿不愿意收"
+    let e = m1::paired_root(&cli, "p", Some("D:/elsewhere")).expect_err("覆盖不等于配对");
+    assert!(e.to_string().contains("--remote-root"), "报错要说明这一点：{e}");
+
+    // 配上对：默认拿记录的那个；显式覆盖时以覆盖为准（上面已经警告过）
+    let mut reg = Registry::load(&site.root()).unwrap();
+    reg.pair("p", "D:/peer").unwrap();
+    reg.save(&site.root()).unwrap();
+    assert_eq!(m1::paired_root(&cli, "p", None).unwrap(), "D:/peer");
+    assert_eq!(
+        m1::paired_root(&cli, "p", Some("D:/other")).unwrap(),
+        "D:/other",
+        "覆盖要真的生效，否则 --remote-root 就是个骗人的旗标"
+    );
+
+    // 没这个项目是另一种错，别和"没配对"混成一类
+    let e = m1::paired_root(&cli, "nonesuch", None).expect_err("没有这个项目");
+    assert!(e.to_string().contains("没有项目"), "要说清是没注册：{e}");
+}

@@ -245,7 +245,7 @@ fn round(
     std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let cas_b = b.cas();
-            let mut resolve = |_n: &str| Some(b.pid);
+            let mut resolve = |_n: &str| Ok::<u32, String>(b.pid);
             session::serve(&mut pb, &*b.db, &cas_b, b"peer-b", 0xFFFF_FFFF, &mut resolve, false)
         });
         let cas_a = a.cas();
@@ -282,9 +282,10 @@ fn opts<'a>(project: &'a str) -> PushOpts<'a> {
 /// 命令行可执行文件（cargo 给集成测试留的 `CARGO_BIN_EXE_<name>`，它会自动把 bin 编出来）。
 const EXE: &str = env!("CARGO_BIN_EXE_twosync");
 
-/// 在一个空目录上注册项目（`agent` 的白名单就是注册表，§9.5.3）。
-fn register(exe: &str, root: &Path, project: &str) {
-    fs::create_dir_all(root.join(project)).expect("对端项目目录");
+/// 在一个空目录上**只注册**项目（不配对）。§9.5.3 之后"注册了"不等于"愿意收"，
+/// 所以这一条专门给"没配对就该拒"的用例用。
+fn add_project(exe: &str, root: &Path, project: &str) {
+    fs::create_dir_all(root.join(project)).expect("项目目录");
     let out = Command::new(exe)
         .args(["--root", &root.to_string_lossy(), "project", "add", project])
         .output()
@@ -292,6 +293,29 @@ fn register(exe: &str, root: &Path, project: &str) {
     assert!(
         out.status.success(),
         "project add 失败：{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// 注册 + 配对（§9.5.3：两边各确认一次）。`agent` 的白名单是"注册且已配对"，
+/// 所以绝大多数用例走这一条；`--remote-root`/`peer_root` 在这里只是个占位路径，
+/// 会话不读它的内容。
+fn register(exe: &str, root: &Path, project: &str, peer_root: &str) {
+    add_project(exe, root, project);
+    let out = Command::new(exe)
+        .args([
+            "--root",
+            &root.to_string_lossy(),
+            "project",
+            "pair",
+            project,
+            peer_root,
+        ])
+        .output()
+        .expect("起不了 project pair");
+    assert!(
+        out.status.success(),
+        "project pair 失败：{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -365,7 +389,7 @@ fn a_second_push_sends_no_bytes() {
     let (first, second) = std::thread::scope(|sc| {
         let h = sc.spawn(|| {
             let cas_b = b.cas();
-            let mut resolve = |_n: &str| Some(b.pid);
+            let mut resolve = |_n: &str| Ok::<u32, String>(b.pid);
             let one = session::serve(&mut pb, &*b.db, &cas_b, b"peer-b", 0xFFFF_FFFF, &mut resolve, false)
                 .expect("serve 第一场");
             let two = session::serve(&mut pb, &*b.db, &cas_b, b"peer-b", 0xFFFF_FFFF, &mut resolve, false)
@@ -617,7 +641,7 @@ fn push_over_a_real_child_process_and_pipes() {
     assert!(sent >= 3, "3 个文件至少 3 个块：{sent}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
-    register(EXE, b_tmp.path(), PROJECT);
+    register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
     let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
 
     let rep = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
@@ -683,7 +707,7 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
     assert_eq!(blocks.len(), 3, "3 个文件各 1 块：{blocks:?}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
-    register(EXE, b_tmp.path(), PROJECT);
+    register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
     // 这一条**不能用 `agent_child`**：它要自己捏着子进程的 stdin/stdout 手工驱动协议，
     // 好在"只写完两块"的那一刻把进程杀掉。
     let mut child = Command::new(EXE)
@@ -821,7 +845,7 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
     a.commit(&refs, 1);
 
     let b1 = tempfile::tempdir().expect("对端站点一");
-    register(EXE, b1.path(), PROJECT);
+    register(EXE, b1.path(), PROJECT, "D:/peer-site-root");
     let o = PushOpts {
         peer_name: b"peer-b",
         ..opts(PROJECT)
@@ -850,7 +874,7 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
 
     // ③ **换个站点、同一个对端名字** ⇒ 拒。这就是 TOFU 与"信任一切"的差别。
     let b2 = tempfile::tempdir().expect("对端站点二");
-    register(EXE, b2.path(), PROJECT);
+    register(EXE, b2.path(), PROJECT, "D:/peer-site-root");
     let mut io = agent_child(EXE, b2.path(), PROJECT);
     let err = session::push(&mut io, &*a.db, &a.cas(), &o)
         .expect_err("名字相同、站点不同 ⇒ 必须拒，不是提示");
@@ -966,5 +990,76 @@ fn transfer_bytes_for_the_table() {
         second.bytes_sent as f64 / 1048576.0,
         second.commits,
         second.blocks_skipped
+    );
+}
+
+/// §9.5.3 的接收端那一半：**注册了但没配对 ⇒ 拒**，而且一个字都不许落。
+/// 这条存在的理由是"绝不自动在对端建目录"——一个打错的项目名如果只要注册过就收，
+/// 就等于把整棵历史写进对方一个没准备过的格子里。
+#[test]
+fn the_agent_refuses_a_registered_but_unpaired_project() {
+    let a = Site::open();
+    let files = seed(2);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
+
+    let b = tempfile::tempdir().expect("对端站点");
+    add_project(EXE, b.path(), PROJECT); // 只注册，不 pair
+    let mut io = agent_child(EXE, b.path(), PROJECT);
+    let err = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
+        .expect_err("没配对就该拒，不是收下来再说");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("没配对") || msg.contains("project pair"),
+        "报错要给出一条能走的路，而不是'协议走样'：{msg}"
+    );
+    // 项目级拒绝（没注册 / 没配对）让 agent **非零退出**，而 commit 级拒绝（FR-10 熔断）是正常
+    // 收尾、退出码 0。这个区别是故意的：前者是"我连这个项目都不谈"，后者是"谈了，但你这一版我不收"。
+    let done = io.finish();
+    assert!(
+        matches!(&done, Err(e) if e.to_string().contains("退出码")),
+        "项目级拒绝要让发起端看见非零收尾：{done:?}"
+    );
+
+    let b_db = open_store(b.path(), EngineKind::LsmTree).expect("开对端的库");
+    assert!(
+        build::ref_heads(&*b_db, keys::project_id(PROJECT), MAIN)
+            .expect("读 head")
+            .is_empty(),
+        "被拒的会话不许动 head"
+    );
+    assert_eq!(
+        count_blocks(&objects_dir(b.path())),
+        0,
+        "也不许落一个块：拒绝发生在开场，对象一个都没发"
+    );
+    drop(b_db);
+
+    // 配上对之后，同一份历史就该收得下了（说明刚才那一刀是配对挡的，不是别的东西）
+    let out = Command::new(EXE)
+        .args([
+            "--root",
+            &b.path().to_string_lossy(),
+            "project",
+            "pair",
+            PROJECT,
+            "D:/peer-site-root",
+        ])
+        .output()
+        .expect("起不了 project pair");
+    assert!(out.status.success(), "pair 失败：{}", String::from_utf8_lossy(&out.stderr));
+    let mut io = agent_child(EXE, b.path(), PROJECT);
+    let rep = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
+        .expect("配对之后同一份历史就该收下");
+    io.finish().expect("agent 收尾");
+    assert!(rep.bytes_sent > 0, "这一把是真的传了东西");
+    let b_db = open_store(b.path(), EngineKind::LsmTree).expect("再开对端的库");
+    assert_eq!(
+        build::all_ref_heads(&*b_db, keys::project_id(PROJECT), None).expect("读 head"),
+        a.heads(),
+        "配上对之后 head 追平了"
     );
 }

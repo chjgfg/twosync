@@ -256,6 +256,10 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
     )?;
     let (their_heads, their_ancestors) = match frame::decode(io)? {
         Proto::HeadsState { heads, ancestors } => Ok((heads, ancestors)),
+        // 对端在报名字之后就Abort = 它不认这个项目（没注册，或注册了没配对，§9.5.3）。
+        // 不接这一支的话这里会报"期望 HeadsState，收到 Abort{…}"，把一条**有原因的拒绝**
+        // 说成一次协议走样——那会把人往错的方向查。
+        Proto::Abort { msg } => Err(Error::BadInput(format!("对端拒绝开场：{msg}"))),
         other => Err(unexpected(&other, "HeadsState")),
     }?;
 
@@ -377,7 +381,11 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
     Ok(rep)
 }
 
-/// 服务端一场会话。`resolve` 把项目名换成本端 pid（没注册就 `None`）。
+/// 服务端一场会话。`resolve` 把项目名换成本端 pid，**换不成就给一句给人看的原因**。
+///
+/// 为什么是 `Result` 而不是 `Option`：§9.5.3 之后"认不得这个项目"有两种完全不同的理由——
+/// 没注册（`project add`）与注册了但没配对（`project pair`）。把它们都说成"没有这个项目"，
+/// 对端就只能猜；而猜的表现是一边反复重试一条永远不会被接受的会话。
 ///
 /// 一条连接上可以连着调用多次 ⇒ FR-19 的"20 个 project 一轮只 1 次认证"就是外层循环：
 /// 每场会话只多一轮 `BeginSession`/`HeadsState`，不再重新拨号、不再重新输密码。
@@ -387,7 +395,7 @@ pub fn serve(
     cas: &Cas,
     my_peer_id: &[u8],
     my_caps: u32,
-    resolve: &mut dyn FnMut(&str) -> Option<ProjectId>,
+    resolve: &mut dyn FnMut(&str) -> std::result::Result<ProjectId, String>,
     allow_mass_delete: bool,
 ) -> Result<ServeReport> {
     let mut rep = ServeReport::default();
@@ -419,10 +427,14 @@ pub fn serve(
         other => return Err(unexpected(&other, "BeginSession")),
     };
     frame::check_project_id(&project, pid_claimed)?;
-    let Some(pid) = resolve(&project) else {
-        let msg = format!("本端没有注册项目 {project:?}：先 `project add` 再同步");
-        frame::encode(io, &Proto::Abort { msg: msg.clone() })?;
-        return Err(Error::BadInput(msg));
+    let pid = match resolve(&project) {
+        Ok(p) => p,
+        Err(why) => {
+            // 原因原样回给对方：他那边看到的是"我对端不肯收这个项目"，而不是一句我们替他编的猜测。
+            let msg = format!("本端拒绝项目 {project:?}：{why}");
+            frame::encode(io, &Proto::Abort { msg: msg.clone() })?;
+            return Err(Error::BadInput(msg));
+        }
     };
     rep.project = project.clone();
 

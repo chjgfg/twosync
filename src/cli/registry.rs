@@ -114,6 +114,26 @@ impl Registry {
         Ok(p)
     }
 
+    /// 记下"这个项目的对端站点根"（§9.5.3 的配对）。**原样存**，不按本端的规则校验：
+    /// 那是**对端**的路径，对端若是 Linux 就得写 `/home/...`，拿 `check_rel_path` 管它是错的。
+    pub fn pair(&mut self, name: &str, peer_root: &str) -> Result<&mut Project> {
+        let p = self
+            .projects
+            .get_mut(name)
+            .ok_or_else(|| Error::Registry(format!("没有项目 {name}；先 project add")))?;
+        p.peer_path = Some(peer_root.to_string());
+        Ok(p)
+    }
+
+    /// 取消配对：只清记录。历史、CAS、工作树一概不动（与 `remove` 同一个口径）。
+    pub fn unpair(&mut self, name: &str) -> Result<bool> {
+        let p = self
+            .projects
+            .get_mut(name)
+            .ok_or_else(|| Error::Registry(format!("没有项目 {name}")))?;
+        Ok(p.peer_path.take().is_some())
+    }
+
     pub fn select(&mut self, name: &str) -> Result<()> {
         if !self.projects.contains_key(name) {
             let err = format!("没有项目 {name}；先 project add");
