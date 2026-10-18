@@ -34,6 +34,7 @@
 //! 不可达对象与归零块的回收拆成"先落 `D` 表、后限额删文件"两趟，细节与能力边界写在
 //! [`store::gc`](crate::store::gc) 的模块头。
 
+use std::format;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
 
