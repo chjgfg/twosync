@@ -221,11 +221,15 @@ pub enum Cmd {
         project: Option<String>,
     },
 
-    /// 回收：现在只做**引擎版本链**那一半（全库一轮 `vacuum`）；块级配额淘汰（FR-9）还没做
+    /// 回收：两半都在——**引擎版本链**（全库一轮 `vacuum`）与 §9.3 的 **mark-sweep**（`--sweep`）
     ///
     /// 为什么需要它：10 GiB 基线里"0 变更的空转提交 45.2 s → 246.8 s"，同期 `rows_above_one`
     /// 20 215 → 82 704。每轮 `scan` 都要给每一行盖新版本（活性判据的命根子），
     /// 而**没人调用过 vacuum** —— 这一条补的就是那半个调用。
+    ///
+    /// `--sweep` 那半是**两趟**：先记账（不可达对象删行、归零的块落 `D` 表），再按限额与速率闸删文件。
+    /// 还没做的那半是**配额淘汰**：保留集本身就超配额时这里不擅自丢历史，只把账报出来
+    /// （决定丢哪一版是 M4 的 `reset`/`prune --expire`）。
     Gc {
         /// 顺手把引擎的自动回收切片宽度设成 N 行（0 = 关闭）
         ///
@@ -243,6 +247,18 @@ pub enum Cmd {
         /// 配合 `--sweep`：真的落改动。不带就是 dry-run
         #[arg(long)]
         apply: bool,
+        /// 一趟 unlink 最多删几个块文件（§9.3 的"可中断、可续"）；0 = 不限个数，只受 `--max-mbps` 管
+        ///
+        /// 截断不会丢账：没删的那几个仍然留在 `D`（pending-delete）表上，下一次 `gc --sweep --apply`
+        /// 从同一张表接着删。用例把这条演成断言（限额 1 删一半、换个进程重开库仍然认）。
+        #[arg(long, default_value_t = 0)]
+        unlink_max_files: usize,
+        /// **删除**字节的速率上限（MiB/s，FR-15 的令牌桶）。0 = 不限速
+        ///
+        /// 与 `commit --max-mbps` 是同一个桶的形状：扣的是"这次操作搬动的字节"，
+        /// 所以一次 `gc` 不会在单核机上突然做几万次 unlink + 元数据更新。
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
         /// 配额上限（MiB，站点级）。0 = 用 §14 Q12 的默认口径（工作树体积 × 20%，只管首份之后的增量）
         #[arg(long, default_value_t = 0.0)]
         quota_mib: f64,
@@ -259,9 +275,6 @@ pub enum Cmd {
     },
 
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
-    // ── M2 ── daemon / watch
-    // ── M3 ── pull / sync
-    // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
     // ── M2 ── daemon / watch
     // ── M3 ── pull / sync
     // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect

@@ -21,25 +21,43 @@
 //! 的历史，看不见另一个项目；而 `K`/`k` 那两行是"每次采纳一份清单就 +1"的账（`build::adopt_blob`），
 //! 与它对称地 -1 才是正确的动作。所以：**blob 被回收 ⇒ 它的块 refcnt-1；refcnt 归 0 ⇒ 文件才删**。
 //!
-//! # 顺序（FR-13 的镜像）
+//! # 顺序（FR-13 的镜像）+ 为什么删文件要单独一趟
 //!
 //! 先改账（`K`/`k`/`B`/`T`/`C` 行），**后**删文件。反过来崩在中间就会出现"清单还引用着一个已经不存在的
-//! 块"——那是要报错给用户的磁盘级不一致。按这里的顺序，崩在中间留下的是"没人引用的孤儿文件"，
-//! 下一次 sweep 会把它算进 `orphan_files` 报出来。
+//! 块"——那是要报错给用户的磁盘级不一致。所以 [`sweep`] 只做记账：refcnt 归零的块写进
+//! **pending-delete 表**（§9.3 的那个列表，`D|p|hash`），真正碰文件系统的是 [`unlink_pending`]，
+//! 它每删一个先过 [`Cas::pace`] 的桶（FR-15），并受 `max_files` 限额。分成两趟之后最坏情况是
+//! "账上说该删、文件还在"——那是垃圾，不是损坏，下一趟接着删就行。
 //!
 //! # 一处与 §9.2 那句话的偏差（故意的）
 //!
 //! §9.2 说"GC 找 refcnt 0 走 `k|p|0u64_be` 前缀扫，不用全表扫"。**这一版改成了扫全部 `K` 行**，
 //! 因为 dry-run 必须能报出"**将要**归零几个块"，而那些块此刻还挂在 `k|p|1`、`k|p|2` 上——只扫 0 档
 //! 会永远报 0（`tests/gc_sweep.rs` 第一次跑就抓到这个）。`k` 索引照旧维护（`adopt_blob`/这里的删除
-//! 都动它），将来要做"只清已归零的"快速通道随时可以再走那条索引。代价：一趟 sweep 是 O(块数) 次
-//! 点查，10 GiB 站点是 21 792 次 ⇒ 与一次 `scan` 同量级，可以接受。
+//! 都动它），将来要做"只清已归零的"快速通道随时可以再走那条索引。
+//!
+//! 代价不是"点查次数"：0.4.0 的门面**每次读调用都折一遍全库**（§9.6.1、§14 Q10），逐块点查在 10 GiB
+//! 站点上就是 21 792 次全库折叠。所以 [`scan_blocks`] 一次 `K|p` 前缀扫拿到
+//! `(hash, size, refcnt)` 全量，归零判断、配额账与孤儿核对都在内存里做。
+//!
+//! 如实把这条成本的形状写清楚：**"读全部块"的那 21 792 折变成了 1 折，但每回收一个对象仍然要折一次**
+//! （[`decrement_block`] 的读+写、清单/`C`/`T` 行的删除各一次）⇒ 总账是 `O(被回收的对象数)` 折，
+//! 而不是 `O(库里全部块数)` 折。稳态（没什么可回收）因此是便宜的；一次删掉一整个 10 GiB 历史则是贵的，
+//! 而那正是 §14 Q14（门面上没有分片版 `vacuum_bounded`）还没解决的地方——**别把这条当成已解决**。
+//!
+//! 另有一格内存账：`K` 行每条约 40 字节（32 字节 hash 键 + 值），21 792 条 ≈ 1 MB 量级，
+//! 10 GiB 站点仍在 RSS 80 MB 预算内；真要扩到百万块，这里得改成分片扫（记进 §15 的已知限制，
+//! 不假装已经解决）。
 //!
 //! # 一条硬前提：单写者
 //!
 //! [`sweep`] 不能与 `commit`/`push`/`agent` 并发。采纳一份清单是"写 `B` 行 → 逐块 `refcnt++`"两步，
-//! 中间插一次 sweep 就会把一份**正在被采纳**的清单判成不可达并把它独占的块删掉。全站本来就是
-//! 单写者设计（§9.6.4），这里只是把那条前提写明。
+//! 中间插一次 sweep 就会把一份**正在被采纳**的清单判成不可达并把它独占的块删掉。
+//!
+//! 这条前提在跨进程方向上**不是靠自觉**：`storage_engines` 拿的是库级文件锁，第二个句柄 open 直接被拒
+//! （实测 `kind: WouldBlock`，报文原话"请先释放全部句柄再 open"），所以"一条 `gc` 与一条 `commit`
+//! 同时握着同一个站点"在这台机器上根本开不了张（`tests/gc_sweep.rs` 的 `the_pending_table_survives_a_reopen`
+//! 就是先撞上这把锁才写对的）。同一进程内仍然只有"一条命令一个句柄"这个约定在守着。
 //!
 //! # 跑法
 //!
@@ -65,14 +83,110 @@ pub struct Plan {
     pub commits_dropped: usize,
     pub trees_dropped: usize,
     pub blobs_dropped: usize,
-    /// refcnt 归 0 之后**真删掉**的块文件数与字节。
+    /// refcnt 归零、**已记进 pending 表**的块数与字节（§9.3 的那个列表）。
+    /// 这一格不等于"文件已删"——删是 [`unlink_pending`] 那一趟的活。
+    pub blocks_pending: usize,
+    pub bytes_pending: u64,
+    /// pending 表里现在一共欠着多少（含上一次崩在中途没删完的）。
+    pub pending_total: usize,
+    pub pending_bytes: u64,
+    /// 已经删掉的文件数与字节：[`sweep`] 自己不删，所以它恒为 0，由 `run_gc` 在 unlink 之后填。
     pub blocks_unlinked: usize,
     pub bytes_freed: u64,
-    /// refcnt 归 0 但文件本来就不在（崩在中间过、或手工挪走过）：账要清，但没什么可删。
+    /// pending 表上有、文件本来就不在（崩在一次 unlink 的中间、或手工挪走过）：账要清，但没什么可删。
     pub blocks_missing: usize,
     /// 盘上有文件、库里没有 `K` 行 = 崩溃留下的孤儿。**这一版只数不删**（见模块头那条顺序）。
     pub orphan_files: usize,
     pub orphan_bytes: u64,
+}
+
+/// pending-delete 一行的值。带 `size` 是为了让 unlink 那一趟**不必回头点查 `K`**
+/// （门面每次读调用折全库，§9.6.1：一次要删两万个块时，这一下就是两万折）。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+pub struct PendingDel {
+    pub size: u32,
+}
+
+/// 一次限额 unlink 的账。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Unlinked {
+    pub files: usize,
+    pub bytes: u64,
+    pub missing: usize,
+    pub left: usize,
+}
+
+/// 把 pending 表里的块**按 FR-15 的桶限额删掉**。
+///
+/// 与 [`sweep`] 分成两个动作就是 §9.3 要的形状：归零是记账，删文件是后面一趟可中断、可续、
+/// 可限速的活。每删一个之前先从桶里扣它的字节（`Cas::pace`），所以一次 `gc` 不会在单核机上
+/// 制造"突然几千次 unlink + 元数据更新"的尖峰。
+pub fn unlink_pending(
+    db: &dyn KvEngine,
+    cas: &Cas,
+    pid: ProjectId,
+    max_files: usize,
+    dry: bool,
+) -> Result<Unlinked> {
+    let mut out = Unlinked::default();
+    let mut prefix = vec![keys::TAG_PENDING];
+    prefix.extend_from_slice(&pid.to_be_bytes());
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    if rows.len() as usize > max_files {
+        out.left = rows.len() as usize - max_files;
+    }
+    for row in rows.iter().take(max_files) {
+        let Some(tail) = row.key.get(prefix.len()..) else { continue };
+        if tail.len() != 32 {
+            continue;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(tail);
+        let size = match &row.value {
+            Some(v) => keys::rec::<PendingDel>(v, "PendingDel")?.size,
+            None => 0,
+        };
+        if dry {
+            // 只报账：**不扣桶**。桶是"这台机器真的吃掉了这些 IO 预算"的账，dry-run 什么都没删。
+            out.files += 1;
+            out.bytes += u64::from(size);
+            continue;
+        }
+        // 扣桶在前：睡的是"这次删除的额度"，所以被限速的是删除本身，不是清账。
+        cas.pace(u64::from(size));
+        // 清账（K / k / D）在前、删文件在后：崩在中间留下的是"该删的文件还在"，那是垃圾不是损坏；
+        // 反过来就会留下"账上还在、文件已经没了"，而 `verify`/`restore` 会把那当成磁盘损坏报出去。
+        let tx = db.begin();
+        tx.delete(&keys::pending_key(pid, &h));
+        tx.delete(&keys::block_key(pid, &h));
+        tx.delete(&keys::refcnt_key(pid, 0, &h));
+        tx.commit();
+        if cas.remove_block(&h)? {
+            out.files += 1;
+            out.bytes += u64::from(size);
+        } else {
+            out.missing += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// pending 表现在的规模（报账用；也是"上一次崩在哪儿"的读数）。
+pub fn pending_total(db: &dyn KvEngine, pid: ProjectId) -> Result<(usize, u64)> {
+    let mut prefix = vec![keys::TAG_PENDING];
+    prefix.extend_from_slice(&pid.to_be_bytes());
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let mut bytes = 0u64;
+    for row in &rows {
+        if let Some(v) = &row.value {
+            bytes += u64::from(keys::rec::<PendingDel>(v, "PendingDel")?.size);
+        }
+    }
+    Ok((rows.len(), bytes))
 }
 
 /// 跑一趟 mark-sweep。`dry = true` 只算账、不落任何改动。
@@ -146,10 +260,10 @@ pub fn sweep(db: &dyn KvEngine, cas: &Cas, pid: ProjectId, dry: bool) -> Result<
         }
     }
 
-    if dry {
-        p.blocks_unlinked = free.len();
-        p.bytes_freed = free.iter().map(|(_, s)| u64::from(*s)).sum();
-    } else {
+    // 本次归零的块 = 待删账。**两种模式都先算出来**，只有副作用不同。
+    p.blocks_pending = free.len();
+    p.bytes_pending = free.iter().map(|(_, s)| u64::from(*s)).sum();
+    if !dry {
         for blob in &drop_blobs {
             for b in blob.blocks.iter().filter(|b| !b.zero) {
                 decrement_block(db, pid, &b.hash)?;
@@ -158,20 +272,29 @@ pub fn sweep(db: &dyn KvEngine, cas: &Cas, pid: ProjectId, dry: bool) -> Result<
             tx.delete(&keys::blob_key(pid, &blob.hash));
             tx.commit();
         }
-        // 归零的块：**先清账，再删文件**。反过来崩在中间就留下"清单引用不存在的块"，
-        // 那是要报错给用户的磁盘级不一致；按这里的顺序崩了只留下孤儿文件，可数、下次还能清。
+        // 归零的块**不在这里删文件**：落 pending-delete 列表（§9.3），删是后面那一趟限额的活。
+        // 为什么必须分两趟：在 decrements 现场 `unlink` 的话，崩在中间就是"清单引用一个不存在
+        // 的块"——那是要报错给用户的磁盘级不一致，而且来不及救。分成两趟之后，最坏情况是
+        // "账上说该删、文件还在"，那是垃圾，不是损坏。
         for (h, size) in &free {
+            let body = keys::wrap(keys::enc(&PendingDel { size: *size }, "PendingDel")?);
             let tx = db.begin();
-            tx.delete(&keys::refcnt_key(pid, 0, h));
-            tx.delete(&keys::block_key(pid, h));
-            tx.commit();
-            if cas.remove_block(h)? {
-                p.blocks_unlinked += 1;
-                p.bytes_freed += u64::from(*size);
-            } else {
-                p.blocks_missing += 1;
+            if !tx.set(&keys::pending_key(pid, h), body) {
+                return Err(Error::WriteConflict(keys::short(h)));
             }
+            tx.commit();
         }
+    }
+
+    // pending 表的规模：含上一次崩在中途、还没删完的那些。
+    let (pend_now, pend_bytes) = pending_total(db, pid)?;
+    p.pending_total = pend_now;
+    p.pending_bytes = pend_bytes;
+    if dry {
+        // dry 模式没写表，所以表上那个数是"现在的"；本次将要记进去的得自己加上，
+        // 否则"先看账"这一步看不到总量（§17 补记十九）。
+        p.pending_total += free.len();
+        p.pending_bytes += p.bytes_pending;
     }
 
     // ── 孤儿文件：盘上有、账上没有 ──

@@ -8,6 +8,15 @@
 //! 历史删掉，而且删完之后 `doctor`/`status` 看起来都是干净的。所以每个用例都要**两头都断言**：
 //! 不可达的确实消失了，**同时**可达的对象、清单、块、字节数一个都没少。
 //!
+//! # §9.3 的两趟形状，每趟都要单独断言
+//!
+//! `sweep` 只**记账**（refcnt 归零 ⇒ 往 `D` 表写一行），`unlink_pending` 才碰文件系统（限额 + 过桶）。
+//! 分开是为了崩溃：崩在两趟之间留下的是"该删的文件还在"（垃圾，下一趟接着删），而不是"清单引用一个
+//! 不存在的块"（损坏）。所以这里的用例断言的是**五种**残留形状都各归各位：
+//! 记账了但没删（限额 0）、删了一半（限额 1，剩下的仍在表上）、**换个进程重开库**还能接着删、
+//! 崩在中途（文件已没、账还在 ⇒ `missing`）、以及"删除真的扣了 FR-15 的桶"
+//! （用 `Cas::paced_bytes` 核对字节数，不掐墙钟）。
+//!
 //! # 测试用的形状
 //!
 //! 块大小取 4 KiB（`Cas::new(.., BLOCK)`），这样"两个不同 blob 共享一个块"能用几 KiB 的文件造出来：
@@ -95,6 +104,17 @@ impl Site {
 
     fn heads(&self) -> Vec<Hash> {
         build::ref_heads(&*self.db, self.pid, build::MAIN).expect("heads")
+    }
+
+    /// 把站点关掉（**释放库锁**）但保住临时目录：用来演"上一条命令退出、下一条命令起来"。
+    ///
+    /// 必须真的 drop：`storage_engines` 拿的是库级文件锁，同进程里两个句柄并存会直接被拒
+    /// （实测 `kind: WouldBlock`，"数据库锁被占用 … 请先释放全部句柄再 open"）。这条也正是
+    /// §9.6.4 单写者前提在引擎侧的兜底——`gc` 与 `commit` 不可能在两个进程里同时握着库。
+    fn release(site: Site) -> tempfile::TempDir {
+        let Site { db, tmp, .. } = site;
+        drop(db);
+        tmp
     }
 
     fn block_files(&self) -> usize {
@@ -191,15 +211,32 @@ fn an_unreachable_commit_is_swept_while_the_reachable_one_is_untouched() {
     assert_eq!(plan.commits_kept, 1, "保留集就是 C1：{plan:?}");
     assert_eq!(plan.commits_dropped, 1, "C2 该被判不可达");
     assert_eq!(plan.blobs_dropped, 1, "只有 b 的清单不可达");
-    assert_eq!(plan.blocks_unlinked, 1, "只有 Q 那块归零：{plan:?}");
+    assert_eq!(plan.blocks_pending, 1, "只有 Q 那块该被判归零：{plan:?}");
+    assert_eq!(plan.blocks_unlinked, 0, "dry-run 连'已删'都不能报：{plan:?}");
     assert_eq!(site.block_files(), files_before, "dry-run 一个文件都不许删");
+    assert_eq!(
+        count_rows(&*site.db, keys::TAG_PENDING, site.pid),
+        0,
+        "dry-run 也不许往 pending 表上落行"
+    );
 
-    // ── 真回收 ──
+    // ── 真回收：第一趟只记账，删文件是限额的第二趟（§9.3） ──
     let plan = gc::sweep(&*site.db, &site.cas(), site.pid, false).expect("sweep");
     assert_eq!(plan.commits_dropped, 1);
-    assert_eq!(plan.bytes_freed, u64::from(blocks_b[1].1), "释放的字节数要等于那一块");
+    assert_eq!(plan.blocks_pending, 1, "Q 那块该记进 pending 表：{plan:?}");
+    assert_eq!(plan.bytes_pending, u64::from(blocks_b[1].1));
+    assert_eq!(plan.blocks_unlinked, 0, "sweep 自己不删文件");
+    assert!(
+        site.cas().contains(&only_b),
+        "文件必须还在——删除是第二趟可中断、可续的活"
+    );
+    assert_eq!(
+        gc::refcnt_of(&*site.db, site.pid, &only_b).expect("读账"),
+        Some(0),
+        "账已归零，等第二趟清"
+    );
 
-    // 该删的确实没了
+    // 该删的账先清、文件随后删
     assert!(
         build::read_blob(&*site.db, site.pid, &blob_b).is_err(),
         "b 的清单该被删掉"
@@ -209,12 +246,16 @@ fn an_unreachable_commit_is_swept_while_the_reachable_one_is_untouched() {
         vec![c1],
         "`C` 行里只该剩下可达的那一条"
     );
-    assert!(!site.cas().contains(&only_b), "Q 那块的文件该删了");
+    let ul = gc::unlink_pending(&*site.db, &site.cas(), site.pid, usize::MAX, false).expect("unlink");
+    assert_eq!(ul.files, 1, "第二趟删一个：{ul:?}");
+    assert_eq!(ul.bytes, u64::from(blocks_b[1].1));
+    assert!(!site.cas().contains(&only_b), "Q 那块的文件这下该没了");
     assert_eq!(
         gc::refcnt_of(&*site.db, site.pid, &only_b).expect("读账"),
         None,
-        "Q 那块的 `K` 行也该一起清掉（先清账再删文件，反了就会留下悬空引用）"
+        "`K` 行与 pending 行一起清（先清账再删文件，反了就会留下悬空引用）"
     );
+    assert_eq!(gc::pending_total(&*site.db, site.pid).expect("读表"), (0, 0));
 
     // 该留的一个都不能少
     assert!(
@@ -276,11 +317,193 @@ fn a_dry_run_reports_but_changes_nothing() {
     let files = site.block_files();
     let plan = gc::sweep(&*site.db, &site.cas(), site.pid, true).expect("dry");
     assert!(plan.commits_dropped > 0, "dry-run 也要把'将要删什么'报出来");
+    assert_eq!(
+        plan.blocks_pending, 1,
+        "dry-run 的待删数必须报得出来——它原来永远报 0（§17 补记十九）：{plan:?}"
+    );
+    assert!(plan.bytes_pending > 0, "字节数也得报：{plan:?}");
+    assert_eq!(plan.pending_total, 1, "dry 模式把'将记进表'的也算进 total：{plan:?}");
+    assert_eq!(
+        gc::pending_total(&*site.db, site.pid).expect("读表"),
+        (0, 0),
+        "但表上真一个都不许多"
+    );
     assert_eq!(site.block_files(), files, "dry-run 一个文件都不许删");
     assert_eq!(
         count_rows(&*site.db, keys::TAG_BLOB, site.pid),
         2,
         "dry-run 连清单行都不该动"
+    );
+    assert_eq!(
+        count_rows(&*site.db, keys::TAG_PENDING, site.pid),
+        0,
+        "dry-run 也不该落 pending 行"
+    );
+}
+
+/// pending 表存在的意义就是"这一趟没删完，下一趟接着删"。这里演一遍崩在中途：
+/// 记完 pending 之后把文件手工抹掉（等价于"上一趟删了文件但没清账"），第二趟必须
+/// 把账清干净并报出 `missing`，而不是 panic、也不是把垃圾留在表上。
+#[test]
+fn the_pending_list_is_resumable_after_a_crash_mid_unlink() {
+    let p = pattern(0xF00D, 4096);
+    let site = Site::open();
+    let c1 = site.commit(&[("a.bin", &p)], 1);
+    let mut r = p.clone();
+    r.extend_from_slice(&pattern(0xBEEF, 4096));
+    site.commit(&[("a.bin", &p), ("b.bin", &r)], 2);
+    let blob_b = blob_at(&site, "b.bin");
+    let only_b = blocks_of(&*site.db, site.pid, &blob_b)[1].0;
+    build::set_ref(&*site.db, site.pid, build::MAIN, &[c1]).expect("倒回");
+
+    gc::sweep(&*site.db, &site.cas(), site.pid, false).expect("sweep");
+    assert_eq!(gc::pending_total(&*site.db, site.pid).expect("读表").0, 1);
+
+    // 假装上一趟死在"文件已删、账未清"的那一刻
+    let path = site.cas().dir().join(Cas::path_of(&only_b));
+    fs::remove_file(&path).expect("手工抹掉块文件");
+    let ul = gc::unlink_pending(&*site.db, &site.cas(), site.pid, usize::MAX, false).expect("unlink");
+    assert_eq!(ul.missing, 1, "文件已经不在 ⇒ 报 missing，不 panic：{ul:?}");
+    assert_eq!(ul.files, 0);
+    assert_eq!(
+        gc::pending_total(&*site.db, site.pid).expect("再读表"),
+        (0, 0),
+        "账必须清掉，否则下一趟永远背着它"
+    );
+    assert_eq!(
+        gc::refcnt_of(&*site.db, site.pid, &only_b).expect("读账"),
+        None,
+        "`K` 行也跟着清"
+    );
+}
+
+/// `--unlink-max-files` 截断的是"这一趟删几个"，剩下的必须仍然记在表上（可续），
+/// 而不是被顺手丢掉。这里一次删一个，连删三趟，把"可中断、可续"演成断言。
+#[test]
+fn a_bounded_unlink_pass_leaves_the_rest_on_the_pending_list() {
+    let site = Site::open();
+    let keep = pattern(7, 4096);
+    let c1 = site.commit(&[("keep.bin", &keep)], 1);
+    // 第二版多两个文件 ⇒ 两个"只被不可达清单引用"的块，pending 表上该有两条。
+    let x = pattern(0x111, 4096);
+    let y = pattern(0x222, 4096);
+    site.commit(&[("keep.bin", &keep), ("x.bin", &x), ("y.bin", &y)], 2);
+    let bx = blocks_of(&*site.db, site.pid, &blob_at(&site, "x.bin"))[0].0;
+    let by = blocks_of(&*site.db, site.pid, &blob_at(&site, "y.bin"))[0].0;
+    assert_ne!(bx, by, "两块内容不同才测得出限额");
+    build::set_ref(&*site.db, site.pid, build::MAIN, &[c1]).expect("倒回");
+
+    let plan = gc::sweep(&*site.db, &site.cas(), site.pid, false).expect("sweep");
+    assert_eq!(plan.blocks_pending, 2, "两个块该归零：{plan:?}");
+    assert_eq!(
+        gc::pending_total(&*site.db, site.pid).expect("读表"),
+        (2, 8192),
+        "两条各 4 KiB"
+    );
+
+    // 限额 0 ⇒ 一个都不删，但欠着的账必须原样留着，并且报出"还欠几个"。
+    let ul = gc::unlink_pending(&*site.db, &site.cas(), site.pid, 0, false).expect("限额 0");
+    assert_eq!(ul.files, 0, "限额 0 就是 0");
+    assert_eq!(ul.left, 2, "要报出还欠 2 个：{ul:?}");
+    assert!(
+        site.cas().contains(&bx) && site.cas().contains(&by),
+        "文件必须都还在盘上"
+    );
+
+    // 放开一档：删掉一个，另一个仍在表上——这一条是"下一趟接着删"的凭据。
+    let ul = gc::unlink_pending(&*site.db, &site.cas(), site.pid, 1, false).expect("限额 1");
+    assert_eq!(ul.files, 1, "一次只删一个：{ul:?}");
+    assert_eq!(ul.left, 1);
+    assert_eq!(
+        gc::pending_total(&*site.db, site.pid).expect("再读表").0,
+        1,
+        "剩下的仍记在表上，不是被跳过就忘了"
+    );
+    let gone = usize::from(!site.cas().contains(&bx)) + usize::from(!site.cas().contains(&by));
+    assert_eq!(gone, 1, "恰好少了一个文件");
+
+    let ul = gc::unlink_pending(&*site.db, &site.cas(), site.pid, 5, false).expect("放开");
+    assert_eq!(ul.files, 1, "表上只剩一个 ⇒ 限额用不完不该虚报");
+    assert_eq!(ul.left, 0);
+    assert_eq!(gc::pending_total(&*site.db, site.pid).expect("收尾"), (0, 0));
+    assert!(!site.cas().contains(&bx) && !site.cas().contains(&by), "两个都该消失");
+    assert!(
+        site.cas().contains(&blocks_of(&*site.db, site.pid, &blob_at(&site, "keep.bin"))[0].0),
+        "可达的 keep.bin 那块一个趟次都不该被碰到"
+    );
+}
+
+/// FR-15 那句"**删除也过同一个桶**"必须可核对，否则限速只是命令行上一个看起来生效的旋钮。
+/// 这里不掐墙钟（单核机上计时用例本身就是噪声源），改断言"累计扣桶的字节 = 被删块的 size 之和"。
+#[test]
+fn the_unlink_pass_charges_the_same_bucket_as_a_write() {
+    let site = Site::open();
+    let keep = pattern(11, 4096);
+    let c1 = site.commit(&[("keep.bin", &keep)], 1);
+    let x = pattern(0x555, 4096);
+    let y = pattern(0x666, 4096);
+    site.commit(&[("keep.bin", &keep), ("x.bin", &x), ("y.bin", &y)], 2);
+    let want: u64 = ["x.bin", "y.bin"]
+        .iter()
+        .map(|n| u64::from(blocks_of(&*site.db, site.pid, &blob_at(&site, n))[0].1))
+        .sum();
+    assert_eq!(want, 8192, "两个各一块 4 KiB：{want}");
+    build::set_ref(&*site.db, site.pid, build::MAIN, &[c1]).expect("倒回");
+
+    // 限额设得极大 ⇒ 真的不会睡觉，但桶照样累计（`paced_bytes` 就是这条用例的尺子）。
+    let cas = Cas::new(&objects_dir(site.tmp.path()), BLOCK)
+        .expect("CAS")
+        .with_rate_limit(1 << 30);
+    gc::sweep(&*site.db, &cas, site.pid, false).expect("sweep");
+    assert_eq!(cas.paced_bytes(), Some(0), "sweep 不碰文件系统 ⇒ 一个字节都不该扣桶");
+
+    let dry = gc::unlink_pending(&*site.db, &cas, site.pid, usize::MAX, true).expect("dry unlink");
+    assert_eq!(dry.files, 2, "dry 要报出'将要删 2 个'：{dry:?}");
+    assert_eq!(cas.paced_bytes(), Some(0), "但 dry 什么都没删 ⇒ 桶不许扣");
+
+    let ul = gc::unlink_pending(&*site.db, &cas, site.pid, usize::MAX, false).expect("unlink");
+    assert_eq!(ul.files, 2, "两块都该删掉：{ul:?}");
+    assert_eq!(
+        cas.paced_bytes(),
+        Some(want),
+        "扣桶的字节必须等于被删块的 size 之和（§9.3/FR-15 的那句话是硬的）"
+    );
+}
+
+/// pending 表的全部价值在于"**换个进程也还认**"：`gc` 是一条命令、`unlink` 是下一条（或明天那一次）。
+/// 所以这里在记完账之后**重开一个引擎句柄**再删——同进程同一句柄读到的表证明不了持久性。
+#[test]
+fn the_pending_table_survives_a_reopen() {
+    let site = Site::open();
+    let keep = pattern(31, 4096);
+    let c1 = site.commit(&[("keep.bin", &keep)], 1);
+    let x = pattern(0x777, 4096);
+    site.commit(&[("keep.bin", &keep), ("x.bin", &x)], 2);
+    let bx = blocks_of(&*site.db, site.pid, &blob_at(&site, "x.bin"))[0].0;
+    build::set_ref(&*site.db, site.pid, build::MAIN, &[c1]).expect("倒回");
+    let pid = site.pid;
+
+    gc::sweep(&*site.db, &site.cas(), pid, false).expect("sweep 记账");
+    assert_eq!(gc::pending_total(&*site.db, pid).expect("读表").0, 1);
+    assert!(site.cas().contains(&bx), "sweep 这一趟文件必须还在");
+
+    // 上一条命令退出（释放库锁），下一条命令起来：表必须还认。
+    let tmp = Site::release(site);
+    let db2 = open_store(tmp.path(), EngineKind::LsmTree).expect("重开库");
+    assert_eq!(
+        gc::pending_total(&*db2, pid).expect("新句柄读表").0,
+        1,
+        "表是落在库里的，不是内存里的清单"
+    );
+    let cas = Cas::new(&objects_dir(tmp.path()), BLOCK).expect("CAS");
+    let ul = gc::unlink_pending(&*db2, &cas, pid, usize::MAX, false).expect("第二趟");
+    assert_eq!(ul.files, 1, "{ul:?}");
+    assert!(!cas.contains(&bx), "这下文件才真没了");
+    assert_eq!(gc::pending_total(&*db2, pid).expect("收尾"), (0, 0));
+    assert_eq!(
+        gc::refcnt_of(&*db2, pid, &bx).expect("读账"),
+        None,
+        "新句柄看到的 `K` 行也是清掉的"
     );
 }
 

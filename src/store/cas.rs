@@ -193,6 +193,18 @@ impl Cas {
             .map(|p| p.max_bps)
     }
 
+    /// 从这个 `Cas` 建立起累计扣过桶的字节数（写 + 删）；没开限速时是 `None`。
+    ///
+    /// 存在的唯一理由是 §9.3/FR-15 那条"删除也要过同一个桶"**必须可核对**：用例拿它断言
+    /// "一趟 unlink 扣掉的字节 = 被删块的 size 之和"，这比掐墙钟可靠（单核机上计时用例本身就是噪声源）。
+    pub fn paced_bytes(&self) -> Option<u64> {
+        self.pacer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|p| p.written)
+    }
+
     /// 块在库内的相对路径：`<hash[0:2]>/<hash[2:]>`，两级目录避免单目录爆十万文件。
     pub fn path_of(hash: &Hash) -> PathBuf {
         let hex = keys::hex(hash);
@@ -208,10 +220,11 @@ impl Cas {
         &self.dir
     }
 
-    /// 删一个块。返回是否真删了。
+    /// 删一个块。返回是否真删了（`false` = 文件本来就不在，pending 表上的账照样要清）。
     ///
-    /// **只在 `K` 行已经记为 refcnt 0 之后调用**（§9.3）：删块与删清单是两个动作，中间崩了留下的是
-    /// "没人引用的孤儿文件"而不是"清单引用不存在的块"——方向反过来才是要命的那种。
+    /// 调用点是 §9.3 的**第二趟**（`gc::unlink_pending`）：归零那一刻只往 `D` 表记一行，真正碰文件
+    /// 系统在这里，且每个块删之前先从 FR-15 的桶里扣自己的 size。删之前 `K`/`k`/`D` 三行已在同一事务
+    /// 里清掉——崩在中间留下的是"该删的文件还在"（垃圾），而不是"清单引用不存在的块"（损坏）。
     /// 全零块本来就不落盘，所以这里对它是 no-op。
     pub fn remove_block(&self, hash: &Hash) -> Result<bool> {
         if *hash == ZERO_HASH {
@@ -483,7 +496,12 @@ impl Cas {
     }
 
     /// 把刚写进 CAS 的字节数记进速率闸。放在 `rename` **之后**：被拒/重名复用的那次不该扣预算。
-    fn pace(&self, n: u64) {
+    /// 从漏桶里扣 `n` 字节：不够就睡到够。
+    ///
+    /// 公开的理由是 §9.3 那句"删除动作全程挂 FR-15 令牌桶"：**删除也要过同一个桶**——
+    /// 一次 unlink 几万个块文件在机械盘上同样是突发。写与删共用一个 `Pacer` 是刻意的：
+    /// 两个各自的桶加起来就是双倍的速率，而配额是按"这台机器一共能吃多少 IO"定的。
+    pub fn pace(&self, n: u64) {
         let mut guard = self.pacer.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = guard.as_mut() {
             p.charge(n);

@@ -1,5 +1,5 @@
-//! M1 批次：联网单向。`push` / `agent` / `gc`（本文件已实现）· `peer add|list|trust`
-//! 与块级配额淘汰（还没做，见下面"现在还缺的两件事"）。
+//! M1 批次：联网单向 + 回收。`push` / `agent` / `peer list|forget` / `gc`（本文件已实现），
+//! 还缺的三格如实列在下面。
 //!
 //! # 传输为什么是"一根子进程的管子"
 //!
@@ -15,19 +15,24 @@
 //! **stdout 只能有帧**，给人看的一律走 stderr。多往 stdout 写一行，对端就把那一行当帧解，
 //! 报出来是"协议走样"——看起来像对面在攻击，其实是我们自己污染了通道。
 //!
-//! # 现在还缺的两件事（如实标，别当 M1 已完成）
+//! # 现在还缺的三件事（如实标，别当 M1 已完成）
 //!
-//! - §9.5 的 **TOFU 指纹表**（`peer add|list|trust`）没做：现在的 `peer_id` 只是"对端自报的
-//!   名字"，任何人都能冒充。M1 的判据列的是通道 + 熔断 + 配额，所以这格可以晚一步，
-//!   但**接真机之前必须补**。
-//! - **块级配额淘汰（FR-9 的"超出配额按最老且不可达优先"）还没做**：`gc` 现在只压引擎的
-//!   版本链，不删任何块。所以 `push` 只保证"对端缺什么才传什么"，不保证对端磁盘装得下。
+//! - **真 SSH 那条链路还没跑过**：本机只有 ssh 客户端、没有 sshd，所以会话代码验过的是
+//!   "内存管道 + 真子进程 stdio"两种管子（`tests/net_session.rs`）。开对端 sshd 要授权，
+//!   这一格留在最后。
+//! - **块级配额淘汰（FR-9 的"超出配额按最老且不可达优先"）没做**：`gc --sweep` 只清**不可达**的，
+//!   保留集本身超配额时它只报账不丢历史（那是 M4 的 `reset`/`prune --expire` 的决策权）。
+//!   所以 `push` 只保证"对端缺什么才传什么"，不保证对端磁盘装得下。
+//! - **§14 Q14**：门面 `KvEngine` 没有分片版 `vacuum_bounded` ⇒ `gc` 的引擎那一半仍是"全库一刀"，
+//!   在单核机械盘上就是个 IO 突发（实测 94.8 % 单核 / 40 s）。要真消除突发得动引擎侧，
+//!   这里不 downcast 凑（理由写在 [`gc`] 的文档里）。
 //!
 //! # `gc` 为什么排在这三条里
 //!
 //! 它不是网络活儿，是**记账活儿**：10 GiB 基线上"0 变更的空转提交 45.2 s → 246.8 s"
-//! （§11.1 复验表）就是"没人调用过 vacuum"这一条的账单。细节与那条能力边界
-//! （门面没有分片 `vacuum_bounded`）写在 [`gc`] 的文档里。
+//! （§11.1 复验表）就是"没人调用过 vacuum"这一条的账单。§9.3 的 mark-sweep 是另一半：
+//! 不可达对象与归零块的回收拆成"先落 `D` 表、后限额删文件"两趟，细节与能力边界写在
+//! [`store::gc`](crate::store::gc) 的模块头。
 
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -298,7 +303,8 @@ fn io_kind_eof() -> std::io::ErrorKind {
 }
 
 
-/// `gc`：**引擎版本回收**（全库一轮 `vacuum()`，前后各读一次 §9.6.2 的 `health()`）。
+/// `gc`：**引擎版本回收**（全库一轮 `vacuum()`，前后各读一次 §9.6.2 的 `health()`），
+/// 外加 `--sweep` 的 §9.3 mark-sweep（两趟：记账 → 限额删）。
 ///
 /// 病根见模块头：`scan` 每轮都要给每一行盖新版本（活性判据的命根子，不能省），而回收这一步
 /// 在 M0 的流水线里从来没被调用过。
@@ -320,6 +326,8 @@ pub fn gc(
     auto_slice: Option<u64>,
     sweep: bool,
     apply: bool,
+    unlink_max_files: usize,
+    max_mbps: f64,
     quota_mib: f64,
 ) -> Result<()> {
     let db = cli.store()?;
@@ -373,7 +381,22 @@ pub fn gc(
             "回收        = mark-sweep {}；前提是本站点没有别的写者，与 commit/push 并发会误删",
             if apply { "**落改动**" } else { "只报账（dry-run）" }
         );
-        let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+        let unlink_max = if unlink_max_files == 0 { usize::MAX } else { unlink_max_files };
+        let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
+            .with_rate_limit((max_mbps * 1048576.0) as u64);
+        let cap = if unlink_max == usize::MAX {
+            "不限个数".to_string()
+        } else {
+            format!("最多 {unlink_max} 个块")
+        };
+        println!(
+            "删除闸门    = 单趟上限 {cap}，限速 {}；每删一个先从 FR-15 的桶里扣它自己的 \
+             size（§9.3：删除与写入共用一个桶，两个各自的桶加起来就是双倍速率）",
+            match cas.rate_limit_bps() {
+                Some(bps) => format!("{:.1} MiB/s", bps as f64 / 1048576.0),
+                None => "**未设**（`--max-mbps` 不给就是放任突发）".to_string(),
+            }
+        );
         let reg = crate::cli::registry::Registry::load(&cli.root)?;
         let mut names: Vec<&String> = reg.projects.keys().collect();
         names.sort();
@@ -381,32 +404,54 @@ pub fn gc(
         for name in names {
             let pid = keys::project_id(name);
             let p = gc::sweep(&*db, &cas, pid, !apply)?;
+            // 归零已经记进 pending 表了；删文件是第二趟（限额、可续）。dry 模式只报"将要删哪些"。
+            let ul = gc::unlink_pending(&*db, &cas, pid, unlink_max, !apply)?;
+            let (pt, pb) = gc::pending_total(&*db, pid)?;
             all.commits_kept += p.commits_kept;
             all.commits_dropped += p.commits_dropped;
             all.trees_dropped += p.trees_dropped;
             all.blobs_dropped += p.blobs_dropped;
-            all.blocks_unlinked += p.blocks_unlinked;
-            all.bytes_freed += p.bytes_freed;
-            all.blocks_missing += p.blocks_missing;
+            all.blocks_pending += p.blocks_pending;
+            all.bytes_pending += p.bytes_pending;
+            all.pending_total += pt;
+            all.pending_bytes += pb;
+            all.blocks_unlinked += ul.files;
+            all.bytes_freed += ul.bytes;
+            all.blocks_missing += ul.missing;
             all.orphan_files += p.orphan_files;
             all.orphan_bytes += p.orphan_bytes;
             println!(
-                "  {name:<14} 保留 {:>5} 个事务；回收 事务 {:>3} / tree {:>4} / 清单 {:>5}；块 {:>5} 个 / {:.1} MiB",
+                "  {name:<12} 保留 {:>5} 事务；回收 事务 {:>3} / tree {:>4} / 清单 {:>5}；\
+                 本次待删 {:>5} 块 / {}，{} {:>5} / 表上还欠 {:>5}",
                 p.commits_kept,
                 p.commits_dropped,
                 p.trees_dropped,
                 p.blobs_dropped,
-                p.blocks_unlinked,
-                p.bytes_freed as f64 / 1048576.0
+                p.blocks_pending,
+                size_h(p.bytes_pending),
+                if apply { "实删" } else { "将删" },
+                ul.files + ul.missing,
+                pt,
             );
+            if pb > 0 {
+                println!(
+                    "             pending 表合计 {}（{pt} 个块）没删完 ⇒ 再跑一次 `gc --sweep --apply`\
+                     就续上；被 `--unlink-max-files` 截住的还有 {} 个",
+                    size_h(pb),
+                    ul.left
+                );
+            }
         }
         println!(
-            "合计        = 回收 事务 {} / tree {} / 清单 {}；块 {} 个 / {:.1} MiB",
+            "合计        = 回收 事务 {} / tree {} / 清单 {}；记进待删 {} 块 / {}，\
+             本趟实删 {} 块 / {}",
             all.commits_dropped,
             all.trees_dropped,
             all.blobs_dropped,
+            all.blocks_pending,
+            size_h(all.bytes_pending),
             all.blocks_unlinked,
-            all.bytes_freed as f64 / 1048576.0
+            size_h(all.bytes_freed)
         );
         if all.blocks_missing > 0 {
             println!(
@@ -416,10 +461,10 @@ pub fn gc(
         }
         if all.orphan_files > 0 {
             println!(
-                "孤儿文件    = {} 个 / {:.1} MiB：盘上有、`K` 账上没有 ⇒ 会话在「块落完、清单还没到」\
+                "孤儿文件    = {} 个 / {}：盘上有、`K` 账上没有 ⇒ 会话在「块落完、清单还没到」\
                  时被打断。这一版**只数不删**，因为删它要跟保留集一起判断（见 §9.3 的顺序）",
                 all.orphan_files,
-                all.orphan_bytes as f64 / 1048576.0
+                size_h(all.orphan_bytes)
             );
         }
 
@@ -433,8 +478,12 @@ pub fn gc(
         for (name, proj) in &reg.projects {
             let d = utils::dir_size(&cli.root.join(&proj.path));
             work += d.bytes;
-            println!("  工作树 {name:<12} = {:.1} MiB（{} 个文件，读不到 {} 项）",
-                d.bytes as f64 / 1048576.0, d.files, d.unreadable);
+            println!(
+                "  工作树 {name:<12} = {}（{} 个文件，读不到 {} 项）",
+                size_h(d.bytes),
+                d.files,
+                d.unreadable
+            );
         }
         let cas_bytes = utils::dir_size(&objects_dir(&cli.root)).bytes;
         let limit = if quota_mib > 0.0 {
@@ -443,25 +492,55 @@ pub fn gc(
             work + work / 5
         };
         println!(
-            "配额        = CAS {:.1} MiB / 工作树 {:.1} MiB ⇒ 上限（{}）{:.1} MiB，现超 {:.1} MiB",
-            cas_bytes as f64 / 1048576.0,
-            work as f64 / 1048576.0,
+            "配额        = CAS {} / 工作树 {} ⇒ 上限（{}）{}，{}",
+            size_h(cas_bytes),
+            size_h(work),
             if quota_mib > 0.0 {
                 "--quota-mib"
             } else {
                 "默认 工作树×(1+20%)"
             },
-            limit as f64 / 1048576.0,
-            cas_bytes.saturating_sub(limit) as f64 / 1048576.0
+            size_h(limit),
+            if cas_bytes > limit {
+                format!("现超 {}", size_h(cas_bytes - limit))
+            } else {
+                format!("没超（还余 {}）", size_h(limit - cas_bytes))
+            }
         );
         if cas_bytes > limit {
-            println!(
-                "还超着      = 回收之后仍然超配额 ⇒ 剩下的都是**仍被保留 head 可达**的字节，gc 无权删\
-                 （不变量 (d)）。要腾地方得由人决定丢哪一版：那是 M4 的 `reset`/`prune --expire`"
-            );
+            // "剩下的都可达"这句话在有孤儿文件时是**假的**，所以逐条列原因，别一句话盖掉。
+            let mut why = vec!["仍被保留 head 可达的字节 ⇒ gc 无权删（不变量 (d)）".to_string()];
+            if all.orphan_files > 0 {
+                why.push(format!(
+                    "{} 个孤儿文件 / {} ⇒ 会话崩在「块落完、清单还没到」之间，这一版只数不删",
+                    all.orphan_files,
+                    size_h(all.orphan_bytes)
+                ));
+            }
+            if all.pending_total > 0 {
+                why.push(format!(
+                    "pending 表上还欠 {} 个块 / {} ⇒ 再跑一次 `gc --sweep --apply` 就删完",
+                    all.pending_total,
+                    size_h(all.pending_bytes)
+                ));
+            }
+            println!("还超着      = 回收之后仍然超配额，账在：{}", why.join("；"));
+            println!("              要真腾地方得由人决定丢哪一版：那是 M4 的 `reset`/`prune --expire`");
         }
     }
     Ok(())
+}
+
+/// 报账的体积单位：10 GiB 站点上 MiB 是对的，但小站点用 `{:.1} MiB` 会把 4 KiB 印成 `0.0 MiB`
+/// ——而 `gc` 的账必须在小站点上也读得出非零，否则"孤儿 1 个 / 0.0 MiB"这种句子等于没说。
+fn size_h(b: u64) -> String {
+    if b >= 1 << 20 {
+        format!("{:.1} MiB", b as f64 / 1048576.0)
+    } else if b >= 1 << 10 {
+        format!("{:.1} KiB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
 }
 
 /// `peer list|forget`：§9.5.1 的 TOFU 表。表只有库里那一份（`P` 前缀），

@@ -94,6 +94,12 @@ pub const TAG_SCAN: u8 = b'Z';
 pub const TAG_FOLDED: u8 = b'A';
 pub const TAG_SESSION: u8 = b'S';
 pub const TAG_PEER: u8 = b'P';
+/// pending-delete：refcnt 已归零、等着被限额 unlink 的块（§9.3 的那个"列表"）。
+///
+/// 为什么要有这么一行而不是"当场删文件"： decrements 现场删文件是 §9.3 明令禁止的——
+/// 崩在中间就是"清单引用一个不存在的块"。归零的块先进这张表，unlink 是**后面一趟限额的活**，
+/// 崩了下次接着做，而且 `gc` 能报出"还欠着多少个没删"。
+pub const TAG_PENDING: u8 = b'D';
 
 /// 内容 hash 的唯一入口。换算法/改截断长度只改这一处
 pub fn hash_of(bytes: &[u8]) -> Hash {
@@ -203,6 +209,12 @@ pub fn peer_key(peer_id: &[u8]) -> Vec<u8> {
     let mut k = vec![TAG_PEER];
     k.extend_from_slice(peer_id);
     k
+}
+
+/// pending-delete 的一行：`D|p|hash` → `{size}`。**值里带 size** 是有意的：
+/// unlink 那一趟要按字节数从 FR-15 的桶里扣，而这不该再回头点查 `K`（门面每次读折全库，§9.6.1）。
+pub fn pending_key(pid: ProjectId, hash: &Hash) -> Vec<u8> {
+    keyed(TAG_PENDING, pid, hash)
 }
 
 /// NFC 归一化助手。**目前只服务于比较**（`fold_path`），还没有用于"仓库内路径的身份"——
