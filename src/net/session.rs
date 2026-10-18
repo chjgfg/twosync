@@ -509,6 +509,10 @@ pub fn serve(
     }
 
     // 清单与 commit。
+    //
+    // `got` 记下**这一场会话真的收到过**哪些 tree/blob：验收那道闸要用它做差集
+    // （[`verify_closure_delta`]，§15.22）。
+    let mut got = Got::default();
     loop {
         match msg {
             Proto::PushObjects {
@@ -521,12 +525,15 @@ pub fn serve(
                         keys::legal_name(&e.name)
                             .map_err(|er| note_abort(io, &er.to_string()).err().unwrap_or(er))?;
                     }
-                    object::put_tree(db, pid, entries)?;
+                    let h = object::put_tree(db, pid, entries)?;
+                    // 树的身份就是条目集合的 blake3，`put_tree` 落盘前已经自证过 ⇒ 直接用它返回的 hash。
+                    got.trees.insert(h);
                     rep.trees_in += 1;
                 }
                 for b in &blobs {
                     build::adopt_blob(db, pid, b, "push")
                         .map_err(|er| note_abort(io, &er.to_string()).err().unwrap_or(er))?;
+                    got.blobs.insert(b.hash);
                     rep.blobs_in += 1;
                 }
                 for c in &commits {
@@ -570,6 +577,7 @@ pub fn serve(
             known: &known,
             newest: &newest,
             allow_mass_delete,
+            got: &got,
         },
     );
     match verdict {
@@ -621,24 +629,35 @@ fn accept(db: &dyn KvEngine, cas: &Cas, a: &Accept<'_>) -> Result<(Vec<Hash>, St
     let mut why = String::new();
     for h in &incoming {
         let c = object::read_commit(db, pid, h)?;
+        // 差集基线 = 这个 commit **在本端读得到的那一个亲代**（发送端用的是"在对面可达集里的第一个亲代"，
+        // 两边用同一棵亲代树 ⇒ 规则对称；对不上就是悬空引用，报出去而不是静默接受）。
+        let parent_tree = match c.parents.iter().find(|p| object::read_commit(db, pid, p).is_ok()) {
+            Some(p) => Some(object::read_commit(db, pid, p)?.tree),
+            None => None,
+        };
         let mut closed = 0usize;
-        verify_closure(db, pid, cas, &c.tree, &mut closed)?;
-        if let Some(p) = c.parents.first() {
-            let parent = object::read_commit(db, pid, p)?;
-            let known = count_entries(db, pid, &parent.tree)?;
-            let d = build::diff(db, pid, Some(&parent.tree), &c.tree)?;
+        let inherited = verify_closure_delta(db, pid, cas, &c.tree, parent_tree.as_ref(), a.got, &mut closed)?;
+        if let Some(pt) = &parent_tree {
+            let known = count_entries(db, pid, pt)?;
+            let d = build::diff(db, pid, Some(pt), &c.tree)?;
             build::check_mass_delete(d.delete, d.deleted_bytes, known, allow)?;
             if d.delete > 0 {
                 why = format!(
-                    "接受 {}：{} 个对象闭合，删除 {} 条 / {:.1} MiB 在闸内",
+                    "接受 {}：{} 个对象闭合、{} 个从未变的上代继承，删除 {} 条 / {:.1} MiB 在闸内",
                     keys::short(h),
                     closed,
+                    inherited,
                     d.delete,
                     d.deleted_bytes as f64 / 1048576.0
                 );
             }
         } else {
-            why = format!("接受 {}：{} 个对象闭合（首个提交）", keys::short(h), closed);
+            why = format!(
+                "接受 {}：{} 个对象闭合、{} 个继承（首个提交或亲代不在本端 ⇒ 全量校验）",
+                keys::short(h),
+                closed,
+                inherited
+            );
         }
     }
     let mut cand: Vec<Hash> = a.our_heads.to_vec();
@@ -657,51 +676,126 @@ struct Accept<'a> {
     known: &'a BTreeSet<Hash>,
     newest: &'a Hash,
     allow_mass_delete: bool,
+    /// 这一场会话**真的收到**的对象（验收走差集要用它，见 [`verify_closure_delta`]）
+    got: &'a Got,
 }
 
-/// 一棵树的闭包能不能取回来：每层清单读得到、每个 File/Symlink 有 `B` 清单、
-/// 清单里每个非零块**在盘上**。这三条少一条，历史就是假的（不变量 (b)）。
-fn verify_closure(
+/// 这一场会话收到过哪些 tree/blob。**为什么非记不可**：发送端现在只送差集（补记廿三），
+/// 于是"新 commit 引用的对象"分成两类——这次推来的、以及"与亲代那一字相同所以没推"的。
+/// 收端要分辨这两类只能靠自己记得收过什么。
+#[derive(Default)]
+struct Got {
+    trees: BTreeSet<Hash>,
+    blobs: BTreeSet<Hash>,
+}
+
+/// 一棵树的闭包能不能取回来 —— **差集版**（§15.22；发送端只送差集之后，这里也必须只验差集，
+/// 否则一次 4 MiB 的增量推送要在收端读两万遍清单，而门面每次读调用折一遍全库（§9.6.1））。
+///
+/// 每个条目只有三种合法去向：
+/// 1. **这一场会话收到的**（在 `got` 里）⇒ 逐块查盘（`cas.contains`），少一个块就拒；
+/// 2. **与亲代同一位置逐字节相同的**（同 kind 同 hash，且亲代那一棵在 `got` 之外从没被这次推来）
+///    ⇒ 继承，不必再读：不变量"head 只在闭包校验通过之后才前移"保证了它当年验过；
+/// 3. **两者都不是** ⇒ 悬空引用 ⇒ 拒整个 commit（这就是原来那条 `MissingObject`）。
+///
+/// 返回"按继承算过去"的对象数，报账用（`why` 里那句"从未变的上代继承"）。
+///
+/// **这条改动把担保范围挪了一段，必须说清**：原来每次推送都会把整仓库重验一遍，所以它顺带也是个
+/// 磁盘腐烂探测器；现在不是了——**它保证的是"这次推的东西自洽、引用得到"，不再保证"全仓库没有 rot"**。
+/// rot 的归属改给读路径与自检：`restore`/`checkout`/`verify` 逐块按 hash 自证（§9.4.7 规矩 3，
+/// 损坏永远报错不静默），`gc --sweep` 会报出"账上有、盘上没"的缺口（§9.3 的 orphan/missing 两格），
+/// FR-21 的 `doctor` 在启动时开库自证。这个取舍写在 §15.22，不藏。
+///
+/// `parent = None`（首个提交、或亲代不在本端）⇒ 第三类之外的东西全都必须在 `got` 里 ⇒ 自动退回全量校验。
+fn verify_closure_delta(
     db: &dyn KvEngine,
     pid: ProjectId,
     cas: &Cas,
     root: &Hash,
+    parent: Option<&Hash>,
+    got: &Got,
     counted: &mut usize,
-) -> Result<()> {
-    let mut stack = vec![*root];
-    while let Some(h) = stack.pop() {
+) -> Result<usize> {
+    let mut inherited = 0usize;
+    // 栈里是 (这次要验的树, 亲代同一位置的树)
+    let mut stack: Vec<(Hash, Option<Hash>)> = vec![(*root, parent.copied())];
+    while let Some((h, ph)) = stack.pop() {
         let entries = object::read_tree(db, pid, &h)?;
+        let older = match &ph {
+            Some(x) if *x != h => Some(object::read_tree(db, pid, x)?),
+            // 亲代这一层与新的一模一样（同 hash）⇒ 整棵继承，不必展开。
+            // 走到这里通常说明这棵树根本没在 `got` 里，上面那条分支已经先挡住了。
+            _ => None,
+        };
         for e in entries {
+            let old = older
+                .as_ref()
+                .and_then(|list| list.iter().find(|o| o.name == e.name));
             match e.kind {
-                Kind::Dir => stack.push(e.hash),
-                Kind::File | Kind::Symlink => {
-                    let blob = build::read_blob(db, pid, &e.hash).map_err(|_| {
-                        Error::MissingObject {
-                            hash: keys::short(&e.hash),
-                            kind: "blob（对端推的清单里引用它，但没推它本身）".to_string(),
-                        }
-                    })?;
-                    if blob.hash != e.hash {
-                        return Err(Error::CorruptBlock {
-                            hash: keys::short(&e.hash),
-                            path: "(清单对不上自己的 hash)".into(),
-                            why: "blob 的 B 行内容算出的 hash 与 tree 条目引用的不符".to_string(),
-                        });
-                    }
-                    for b in blob.blocks.iter().filter(|b| !b.zero) {
-                        if !cas.contains(&b.hash) {
+                Kind::Dir => {
+                    if got.trees.contains(&e.hash) {
+                        // 这次推来的层：继续展开，与亲代同名项配对以便下一层也能判继承
+                        stack.push((e.hash, old.map(|o| o.hash)));
+                    } else if let Some(o) = old {
+                        if o.kind == e.kind && o.hash == e.hash {
+                            inherited += 1; // 整棵子树与上代逐字节相同 ⇒ 当年验过，不必再读
+                        } else {
                             return Err(Error::MissingObject {
-                                hash: keys::short(&b.hash),
-                                kind: "block（清单引用，盘上没有）".to_string(),
+                                hash: keys::short(&e.hash),
+                                kind: "tree（清单引用它，既没推来、也与上代不同）".to_string(),
                             });
                         }
+                    } else {
+                        return Err(Error::MissingObject {
+                            hash: keys::short(&e.hash),
+                            kind: "tree（清单引用它，但这一场会话没收到它）".to_string(),
+                        });
                     }
-                    *counted += 1;
+                }
+                Kind::File | Kind::Symlink => {
+                    if got.blobs.contains(&e.hash) {
+                        let blob = build::read_blob(db, pid, &e.hash).map_err(|_| {
+                            Error::MissingObject {
+                                hash: keys::short(&e.hash),
+                                kind: "blob（对端推的清单里引用它，但没推它本身）".to_string(),
+                            }
+                        })?;
+                        if blob.hash != e.hash {
+                            return Err(Error::CorruptBlock {
+                                hash: keys::short(&e.hash),
+                                path: "(清单对不上自己的 hash)".into(),
+                                why: "blob 的 B 行内容算出的 hash 与 tree 条目引用的不符".to_string(),
+                            });
+                        }
+                        for b in blob.blocks.iter().filter(|b| !b.zero) {
+                            if !cas.contains(&b.hash) {
+                                return Err(Error::MissingObject {
+                                    hash: keys::short(&b.hash),
+                                    kind: "block（清单引用，盘上没有）".to_string(),
+                                });
+                            }
+                        }
+                        *counted += 1;
+                    } else if let Some(o) = old {
+                        if o.kind == e.kind && o.hash == e.hash {
+                            inherited += 1;
+                        } else {
+                            return Err(Error::MissingObject {
+                                hash: keys::short(&e.hash),
+                                kind: "blob（清单引用它，既没推来、也与上代不同）".to_string(),
+                            });
+                        }
+                    } else {
+                        return Err(Error::MissingObject {
+                            hash: keys::short(&e.hash),
+                            kind: "blob（清单引用它，但这一场会话没收到它）".to_string(),
+                        });
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(inherited)
 }
 
 fn count_entries(db: &dyn KvEngine, pid: ProjectId, root: &Hash) -> Result<u32> {

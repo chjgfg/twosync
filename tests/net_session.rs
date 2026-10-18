@@ -1458,16 +1458,26 @@ fn incremental_transfer_at_ten_gib() {
         .unwrap_or(8.0);
 
     let pid = keys::project_id(&name);
+    let t_start = std::time::Instant::now();
     let db = open_store(&a, EngineKind::LsmTree).expect("开本端的库");
     let cas_a = Cas::new(&objects_dir(&a), cas::DEFAULT_BLOCK).expect("本端 CAS");
     let a_heads = build::all_ref_heads(&*db, pid, None).expect("本端 head");
     assert!(!a_heads.is_empty(), "本端没有 head ⇒ 这一格没得测");
 
     // 对端在推之前的样子：块数与 head（推之后拿这两个数做对照）
+    let t_heads = t_start.elapsed().as_secs_f64();
     let blocks_before = count_blocks(&objects_dir(&b));
+    let t_count0 = t_start.elapsed().as_secs_f64();
     let b_db0 = open_store(&b, EngineKind::LsmTree).expect("开对端的库");
     let b_heads_before = build::all_ref_heads(&*b_db0, pid, None).expect("对端 head");
     drop(b_db0);
+    let t_setup = t_start.elapsed().as_secs_f64();
+    println!(
+        "TEN_GIB 相位：开本端库+读 head {t_heads:.1} s / 数对端 21 794 个块文件 {:.1} s / \
+         开对端库+读 head {:.1} s ⇒ 会话之前合计 {t_setup:.1} s",
+        t_count0 - t_heads,
+        t_setup - t_count0
+    );
 
     let mut wire = Wire { io: agent_child(EXE, &b, &name), out: 0 };
     let o = PushOpts {
@@ -1476,13 +1486,22 @@ fn incremental_transfer_at_ten_gib() {
         peer_name: b"ten-gib-peer",
         ..Default::default()
     };
+    // 相位计时（§15.22 的第一版归因被臂 4 的实测推翻了，见补记廿四 ⇒ 这次先量再说话）。
+    // 特别注意 `count_blocks`：它要在 5400 转的盘上走 21 794 个块文件**两遍**，本身就可能比会话还贵。
+    use std::time::Instant;
+    let t0 = Instant::now();
     let rep = session::push(&mut wire, &*db, &cas_a, &o).expect("增量推送");
+    let t_push = t0.elapsed();
     let wire_bytes = wire.finish().expect("agent 收尾");
+    let t_child = t0.elapsed();
+    let blocks_after = count_blocks(&objects_dir(&b));
+    let t_count = t0.elapsed();
 
     println!(
         "TEN_GIB blocks_sent={} skipped={} blob帧={} tree帧={} commits={}\n\
          TEN_GIB 块裸字节={} B ({:.2} MiB)\n\
-         TEN_GIB 管子总字节={} B ({:.2} MiB)  ← 含协商/清单/commit 帧",
+         TEN_GIB 管子总字节={} B ({:.2} MiB)  ← 含协商/清单/commit 帧\n\
+         TEN_GIB 相位：push={:.1} s（含等子进程退出 {}） / 之后再数盘 {:.1} s；开库+读 head+第一次数盘 之前已花 {:.1} s",
         rep.blocks_sent,
         rep.blocks_skipped,
         rep.blobs_sent,
@@ -1492,11 +1511,21 @@ fn incremental_transfer_at_ten_gib() {
         rep.bytes_sent as f64 / 1048576.0,
         wire_bytes,
         wire_bytes as f64 / 1048576.0,
+        t_push.as_secs_f64(),
+        (t_child - t_push).as_secs_f64(),
+        (t_count - t_child).as_secs_f64(),
+        t_setup,
     );
 
     // ── 对照 ①：对端不是空的，否则"增量"是假的 ──
+    // `commits == 0` 是合法的跑法：**没有新东西**时这一条就变成"固定成本探针"（量具自己那部分开销），
+    // 臂与臂之间要比的正是这个固定成本，所以不许改语料也能单独跑。
+    if rep.commits == 0 {
+        assert_eq!(rep.bytes_sent, 0, "没有待推的 commit ⇒ 一个字节都不该发");
+        assert_eq!(blocks_after, blocks_before, "没有待推的 commit ⇒ 对端一个文件都不该多");
+        return;
+    }
     assert!(rep.blocks_skipped >= 1000, "对端应该已经有其余那些块：{rep:?}");
-    assert!(rep.commits >= 1, "本端一个新 commit 都没推 ⇒ 变更根本没进历史：{rep:?}");
     assert!(rep.blocks_sent >= 1, "脏块一个都没发 ⇒ 这一刀没落到盘上：{rep:?}");
     assert!(
         (rep.bytes_sent as f64) <= ceil_mib * 1048576.0,
@@ -1511,7 +1540,7 @@ fn incremental_transfer_at_ten_gib() {
 
     // ── 对照 ②：推过去了、也生效了 ──
     assert_eq!(
-        count_blocks(&objects_dir(&b)),
+        blocks_after,
         blocks_before + rep.blocks_sent,
         "对端的块数应该正好长出这么多"
     );
@@ -1524,4 +1553,170 @@ fn incremental_transfer_at_ten_gib() {
         let tb = object::read_commit(&*b_db, pid, h).expect("对端 commit").tree;
         assert_eq!(ta, tb, "根 tree 必须一致（{h:?}）");
     }
+}
+
+/// 差集那道闸**仍然**必须拒"谎报的引用"：新树里某个条目既不是这一场收到的、也没有亲代可继承 ⇒ 悬空。
+/// 这条用例是 §15.22 那笔交换的另一半——省的是"未变的部分不必重读"，**不是**把校验关掉。
+///
+/// 写法上是手工驱动协议：要用一个 `push` 永远不会构造出来的对象（引用一个哪里都不存在的 blob hash），
+/// 所以绕开发送端，直接对着 `session::serve` 说话。
+#[test]
+fn a_dangling_reference_in_a_delta_push_is_still_refused() {
+    let a = Site::open();
+    let b = Site::open();
+
+    // 伪造：一棵引用"不存在 blob"的树，加一个指向它的 commit。写进 a 的库只是为了拿到两个 hash。
+    let ghost: keys::Hash = [0xEE; 32];
+    let entries = vec![object::TreeEntry {
+        name: "x.bin".into(),
+        kind: keys::Kind::File,
+        hash: ghost,
+        size: 10,
+        mode: 0o644,
+    }];
+    let tree = object::put_tree(&*a.db, a.pid, &entries).expect("伪造 tree");
+    let forged = object::Commit {
+        parents: Vec::new(),
+        tree,
+        peer: "a".to_string(),
+        ts: 9,
+        msg: "谎报的引用".to_string(),
+        stats: object::Stats { add: 1, modify: 0, delete: 0, rename: 0, bytes: 10 },
+    };
+    let fake = object::put_commit(&*a.db, a.pid, &forged).expect("伪造 commit");
+
+    let (mut pa, mut pb) = duplex();
+    let cas_b = b.cas();
+    let served = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let mut resolve = |_n: &str| Ok::<u32, String>(b.pid);
+            session::serve(&mut pb, &*b.db, &cas_b, b"peer-b", 0xFFFF_FFFF, &mut resolve, false)
+        });
+        frame::encode(
+            &mut pa,
+            &Proto::Hello { proto_ver: PROTO_VER, peer_id: b"liar".to_vec(), caps: u32::MAX },
+        )
+        .expect("发 Hello");
+        expect_frame(frame::decode(&mut pa), |p| matches!(p, Proto::Hello { .. }), "Hello");
+        frame::encode(
+            &mut pa,
+            &Proto::BeginSession { project: PROJECT.to_string(), pid: a.pid, my_heads: vec![fake] },
+        )
+        .expect("发 BeginSession");
+        expect_frame(
+            frame::decode(&mut pa),
+            |p| matches!(p, Proto::HeadsState { .. }),
+            "HeadsState",
+        );
+        frame::encode(&mut pa, &Proto::WantHave { want: Vec::new() }).expect("发 WantHave");
+        frame::encode(&mut pa, &Proto::HaveDone).expect("发 HaveDone");
+        loop {
+            match frame::decode(&mut pa).expect("读 MissingBlocks") {
+                Proto::MissingBlocks { .. } => {}
+                Proto::MissingDone => break,
+                other => panic!("该收 MissingBlocks/MissingDone，收到 {other:?}"),
+            }
+        }
+        // 只给清单：那个 blob 与它的块都故意不推
+        frame::encode(
+            &mut pa,
+            &Proto::PushObjects { blobs: Vec::new(), trees: vec![entries], commits: vec![forged] },
+        )
+        .expect("发 PushObjects");
+        frame::encode(&mut pa, &Proto::ObjectsDone).expect("发 ObjectsDone");
+        frame::encode(&mut pa, &Proto::VerifyCommit { hash: fake }).expect("发 VerifyCommit");
+        let rep = match frame::decode(&mut pa).expect("读 verdict") {
+            p @ Proto::RejectCommit { .. } => {
+                let Proto::RejectCommit { reason, .. } = p else { unreachable!() };
+                assert!(
+                    reason.contains("没收到它") || reason.contains("与上代不同"),
+                    "拒绝的理由要说清是悬空引用，实际：{reason}"
+                );
+                h.join().expect("serve 线程")
+            }
+            other => panic!("该收 RejectCommit，收到 {other:?}"),
+        };
+        drop(pa);
+        rep
+    })
+    .expect("serve 该正常返回（拒绝是判决，不是会话故障）");
+    assert!(!served.accepted, "谎报的引用必须被拒：{}", served.reason);
+
+    // 而且 head 一步没动：清单落进了库（那是等 GC 的垃圾），但没有"生效"这件事。
+    // 用 `b.db` 这个**已经开着的**句柄读，不要再 `open_store` 一次——引擎的库级文件锁连同进程双开
+    // 都拒（`WouldBlock`，见 `tests/gc_sweep.rs` 那条跨进程重开的用例）。
+    assert!(
+        served.heads_after.is_empty(),
+        "被拒的会话报出来的 head 集合该是空的：{:?}",
+        served.heads_after
+    );
+    assert!(
+        build::all_ref_heads(&*b.db, b.pid, None)
+            .expect("读 head")
+            .is_empty(),
+        "谎报的引用不许动 head"
+    );
+}
+
+/// §15.22 那笔交换的**账单**，写成用例而不是只写进文档：把差集校验之后，"某个**未变的**块在对端烂了"
+/// 这一种磁盘腐烂**不再被 push 那道闸抓到**（它本来就不是协议错误：这次没推它，亲代也是这么指的）。
+/// 但读路径必须抓到，而且不能静默给半截内容（§9.4.7 规矩 3）。
+///
+/// 这条用例存在的意义是：**不许把"推送变快了"读成"全仓库不再有损坏风险"**——风险换了看守，没消失。
+#[test]
+fn an_inherited_rot_slips_the_push_gate_and_is_caught_on_read() {
+    let a = Site::open();
+    let b = Site::open();
+    let files = seed(2);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
+    round_ok(&a, &b, &opts(PROJECT));
+
+    // 对端第一个文件的块：这一刀之后**不会**被重发（内容没变），所以先把它"弄烂"。
+    // 读对端的账用**已经开着的那个句柄**（`b.db`）：引擎是库级文件锁，同进程再 open 一次会 `WouldBlock`。
+    let head0 = *build::ref_heads(&*b.db, b.pid, MAIN)
+        .expect("b 的 head")
+        .first()
+        .expect("有 head");
+    let tree0 = object::read_commit(&*b.db, b.pid, &head0).expect("读 commit").tree;
+    let e0 = history::resolve(&*b.db, b.pid, &tree0, "d0/f0.bin")
+        .expect("resolve")
+        .expect("f0 在树里");
+    let blob0 = build::read_blob(&*a.db, a.pid, &e0.hash).expect("读本端同一个 blob");
+    let victim_block = blob0.blocks.iter().find(|b| !b.zero).expect("至少一块").hash;
+    let cas_b = b.cas();
+    let p = cas_b.dir().join(Cas::path_of(&victim_block));
+    fs::remove_file(&p).expect("手工抹掉对端那个未变的块（模拟腐烂）");
+
+    // 本端只改**第二个**文件再推 ⇒ 差集里 f0 全部继承 ⇒ 这道闸放行了（这就是被挪走的那半担保）
+    let second = a.proj().join("d1").join("f1.bin");
+    let mut body2 = fs::read(&second).expect("读 f1");
+    body2[7] ^= 0xFF;
+    fs::write(&second, &body2).expect("改 f1");
+    worktree::scan(&*a.db, a.pid, &a.proj(), false, 500).expect("scan");
+    let store = a.cas();
+    build::build(
+        &*a.db,
+        a.pid,
+        &store,
+        &a.proj(),
+        Meta { peer: "a", msg: "只改 f1", ts: 2, allow_mass_delete: true },
+    )
+    .expect("增量提交");
+    let (rep, served) = round_ok(&a, &b, &opts(PROJECT));
+    assert!(served.accepted, "腐烂的是未变的那个文件 ⇒ 差集校验放行，这是 §15.22 明写的取舍：{}", served.reason);
+    assert_eq!(rep.blocks_sent, 1, "只推 f1 那一块：{rep:?}");
+
+    // 但读路径必须抓到，而且是报错不是静默
+    let err = cas_b
+        .read_blob(&blob0, &b.tmp.path().join("out.bin"))
+        .expect_err("盘上少了块 ⇒ 读它必须报错，不许给半截内容");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("块") || msg.contains("block"),
+        "报错要指到块这一层，实际：{msg}"
+    );
 }
