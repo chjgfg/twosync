@@ -371,7 +371,7 @@ fn the_parent_index_keeps_ordinal_order_including_merges() {
     assert_eq!(index.get(&m).unwrap(), &vec![r, l], "ordinal 就是下标，不许按 hash 排序");
     assert_eq!(index.get(&l).unwrap(), &vec![g]);
     assert_eq!(index.get(&r).unwrap(), &vec![g]);
-    assert!(index.get(&g).is_none(), "根提交没有亲代行");
+    assert!(!index.contains_key(&g), "根提交没有亲代行");
 
     // 闭包（纯函数那份）走同样的图：合并的两个亲代都要到根
     let got = history::reachable_from(&index, &[m], &[]);

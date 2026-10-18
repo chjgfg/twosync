@@ -1,7 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use storage_engines::{EngineConfig, EngineKind, KvEngine, StorageConfig};
+use storage_engines::{
+    DurabilityProfile, EngineConfig, EngineError, EngineKind, ExportRecord, IncrError, KeyMeta,
+    KvBulk, KvEngine, KvTxn, MvccHealth, SearchPage, SearchQuery, StorageConfig, VacuumStats,
+};
 
 use crate::error::{Error, Result};
 
@@ -95,6 +100,9 @@ pub fn site_id(root: &Path) -> Result<Vec<u8>> {
 ///
 /// **所有要读写元数据的命令都从这里拿句柄**：自己拼 `StorageConfig` 就会绕过自检闸，
 /// 而自检闸存在的理由是四家的崩溃安全画像互不等价（§9.6.5）。
+///
+/// `TWOSYNC_COUNT_CALLS=1` ⇒ 再套一层门面调用计数器（文件末尾那一段）。**不设环境变量时
+/// 一个字节都不改**：默认路径上没有原子加、也没有 Drop 打印，量出来的才是发布版的行为。
 pub fn open_store(root: &Path, kind: EngineKind) -> Result<Box<dyn KvEngine>> {
     let cfg = StorageConfig {
         kind,
@@ -103,6 +111,10 @@ pub fn open_store(root: &Path, kind: EngineKind) -> Result<Box<dyn KvEngine>> {
     };
     let db = cfg.open()?;
     check_durability_gate(db.as_ref())?;
+    if std::env::var_os(COUNT_ENV).is_some() {
+        eprintln!("门面计数器已挂上（{COUNT_ENV}）：句柄释放时把各类门面调用打到 stderr");
+        return Ok(counted(db, &Meter::default(), true));
+    }
     Ok(db)
 }
 
@@ -170,4 +182,279 @@ pub fn dir_size(root: &Path) -> DirSize {
         }
     }
     out
+}
+
+// ── 门面调用计数器（§17 补记廿六）────────────────────────────────────────────
+//
+// 为什么要有它：本机墙钟 run 间是 ±2×（§11.3 两臂 226 s / 327 s 同形状），**这个粒度上计时不算证据**。
+// 而 §9.6.1 那条"门面每次读调用折一遍全库"是所有固定成本的根源 ⇒ 判优只能靠**折的次数**。
+// 它同时回答另一件事：写类与"事务收尾"分格，是因为每次 `commit()` 带一次 WAL fsync
+// （§11.1：耗时 = 事务数 × 盘单价，机械盘 85.8 ms），所以事务数本身就是成本的一项。
+
+/// 打开句柄时挂计数器的环境变量名。**只在 [`open_store`] 里读一次**。
+pub const COUNT_ENV: &str = "TWOSYNC_COUNT_CALLS";
+
+/// 按**代价形状**分桶，不按方法名分桶 —— 这是这把尺子唯一的设计决定。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CallCounts {
+    /// `get` / `exists` / `get_meta` / `multi_get` / `get_ttl`
+    pub point_read: u64,
+    /// `scan` / `prefix_scan` / `reverse_scan` / `seek*` / `search_keys` / `key_count` / `export_*`
+    pub scan: u64,
+    /// `set` / `delete` / `batch_*` / `incr` / `decr` / TTL 写
+    pub write: u64,
+    /// `commit()` + `rollback()`：事务数（= WAL fsync 次数的下界）
+    pub txn_end: u64,
+    /// `health` / `vacuum` / `flush` / `checkpoint`：诊断路径，允许它是 O(全库)
+    pub admin: u64,
+}
+
+impl CallCounts {
+    /// **"折了几遍全库"**：两个读桶之和。§15.22 那条固定成本就是这个数 × 一次全库折的代价。
+    pub fn folds(&self) -> u64 {
+        self.point_read + self.scan
+    }
+
+    /// 这一段区间的账（计数器是累计的，用例要的是"这一趟花了多少"）。
+    /// 用 `saturating_sub`：把手在两个快照之间被别的线程加过也不会下溢成一个大数把结论带偏。
+    pub fn since(&self, earlier: CallCounts) -> CallCounts {
+        CallCounts {
+            point_read: self.point_read.saturating_sub(earlier.point_read),
+            scan: self.scan.saturating_sub(earlier.scan),
+            write: self.write.saturating_sub(earlier.write),
+            txn_end: self.txn_end.saturating_sub(earlier.txn_end),
+            admin: self.admin.saturating_sub(earlier.admin),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "点读 {} / 扫描 {} ⇒ 折全库 {} 次；写 {} / 事务收尾 {}（≈ WAL fsync 次数）/ 诊断 {}",
+            self.point_read,
+            self.scan,
+            self.folds(),
+            self.write,
+            self.txn_end,
+            self.admin
+        )
+    }
+}
+
+/// 可共享的计数把手。用法：**先拿把手，再把引擎包起来** —— 包装体交出去之后就变成
+/// `Box<dyn KvEngine>`，测试没法再 downcast 回来读账，把手是唯一不留"取账专用接口"的办法
+/// （往 `KvEngine` 上加一个 `fn counts(&self)` 才是坏路子：那是为了让一个测量工具而污染四个引擎的实现）。
+#[derive(Clone, Default)]
+pub struct Meter(Arc<Mutex<CallCounts>>);
+
+impl Meter {
+    pub fn snapshot(&self) -> CallCounts {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn add(&self, f: impl FnOnce(&mut CallCounts)) {
+        f(&mut self.0.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+}
+
+/// 门面的一层透明包装：除计数之外**不改任何行为**，每个方法原样转发。
+pub struct Counted {
+    inner: Box<dyn KvEngine>,
+    meter: Meter,
+    /// true = 句柄释放时把账打到 stderr（命令行那条路）；测试里给 false，免得刷屏。
+    announce: bool,
+}
+
+/// 用 `meter` 把 `inner` 包起来。
+pub fn counted(inner: Box<dyn KvEngine>, meter: &Meter, announce: bool) -> Box<dyn KvEngine> {
+    Box::new(Counted {
+        inner,
+        meter: meter.clone(),
+        announce,
+    })
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if self.announce {
+            eprintln!(
+                "门面读数 [{}] = {}",
+                self.inner.name(),
+                self.meter.snapshot().line()
+            );
+        }
+    }
+}
+
+impl KvEngine for Counted {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn path(&self) -> Option<&Path> {
+        self.inner.path()
+    }
+    fn begin(&self) -> Box<dyn KvTxn + '_> {
+        Box::new(CountedTxn {
+            inner: self.inner.begin(),
+            meter: &self.meter,
+        })
+    }
+    // 批量导入会话不计数：twosync 现在不走它（`bulk` 只在引擎侧的导入实验里出现）。
+    // 为它再写一层包装就是把"尺子"变成"第二套实现"——要量它的时候再加。
+    fn begin_bulk(&self) -> Box<dyn KvBulk + '_> {
+        self.inner.begin_bulk()
+    }
+    fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.export_latest_visible(include_deleted)
+    }
+    fn vacuum(&self) -> std::result::Result<VacuumStats, EngineError> {
+        self.meter.add(|c| c.admin += 1);
+        self.inner.vacuum()
+    }
+    fn health(&self) -> MvccHealth {
+        self.meter.add(|c| c.admin += 1);
+        self.inner.health()
+    }
+    fn set_vacuum_auto_slice(&self, rows: u64) {
+        self.inner.set_vacuum_auto_slice(rows)
+    }
+    fn vacuum_auto_slice(&self) -> u64 {
+        self.inner.vacuum_auto_slice()
+    }
+    fn durability_profile(&self) -> DurabilityProfile {
+        self.inner.durability_profile()
+    }
+    fn flush(&self) -> std::result::Result<(), EngineError> {
+        self.meter.add(|c| c.admin += 1);
+        self.inner.flush()
+    }
+    fn checkpoint(&self) -> std::result::Result<(), EngineError> {
+        self.meter.add(|c| c.admin += 1);
+        self.inner.checkpoint()
+    }
+    fn merge(&self) -> std::result::Result<(), EngineError> {
+        self.meter.add(|c| c.admin += 1);
+        self.inner.merge()
+    }
+}
+
+/// 事务的计数包装。`'a` 挂在 [`Counted`] 上：引擎句柄活着，事务才活着（与引擎自己的语义一致）。
+pub struct CountedTxn<'a> {
+    inner: Box<dyn KvTxn + 'a>,
+    meter: &'a Meter,
+}
+
+impl KvTxn for CountedTxn<'_> {
+    fn version(&self) -> u64 {
+        self.inner.version()
+    }
+    fn set(&self, key: &[u8], value: Vec<u8>) -> bool {
+        self.meter.add(|c| c.write += 1);
+        self.inner.set(key, value)
+    }
+    fn set_with_ttl(&self, key: &[u8], value: Vec<u8>, ttl: Duration) -> bool {
+        self.meter.add(|c| c.write += 1);
+        self.inner.set_with_ttl(key, value, ttl)
+    }
+    fn delete(&self, key: &[u8]) -> bool {
+        self.meter.add(|c| c.write += 1);
+        self.inner.delete(key)
+    }
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.meter.add(|c| c.point_read += 1);
+        self.inner.get(key)
+    }
+    fn exists(&self, key: &[u8]) -> bool {
+        self.meter.add(|c| c.point_read += 1);
+        self.inner.exists(key)
+    }
+    fn get_meta(&self, key: &[u8]) -> Option<KeyMeta> {
+        self.meter.add(|c| c.point_read += 1);
+        self.inner.get_meta(key)
+    }
+    fn batch_set(&self, items: &[(Vec<u8>, Vec<u8>)]) -> std::result::Result<(), Vec<u8>> {
+        self.meter.add(|c| c.write += 1);
+        self.inner.batch_set(items)
+    }
+    fn batch_delete(&self, keys: &[Vec<u8>]) -> std::result::Result<(), Vec<u8>> {
+        self.meter.add(|c| c.write += 1);
+        self.inner.batch_delete(keys)
+    }
+    fn multi_get(&self, keys: &[Vec<u8>]) -> Vec<Option<Vec<u8>>> {
+        self.meter.add(|c| c.point_read += 1);
+        self.inner.multi_get(keys)
+    }
+    fn incr(&self, key: &[u8], delta: i64) -> std::result::Result<i64, IncrError> {
+        self.meter.add(|c| c.write += 1);
+        self.inner.incr(key, delta)
+    }
+    fn decr(&self, key: &[u8], delta: i64) -> std::result::Result<i64, IncrError> {
+        self.meter.add(|c| c.write += 1);
+        self.inner.decr(key, delta)
+    }
+    fn incr_with_ttl(
+        &self,
+        key: &[u8],
+        delta: i64,
+        ttl: Duration,
+    ) -> std::result::Result<i64, IncrError> {
+        self.meter.add(|c| c.write += 1);
+        self.inner.incr_with_ttl(key, delta, ttl)
+    }
+    fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.scan(start, end)
+    }
+    fn reverse_scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.reverse_scan(start, end)
+    }
+    fn prefix_scan(&self, prefix: &[u8]) -> Vec<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.prefix_scan(prefix)
+    }
+    fn seek(&self, key: &[u8]) -> Option<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.seek(key)
+    }
+    fn seek_prev(&self, key: &[u8]) -> Option<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.seek_prev(key)
+    }
+    fn search_keys(&self, query: &SearchQuery) -> SearchPage {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.search_keys(query)
+    }
+    fn key_count(&self, prefix: &[u8]) -> usize {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.key_count(prefix)
+    }
+    fn get_ttl(&self, key: &[u8]) -> Option<Option<Duration>> {
+        self.meter.add(|c| c.point_read += 1);
+        self.inner.get_ttl(key)
+    }
+    fn refresh_ttl(&self, key: &[u8], ttl: Duration) -> bool {
+        self.meter.add(|c| c.write += 1);
+        self.inner.refresh_ttl(key, ttl)
+    }
+    fn persist_key(&self, key: &[u8]) -> bool {
+        self.meter.add(|c| c.write += 1);
+        self.inner.persist_key(key)
+    }
+    fn purge_expired(&self) -> usize {
+        self.meter.add(|c| c.write += 1);
+        self.inner.purge_expired()
+    }
+    fn export_latest_visible(&self, include_deleted: bool) -> Vec<ExportRecord> {
+        self.meter.add(|c| c.scan += 1);
+        self.inner.export_latest_visible(include_deleted)
+    }
+    fn commit(&self) {
+        self.meter.add(|c| c.txn_end += 1);
+        self.inner.commit()
+    }
+    fn rollback(&self) {
+        self.meter.add(|c| c.txn_end += 1);
+        self.inner.rollback()
+    }
 }

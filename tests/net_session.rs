@@ -31,7 +31,7 @@ use twosync::store::history;
 use twosync::store::keys;
 use twosync::store::object;
 use twosync::store::worktree;
-use twosync::utils::{objects_dir, open_store, site_id};
+use twosync::utils::{self, objects_dir, open_store, site_id};
 
 const PROJECT: &str = "shared";
 /// §10.4 差分表那一臂用的项目名（语料是 `D:\ts10g\dt\a\lab`，与上面那套内存管道用例无关）。
@@ -106,6 +106,21 @@ impl Site {
         let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
         Site {
             db,
+            pid: keys::project_id(PROJECT),
+            tmp,
+        }
+    }
+
+    /// 与 [`Site::open`] 同一件事，但把引擎套一层**门面调用计数器**（`utils::Meter`）。
+    ///
+    /// 为什么要这个形状：`open_store` 只在环境变量存在时才包（默认路径零开销），而测试要的是
+    /// "**我自己**拿把手"——所以先正常开、再手工包，读账走把手而不是往 `KvEngine` 上加一个
+    /// `fn counts()`（那等于为了让一把尺子去污染四个引擎的实现）。
+    fn metered(meter: &twosync::utils::Meter) -> Site {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let inner = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        Site {
+            db: twosync::utils::counted(inner, meter, false),
             pid: keys::project_id(PROJECT),
             tmp,
         }
@@ -1719,4 +1734,95 @@ fn an_inherited_rot_slips_the_push_gate_and_is_caught_on_read() {
         msg.contains("块") || msg.contains("block"),
         "报错要指到块这一层，实际：{msg}"
     );
+}
+
+/// 把门面上"一次 push 折了几遍全库"钉成**整数断言**（§17 补记廿六）。
+///
+/// 为什么必须有这把尺子：本机墙钟 run 间是 ±2×（§11.3 里同形状的臂 3 = 226 s、臂 4 = 327 s），
+/// 所以"我把它变快了"这种话不能拿计时当证据。而**折全库的次数是整数**，可以断言、可以回归。
+///
+/// 这条断言的是**发起端与仓库大小无关**——那正是差集推送（补记廿三）的全部意义：
+/// 未变的子树不收集 ⇒ 不读 ⇒ 不折。收端那一侧此刻**还在**随目录数涨（`count_entries` 与
+/// `build::diff` 按层读），所以这里只钉发起端，并把两边的数都印出来当 §15.25 的读数。
+///
+/// 跑法：`cargo test --test net_session -- --nocapture the_push_fold_count`
+#[test]
+fn the_push_fold_count_does_not_grow_with_the_repo_on_the_sending_side() {
+    // 两个规模：3 个条目与 24 个条目（同形状：每条目一个自己的目录）。
+    // 差集成立 ⇒ 发起端的折数**一模一样**；差集不成立，24 那把会多出二十几次点读。
+    let mut by_n: Vec<(usize, utils::CallCounts, utils::CallCounts)> = Vec::new();
+    for n in [3usize, 24usize] {
+        let (sent, recv) = incremental_push_counts(n);
+        println!(
+            "PUSH_FOLDS n={n} 发起端：{} | 收端：{}",
+            sent.line(),
+            recv.line()
+        );
+        by_n.push((n, sent, recv));
+    }
+
+    let small = &by_n[0].1;
+    let big = &by_n[1].1;
+    assert_eq!(
+        small.folds(),
+        big.folds(),
+        "发起端折了 {} vs {} 遍：差集退化成了按条目数折（补记廿三那条修复没了）",
+        small.folds(),
+        big.folds()
+    );
+    // 绝对上界：这一趟真该做的事只有"读两份 head + 三份可达闭包(各一次装索引) + 差集那几棵变化的树"。
+    // 留了余量，但**不许悄悄涨回几十倍** —— 24 条目的站点都不该超过这个数。
+    assert!(small.folds() <= 30, "发起端折了 {} 遍，比设计值宽：{small:?}", small.folds());
+
+    // 收端此刻仍然随规模涨：**这是已知成本，不是这条用例要修的东西**（§15.25），
+    // 但把它钉成一条会失败的断言比不写强 —— 哪天有人把它修了，这条断言会红，逼他改注释。
+    assert!(
+        by_n[1].2.folds() > by_n[0].2.folds(),
+        "收端折数没有随条目数涨？那 §15.25 那条已知成本已经被修掉了，来更新本节"
+    );
+}
+
+/// 建一个 `n` 条目的站点、推一版、改掉**其中一个**文件再推一版，返回**第二推**两边的账。
+fn incremental_push_counts(n: usize) -> (utils::CallCounts, utils::CallCounts) {
+    let ma = utils::Meter::default();
+    let mb = utils::Meter::default();
+    let a = Site::metered(&ma);
+    let b = Site::metered(&mb);
+    let files = seed(n);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b_)| (p.as_str(), b_.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
+    round_ok(&a, &b, &opts(PROJECT)); // 首推：整仓库都在这儿，不计入下面的差集账
+
+    let victim = a.proj().join("d1").join("f1.bin");
+    let mut body = fs::read(&victim).expect("读原文件");
+    body[9] ^= 0xFF;
+    fs::write(&victim, &body).expect("改一个字节");
+    worktree::scan(&*a.db, a.pid, &a.proj(), false, 500).expect("scan");
+    let store = a.cas();
+    build::build(
+        &*a.db,
+        a.pid,
+        &store,
+        &a.proj(),
+        Meta {
+            peer: "a",
+            msg: "改一个字节",
+            ts: 2,
+            allow_mass_delete: true,
+        },
+    )
+    .expect("增量提交");
+
+    let before_a = ma.snapshot();
+    let before_b = mb.snapshot();
+    let (rep, _served) = round_ok(&a, &b, &opts(PROJECT));
+    assert_eq!(rep.blocks_sent, 1, "这一推就该上线一个脏块：{rep:?}");
+    assert_eq!(rep.blobs_sent, 1, "只有一份清单变了：{rep:?}");
+    (
+        ma.snapshot().since(before_a),
+        mb.snapshot().since(before_b),
+    )
 }
