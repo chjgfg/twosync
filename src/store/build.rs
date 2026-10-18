@@ -1306,22 +1306,37 @@ fn split_opt(path: &str) -> Option<(&str, &str)> {
 /// 多 head 时真正的 head 集合 = 这些 commit 里没有后代的那些，那个可达性过滤是 M3
 /// union 的活；现在 `set_ref` 只会写进一个 commit，所以集合大小恒为 1，过滤无从触发。
 pub fn ref_heads(db: &dyn KvEngine, pid: ProjectId, r: &str) -> Result<Vec<Hash>> {
+    all_ref_heads(db, pid, Some(r))
+}
+
+/// 本项目**所有 ref** 指向的 commit 集合（`r = None`），或指定那一个 ref 的集合。
+///
+/// GC 的保留集必须从"全部 ref"出发而不是只看 `main`：M4 会带来 branch/tag，到时候
+/// 只跟着 `main` 收就把还挂在别的 ref 上的历史判成了垃圾。键的形状（`H|p|名|0x00|hash`）
+/// 只在这儿解释一次，`ref_heads` 是它的 `Some(r)` 特例。
+pub fn all_ref_heads(db: &dyn KvEngine, pid: ProjectId, r: Option<&str>) -> Result<Vec<Hash>> {
     let mut prefix = vec![keys::TAG_HEAD];
     prefix.extend_from_slice(&pid.to_be_bytes());
-    prefix.extend_from_slice(r.as_bytes());
-    prefix.push(0x00);
+    if let Some(r) = r {
+        prefix.extend_from_slice(r.as_bytes());
+        prefix.push(0x00);
+    }
     let tx = db.begin();
     let rows = tx.prefix_scan(&prefix);
     tx.commit();
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let key = &row.key[prefix.len()..];
-        if key.len() != 32 {
+    for row in &rows {
+        // `Some(r)` 时尾巴就是那 32 字节；`None` 时尾巴是 `名|0x00|hash`。
+        // 两种形状在"取最后 32 字节"这一句上合流，而 ref 名里不许有 `0x00`（§9.2）⇒ 切不出半个名字。
+        let tail = &row.key[prefix.len()..];
+        if tail.len() < 32 {
             continue;
         }
         let mut h = [0u8; 32];
-        h.copy_from_slice(key);
-        out.push(h);
+        h.copy_from_slice(&tail[tail.len() - 32..]);
+        if !out.contains(&h) {
+            out.push(h);
+        }
     }
     Ok(out)
 }

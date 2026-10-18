@@ -14,7 +14,7 @@
 //! 有 `--max-count`，而"0 = 全部"必须写成显式选项而不是默认（十万历史 × 32 B 也要 3 MB）。
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashSet, VecDeque};
 
 use storage_engines::{KvEngine, SearchQuery};
 
@@ -138,6 +138,66 @@ pub fn resolve(
 
 /// [`walk_tree`] 与 [`descend`] 的回调：拿到（完整路径, 条目）。
 pub type TreeVisit<'a> = dyn FnMut(&str, &object::TreeEntry) -> Result<()> + 'a;
+
+/// 从一组 head（外加一批"也算已知的"哈希）出发把亲代闭包走完。**错误一律照实抛出**。
+///
+/// 为什么必须是严格的：GC 用同一个闭包当**保留集**，少标一个 commit 就等于把一个还活着的对象
+/// 判成垃圾删掉——那是不可逆的那类错。`net::session` 那边也走这一份实现，但它**故意**把错误
+/// 咽掉（读不到亲代就当没有亲代），因为那里的后果只是"多推几个对象"，幂等、无害。
+/// 同一次遍历、两种容错，差别写在这儿，别在下一个人手里被"统一"掉。
+pub fn reachable_strict(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    heads: &[Hash],
+    extra: &[Hash],
+) -> Result<BTreeSet<Hash>> {
+    let mut seen = BTreeSet::new();
+    let mut q: VecDeque<Hash> = VecDeque::new();
+    for h in heads.iter().chain(extra.iter()) {
+        if seen.insert(*h) {
+            q.push_back(*h);
+        }
+    }
+    while let Some(h) = q.pop_front() {
+        for p in object::parents_of(db, pid, &h)? {
+            if seen.insert(p) {
+                q.push_back(p);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// 一棵树的闭包里出现过的**全部对象**：commit 的 tree、每一层 tree、每一个 blob。
+///
+/// GC 的保留集要的就是这个（"哪些 `B`/`T` 行还有人引用"），而它必须在**不物化整棵树**的前提下走完
+/// ——深度优先、边收哈希边丢条目，内存只剩三个哈希集合。
+pub fn marked_objects(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    commits: &BTreeSet<Hash>,
+) -> Result<(BTreeSet<Hash>, BTreeSet<Hash>)> {
+    let mut trees = BTreeSet::new();
+    let mut blobs = BTreeSet::new();
+    for c in commits {
+        let commit = object::read_commit(db, pid, c)?;
+        let mut stack = vec![commit.tree];
+        while let Some(t) = stack.pop() {
+            if !trees.insert(t) {
+                continue;
+            }
+            for e in object::read_tree(db, pid, &t)? {
+                match e.kind {
+                    Kind::Dir => stack.push(e.hash),
+                    Kind::File | Kind::Symlink => {
+                        blobs.insert(e.hash);
+                    }
+                }
+            }
+        }
+    }
+    Ok((trees, blobs))
+}
 
 /// 深度优先列出一棵树的全部路径，**边遍历边回调**：`ls-files` 面对一百万个文件时
 /// 也不许先把它们装进一个 `Vec`（§9.6.1）。

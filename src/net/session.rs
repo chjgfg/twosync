@@ -33,7 +33,7 @@
 //! 名字里带 `/`、`\`、`..` 的条目一旦进了树对象，要等 M3 检出时才发现就晚了——那时它已经是
 //! 某个合法 commit 的一部分，撤回来要动 head。入库前先拒，代价是每条目一次字符串检查。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ use crate::error::{Error, Result};
 use crate::net::frame::{self, Proto, PROTO_VER};
 use crate::store::build;
 use crate::store::cas::{self, Cas};
+use crate::store::history;
 use crate::store::keys::{self, Hash, Kind, ProjectId};
 use crate::store::object;
 
@@ -687,21 +688,10 @@ fn count_entries(db: &dyn KvEngine, pid: ProjectId, root: &Hash) -> Result<u32> 
 /// 从若干起点出发的可达 commit 集合。解不开亲代的 hash 只算它自己——那是对端自报的祖先，
 /// 我们本来就没有它的对象。
 pub fn reachable(db: &dyn KvEngine, pid: ProjectId, heads: &[Hash], extra: &[Hash]) -> BTreeSet<Hash> {
-    let mut seen = BTreeSet::new();
-    let mut q: VecDeque<Hash> = VecDeque::new();
-    for h in heads.iter().chain(extra.iter()) {
-        if seen.insert(*h) {
-            q.push_back(*h);
-        }
-    }
-    while let Some(h) = q.pop_front() {
-        for p in object::parents_of(db, pid, &h).unwrap_or_default() {
-            if seen.insert(p) {
-                q.push_back(p);
-            }
-        }
-    }
-    seen
+    // **这里故意把错误咽掉**：读不到亲代就当没有亲代 ⇒ 少算一份"对端已知"⇒ 最坏是多推几个对象，
+    // 幂等、无害。GC 走同一份遍历但**不咽**（`history::reachable_strict`）：那边少标一个 commit
+    // 就是把活数据判成垃圾删掉。两种容错的差别写在 `history` 那侧，别被"统一"掉。
+    history::reachable_strict(db, pid, heads, extra).unwrap_or_default()
 }
 
 /// head 集合的**极大元**：谁能被**别的候选**走到，谁就不是头（它是那个头的祖先）。

@@ -203,6 +203,23 @@ impl Cas {
         *hash == ZERO_HASH || self.dir.join(Self::path_of(hash)).exists()
     }
 
+    /// 删一个块。返回是否真删了。
+    ///
+    /// **只在 `K` 行已经记为 refcnt 0 之后调用**（§9.3）：删块与删清单是两个动作，中间崩了留下的是
+    /// "没人引用的孤儿文件"而不是"清单引用不存在的块"——方向反过来才是要命的那种。
+    /// 全零块本来就不落盘，所以这里对它是 no-op。
+    pub fn remove_block(&self, hash: &Hash) -> Result<bool> {
+        if *hash == ZERO_HASH {
+            return Ok(false);
+        }
+        let p = self.dir.join(Self::path_of(hash));
+        match fs::remove_file(&p) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
     /// 在块仓目录里占一个临时文件名。**同一目录**才有原子 `rename` 的保证，
     /// 所以外部（`restore` 读符号链接目标）要写临时文件也用它，不许自己拼名字。
     pub fn temp_for(&self, tag: &str) -> PathBuf {

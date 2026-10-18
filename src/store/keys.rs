@@ -45,6 +45,21 @@ pub fn strip(raw: &[u8]) -> Result<&[u8], crate::error::Error> {
     }
 }
 
+/// 记录编码的唯一一份。**值本身不带信封**，写引擎前还要过 [`wrap`]。
+///
+/// 为什么收在这儿而不是各模块自己写：`build`/`object`/`gc` 三处原先各有一份
+/// `postcard::to_allocvec` + 自己的错误文案，报错口径会漂（"解码失败"到底是谁说的、带不带记录类型名，
+/// 排查磁盘损坏时就是这个区别）。错误里必须带 `what`——只说"解码失败"的报错等于没说。
+pub fn enc<T: serde::Serialize>(v: &T, what: &str) -> crate::error::Result<Vec<u8>> {
+    postcard::to_allocvec(v).map_err(|e| crate::error::Error::Codec(format!("{what} 编码失败：{e}")))
+}
+
+/// 读一条记录：去信封 + 解码。见 [`enc`] 的同一条理由。
+pub fn rec<T: serde::de::DeserializeOwned>(raw: &[u8], what: &str) -> crate::error::Result<T> {
+    postcard::from_bytes(strip(raw)?)
+        .map_err(|e| crate::error::Error::Codec(format!("{what} 解码失败：{e}")))
+}
+
 /// 条目类型。**工作树记录与对象清单共用这一个枚举**：两边各写一份的话，W→tree 的转换
 /// 就要手写映射，而映射表是最容易漂的地方（`copy_out` 那个 hasher bug 是同一类错误）。
 ///
