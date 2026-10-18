@@ -410,13 +410,24 @@ pub fn gc(
             );
         }
 
-        // 配额账（§14 Q12 定案：只管**首份之后**的增量，默认 20% × 工作树）。
-        let work = utils::dir_size(&cli.root).bytes;
+        // 配额账（§14 Q12 定案：配额管的是**首次导入之后**的增量 ⇒ 上限 = 工作树 × (1 + 20%)，
+        // 首份全量不计入——12 GB 的内容不可能存进 2.4 GB，那条在 §11.1 实测是 100.1%）。
+        //
+        // 工作树按**注册表里逐个项目的目录**累加，不拿 `--root` 整棵树去量：站点根下面还挂着
+        // `.twosync/`（CAS 自己！）与别的工具的目录，量它会得出"工作树 30 GB"这种 doubled 的数
+        // （第一版就踩过：`dir_size(--root)` 把 CAS 算进工作树，于是配额比实际松了一倍）。
+        let mut work = 0u64;
+        for (name, proj) in &reg.projects {
+            let d = utils::dir_size(&cli.root.join(&proj.path));
+            work += d.bytes;
+            println!("  工作树 {name:<12} = {:.1} MiB（{} 个文件，读不到 {} 项）",
+                d.bytes as f64 / 1048576.0, d.files, d.unreadable);
+        }
         let cas_bytes = utils::dir_size(&objects_dir(&cli.root)).bytes;
         let limit = if quota_mib > 0.0 {
             (quota_mib * 1048576.0) as u64
         } else {
-            work / 5
+            work + work / 5
         };
         println!(
             "配额        = CAS {:.1} MiB / 工作树 {:.1} MiB ⇒ 上限（{}）{:.1} MiB，现超 {:.1} MiB",
@@ -425,7 +436,7 @@ pub fn gc(
             if quota_mib > 0.0 {
                 "--quota-mib"
             } else {
-                "默认 20%×工作树"
+                "默认 工作树×(1+20%)"
             },
             limit as f64 / 1048576.0,
             cas_bytes.saturating_sub(limit) as f64 / 1048576.0
