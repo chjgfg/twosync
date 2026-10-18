@@ -40,9 +40,10 @@ use crate::net::frame::caps;
 use crate::net::session::{self, PushOpts};
 use crate::store::build;
 use crate::store::cas::Cas;
+use crate::store::gc;
 use crate::store::history;
 use crate::store::keys;
-use crate::utils::{objects_dir, site_id};
+use crate::utils::{self, objects_dir, site_id};
 
 /// 一根管子：读一头、写一头。会话层只认 `Read + Write` 这个形状，所以子进程的 stdio
 /// 与进程自己的 stdio（`agent`）共用同一份会话代码。
@@ -301,7 +302,13 @@ fn io_kind_eof() -> std::io::ErrorKind {
 /// - 想让 `gc` 自己分片，需要门面把 `vacuum_bounded` 提上来 ⇒ 记进 §14 的引擎侧问题，
 ///   **不在这里 downcast 凑**：凑出来的代码要在四个具体类型上各写一遍，等于把引擎的
 ///   类型选择漏进 CLI 层。
-pub fn gc(cli: &Cli, auto_slice: Option<u64>) -> Result<()> {
+pub fn gc(
+    cli: &Cli,
+    auto_slice: Option<u64>,
+    sweep: bool,
+    apply: bool,
+    quota_mib: f64,
+) -> Result<()> {
     let db = cli.store()?;
     let before = db.health();
     println!("engine      = {}", db.name());
@@ -345,6 +352,91 @@ pub fn gc(cli: &Cli, auto_slice: Option<u64>) -> Result<()> {
         before.total_rows,
         after.total_rows
     );
+
+    if sweep {
+        // §9.3 的 mark-sweep。逐项目走：保留集是**按项目**的历史，而块的 refcnt 是**跨项目**的账，
+        // 所以"哪个块能删"只由 refcnt 说话，不由某个项目的保留集说话（理由写在 `store::gc` 模块头）。
+        println!(
+            "回收        = mark-sweep {}；前提是本站点没有别的写者，与 commit/push 并发会误删",
+            if apply { "**落改动**" } else { "只报账（dry-run）" }
+        );
+        let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+        let reg = crate::cli::registry::Registry::load(&cli.root)?;
+        let mut names: Vec<&String> = reg.projects.keys().collect();
+        names.sort();
+        let mut all = gc::Plan::default();
+        for name in names {
+            let pid = keys::project_id(name);
+            let p = gc::sweep(&*db, &cas, pid, !apply)?;
+            all.commits_kept += p.commits_kept;
+            all.commits_dropped += p.commits_dropped;
+            all.trees_dropped += p.trees_dropped;
+            all.blobs_dropped += p.blobs_dropped;
+            all.blocks_unlinked += p.blocks_unlinked;
+            all.bytes_freed += p.bytes_freed;
+            all.blocks_missing += p.blocks_missing;
+            all.orphan_files += p.orphan_files;
+            all.orphan_bytes += p.orphan_bytes;
+            println!(
+                "  {name:<14} 保留 {:>5} 个事务；回收 事务 {:>3} / tree {:>4} / 清单 {:>5}；块 {:>5} 个 / {:.1} MiB",
+                p.commits_kept,
+                p.commits_dropped,
+                p.trees_dropped,
+                p.blobs_dropped,
+                p.blocks_unlinked,
+                p.bytes_freed as f64 / 1048576.0
+            );
+        }
+        println!(
+            "合计        = 回收 事务 {} / tree {} / 清单 {}；块 {} 个 / {:.1} MiB",
+            all.commits_dropped,
+            all.trees_dropped,
+            all.blobs_dropped,
+            all.blocks_unlinked,
+            all.bytes_freed as f64 / 1048576.0
+        );
+        if all.blocks_missing > 0 {
+            println!(
+                "账清文件没清 = {} 个 ⇒ 以前崩在一次删除的中间（§9.3 那个 pending-delete 形状的残留）",
+                all.blocks_missing
+            );
+        }
+        if all.orphan_files > 0 {
+            println!(
+                "孤儿文件    = {} 个 / {:.1} MiB：盘上有、`K` 账上没有 ⇒ 会话在「块落完、清单还没到」\
+                 时被打断。这一版**只数不删**，因为删它要跟保留集一起判断（见 §9.3 的顺序）",
+                all.orphan_files,
+                all.orphan_bytes as f64 / 1048576.0
+            );
+        }
+
+        // 配额账（§14 Q12 定案：只管**首份之后**的增量，默认 20% × 工作树）。
+        let work = utils::dir_size(&cli.root).bytes;
+        let cas_bytes = utils::dir_size(&objects_dir(&cli.root)).bytes;
+        let limit = if quota_mib > 0.0 {
+            (quota_mib * 1048576.0) as u64
+        } else {
+            work / 5
+        };
+        println!(
+            "配额        = CAS {:.1} MiB / 工作树 {:.1} MiB ⇒ 上限（{}）{:.1} MiB，现超 {:.1} MiB",
+            cas_bytes as f64 / 1048576.0,
+            work as f64 / 1048576.0,
+            if quota_mib > 0.0 {
+                "--quota-mib"
+            } else {
+                "默认 20%×工作树"
+            },
+            limit as f64 / 1048576.0,
+            cas_bytes.saturating_sub(limit) as f64 / 1048576.0
+        );
+        if cas_bytes > limit {
+            println!(
+                "还超着      = 回收之后仍然超配额 ⇒ 剩下的都是**仍被保留 head 可达**的字节，gc 无权删\
+                 （不变量 (d)）。要腾地方得由人决定丢哪一版：那是 M4 的 `reset`/`prune --expire`"
+            );
+        }
+    }
     Ok(())
 }
 

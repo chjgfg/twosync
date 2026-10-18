@@ -203,6 +203,11 @@ impl Cas {
         *hash == ZERO_HASH || self.dir.join(Self::path_of(hash)).exists()
     }
 
+    /// 块仓的根目录。GC 要**扫盘**找孤儿文件（盘上有、账上没有），除这个之外没有别的路。
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// 删一个块。返回是否真删了。
     ///
     /// **只在 `K` 行已经记为 refcnt 0 之后调用**（§9.3）：删块与删清单是两个动作，中间崩了留下的是

@@ -232,6 +232,19 @@ pub enum Cmd {
         /// 回收是全库一刀；要"不制造 IO 突发"就把这条交给引擎的小圈（§14 记了引擎侧的缺口）。
         #[arg(long)]
         auto_slice: Option<u64>,
+
+        /// §9.3 的 mark-sweep：回收**不可达**的 commit/tree/blob，以及 refcnt 归 0 的块
+        ///
+        /// 不带 `--apply` 时只报账、一个字都不改（先看"为什么这个库突然大了"）。
+        /// **前提是本站点没有别的写者**：与 `commit`/`push`/`agent` 并发会把正在成形的历史判成垃圾。
+        #[arg(long)]
+        sweep: bool,
+        /// 配合 `--sweep`：真的落改动。不带就是 dry-run
+        #[arg(long)]
+        apply: bool,
+        /// 配额上限（MiB，站点级）。0 = 用 §14 Q12 的默认口径（工作树体积 × 20%，只管首份之后的增量）
+        #[arg(long, default_value_t = 0.0)]
+        quota_mib: f64,
     },
 
     /// 对端身份表（§9.5.1 的 TOFU）：`list` 看库里记了谁，`forget` 忘掉一条以便重新确认

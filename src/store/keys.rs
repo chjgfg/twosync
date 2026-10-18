@@ -285,6 +285,22 @@ pub fn hex(hash: &Hash) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// [`hex`] 的反向：从文件名还原 hash。长度不对或含非十六进制字符就返回 `None` ——
+/// 调用方是在**扫盘**，盘上任何奇怪的东西都不该被硬编成"当作某个 hash"处理。
+pub fn unhex(s: &str) -> Option<Hash> {
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (b[i * 2] as char).to_digit(16)?;
+        let lo = (b[i * 2 + 1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 /// `log`/`status` 里显示用的短摘要。
 pub fn short(hash: &Hash) -> String {
     hex(hash)[..8].to_string()
