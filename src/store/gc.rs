@@ -317,11 +317,6 @@ fn block_hash_from_path(p: &std::path::Path) -> Option<Hash> {
     keys::unhex(&s)
 }
 
-/// 一小段写事务的公共形状见上面三处：删行这类操作 `delete` 要 `&mut`，所以每个站点都是
-/// `let tx = db.begin(); …; tx.commit();`。抽成闭包反而要把 `KvTxn` 的 dyn 与生命周期都写进签名，
-/// 三行一次的重复比那个签名便宜。
-///
-
 /// 保留集的形状，给命令层打印用（"这一版为什么没删东西"要看的就是这四个数）。
 pub fn keep_report(db: &dyn KvEngine, pid: ProjectId) -> Result<(usize, usize, usize)> {
     let heads = build::all_ref_heads(db, pid, None)?;
