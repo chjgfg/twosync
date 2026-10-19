@@ -316,3 +316,101 @@ fn no_scan_mark_means_no_reconciliation() {
     );
     // `status` 的判据就是这一条：没有 epoch 就整段跳过，不去比盘。
 }
+
+// ── 窄扫（`Scope::Dir`）：它买到的是"一轮只花 0.1 s"，代价是"这一轮报不出删除" ────────
+//
+// 这一族的分工：`worktree_scan` 只测扫描器自己的两条承诺（`Z` 不动、路径形状不变），
+// "不产生假删除 / 新文件照常看得见"在 `tests/build_commit.rs` 那侧（要建 commit 才看得见）。
+
+/// 造两个目录：`a/` 与 `b/`，各一个文件。
+fn seed_two_dirs(proj: &Path) {
+    fs::create_dir_all(proj.join("a")).unwrap();
+    fs::create_dir_all(proj.join("b")).unwrap();
+    fs::write(proj.join("a/x.bin"), b"the a file").unwrap();
+    fs::write(proj.join("b/y.bin"), b"the b file").unwrap();
+}
+
+#[test]
+fn a_narrow_round_does_not_move_the_liveness_line() {
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(&proj).unwrap();
+    seed_two_dirs(&proj);
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+
+    let full = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    assert_eq!(full.walked, 4, "两个文件 + 两个目录：{}", full.walked);
+    let mark_after_full = worktree::last_mark(&*db, pid).expect("全量轮必须盖章");
+    assert_eq!(mark_after_full.round, 1);
+
+    // 窄扫 b/：只走那一层（连子树），`walked` 必须显著小于全量
+    let narrow = worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Dir("b".to_string()),
+        false,
+        8,
+    )
+    .unwrap();
+    assert_eq!(narrow.walked, 2, "只该看见 b 与 b/y.bin：{}", narrow.walked);
+
+    // **这一条就是整个设计的核心**：活性线不许被半轮推进。
+    let mark = worktree::last_mark(&*db, pid).expect("标记还在");
+    assert_eq!(mark.epoch, mark_after_full.epoch, "窄扫把 Z.epoch 推进了 ⇒ 下一轮会把没走的目录判成删除");
+    assert_eq!(mark.round, mark_after_full.round, "轮次也不许涨：它记的是「完整扫描第几轮」");
+}
+
+#[test]
+fn narrow_scan_paths_stay_project_relative() {
+    // 窄扫最容易写错的一格：遍历起点换成了子树，路径却必须仍然相对**项目根**。
+    // 记成 `y.bin` 而不是 `b/y.bin` 的话，那一行永远对不上、下一次全量轮就凭空多一条 add。
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(&proj).unwrap();
+    seed_two_dirs(&proj);
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+    worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    let before = db.health().total_rows;
+
+    worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Dir("b".to_string()),
+        false,
+        8,
+    )
+    .unwrap();
+    // 键必须是 `b`、`b/y.bin` 那两条（各多一个版本行），而不是新造出 `y.bin`。
+    let tx = db.begin();
+    let hit = tx.get(&keys::worktree_key(pid, "b/y.bin")).is_some();
+    let ghost = tx.get(&keys::worktree_key(pid, "y.bin")).is_some();
+    tx.commit();
+    assert!(hit, "`b/y.bin` 那行必须还在（窄扫要盖的就是它）");
+    assert!(!ghost, "窄扫写出了 `y.bin` 这种半截路径 ⇒ 键序会跟全量轮对不上");
+    assert!(db.health().total_rows > before, "盖了章就该有新版本行");
+}
+
+#[test]
+fn a_narrow_scan_of_a_missing_directory_is_an_error_not_a_no_op() {
+    // "走错了目录"必须是响亮的：静默走出 0 行 = 下一轮以为什么都没变。
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(&proj).unwrap();
+    seed_two_dirs(&proj);
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+    let e = worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Dir("nope".to_string()),
+        false,
+        8,
+    )
+    .expect_err("不存在的目录该报错");
+    assert!(e.to_string().contains("不是一个目录"), "实际：{e}");
+}

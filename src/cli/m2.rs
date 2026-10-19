@@ -63,10 +63,37 @@ pub fn backoff_secs(failures: u32, cap: u64) -> u64 {
 enum Trigger {
     /// 第一轮：立刻跑，不等事件（也让 `--rounds 1` 在测试里是确定行为）
     First,
-    /// 事件静默 `debounce` 秒之后的那一下
-    Quiet(PathBuf),
-    /// 兜底间隔到了
+    /// 事件静默 `debounce` 秒之后的那一下。带的是**要去窄扫的目录**（项目内相对路径，已去重）。
+    ///
+    /// 为什么带目录而不是"有没有事件"：窄扫的范围就是这一轮的全部工作内容，而它直接决定
+    /// 这一轮能不能推进活性线（`Scope::Dir` 不推 `Z`，见 `store::worktree::Scope`）。
+    Quiet(Vec<String>),
+    /// 兜底间隔到了 ⇒ **全量**那一轮
     Periodic,
+}
+
+/// 把事件路径折成"要窄扫哪些目录"：取每个路径的父目录，相对项目根，去重。
+///
+/// 三条过滤：① 不在项目树里的路径（`.twosync/` 自己的写入、临时文件）丢掉 —— 它们不是用户数据，
+/// 让它们触发一轮等于自己追自己；② 目录事件取它的**父**目录，因为 `scan_scoped` 会连子树一起走，
+/// 从父层进去正好覆盖；③ 根目录本身的事件（`rel` 为空）就窄扫根，语义与全量只差"不推 `Z`"。
+fn event_dirs(work: &Path, paths: &[PathBuf]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in paths {
+        let Ok(rel) = p.strip_prefix(work) else { continue };
+        // 父目录（rel 的第一段之外全部丢掉；`a.txt` 的父是根 = ""）。
+        let dir = match rel.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new(""),
+        };
+        let s = dir.to_string_lossy().replace('\\', "/");
+        // 根目录（`s` 为空）只留一条：窄扫根与全量只差"不推 `Z`"这一件事。
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// 常驻循环。旋钮全在 [`DaemonArgs`] 里（八项，位置参数会被传反，见那个结构的注释）。
@@ -136,7 +163,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         let trigger = if round == 1 {
             Trigger::First
         } else {
-            wait(events.as_ref(), next_forced, debounce)
+            wait(events.as_ref(), next_forced, debounce, &work)
         };
         next_forced = Instant::now() + interval;
         let started = Instant::now();
@@ -145,7 +172,18 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         // ── scan + commit ──
         // head 前后各读一次：`commit` 自己会打印，但"有没有真的产生提交"这件事循环层要知道
         // （一次 `H` 前缀扫，与 68 s 的一轮比可以忽略）。
-        m0::scan(cli, false, 2000)?;
+        //
+        // **事件轮走窄扫，兜底轮走全量**（§11.4b 的那条边界，现在兑现成了代码）：
+        // 窄扫只盖它看见的行、**不推 `Z`** ⇒ 活性线还是上一次全量轮的那条 ⇒
+        // 没被走的目录继续算活着，一个假删除都不会有。代价照实说：事件轮报不出删除。
+        match &trigger {
+            Trigger::Quiet(dirs) if !dirs.is_empty() => {
+                for d in dirs {
+                    m0::scan(cli, false, 2000, Some(d))?;
+                }
+            }
+            _ => m0::scan(cli, false, 2000, None)?,
+        }
         let db = cli.store()?;
         let pid = crate::store::keys::project_id(&name);
         let before = build::all_ref_heads(&*db, pid, None)?;
@@ -302,6 +340,7 @@ fn wait(
     events: Option<&Receiver<notify::Event>>,
     deadline: Instant,
     debounce: Duration,
+    work: &Path,
 ) -> Trigger {
     let Some(rx) = events else {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
@@ -317,9 +356,14 @@ fn wait(
         match rx.recv_timeout(budget) {
             Ok(ev) => {
                 // 收到事件 ⇒ 开始计静默期：连续 `debounce` 秒没有新事件才算稳定。
-                let path = ev.paths.first().cloned().unwrap_or_default();
-                while rx.recv_timeout(debounce).is_ok() {}
-                return Trigger::Quiet(path);
+                // **静默期里到达的路径要全部收下**：只取第一个会把"这次改了四个目录"缩成
+                // "窄扫了一个目录"，另外三个要等到下一次全量轮才被看见 —— 那是慢，不是错，
+                // 但没必要拿设计上的漏洞去换一行代码。
+                let mut paths: Vec<PathBuf> = ev.paths.clone();
+                while let Ok(more) = rx.recv_timeout(debounce) {
+                    paths.extend(more.paths);
+                }
+                return Trigger::Quiet(event_dirs(work, &paths));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // 这一段窗口里没事件：兜底时刻到了就是周期触发，否则回到循环继续等。

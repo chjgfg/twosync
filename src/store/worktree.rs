@@ -121,13 +121,74 @@ pub fn scan(
     force: bool,
     batch: usize,
 ) -> Result<Report> {
+    scan_scoped(db, pid, root, &Scope::Full, force, batch)
+}
+
+/// 扫描的范围。**全量与窄扫的区别不是"少走几个目录"这么轻**：它决定这一轮能不能推进活性线。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// 整个项目树。走完可以把 `Z` 的 epoch 推到本轮 —— 于是"本轮没看见的行"才等价于"盘上没了"。
+    Full,
+    /// 只走工作树里这一个目录（事件驱动的那一轮）。
+    ///
+    /// **窄扫轮不许推 `Z`**：活性判定是 `scanned_at >= Z.epoch`，走了一半就推 epoch ⇒
+    /// 没被走到的那些目录全体看起来像"盘上已删" ⇒ 一次假的大规模删除（§8 第一杀手）。
+    /// 所以窄扫只**盖章它看见的行**，commit 那侧仍然拿上一次完整扫描的 epoch 当线：
+    /// 本轮改过/新增的照常进历史，**删除一个都不报**，留给下一次全量轮确认。
+    Dir(String),
+}
+
+impl Scope {
+    /// 这一轮能不能算"完整扫描"。只有全量轮推 `Z`。
+    pub fn is_full(&self) -> bool {
+        matches!(self, Scope::Full)
+    }
+
+    /// 打印用（`scan`/`daemon` 都必须说清这一轮走的是哪一种，否则"这一轮为什么只改了三个文件"
+    /// 没人答得上来）。
+    pub fn label(&self) -> String {
+        match self {
+            Scope::Full => "全量".to_string(),
+            Scope::Dir(d) if d.is_empty() => "窄扫：根目录".to_string(),
+            Scope::Dir(d) => format!("窄扫：{d}"),
+        }
+    }
+}
+
+/// 扫一遍工作树，把每行的最新状态盖进 `W`。`scope` 见 [`Scope`]。
+pub fn scan_scoped(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Path,
+    scope: &Scope,
+    force: bool,
+    batch: usize,
+) -> Result<Report> {
+    // 窄扫时把遍历起点换成那一个目录，但**相对路径仍然按 root 算**（`rel_path(root, …)`）：
+    // `W` 的键是项目内的完整路径，按子树算会把 `d/e/f.bin` 记成 `e/f.bin`，那一行就永远对不上。
+    let base = match scope {
+        Scope::Full => root.to_path_buf(),
+        Scope::Dir(d) => d
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .fold(root.to_path_buf(), |mut p, seg| {
+                p.push(seg);
+                p
+            }),
+    };
+    if !base.is_dir() {
+        return Err(Error::BadInput(format!(
+            "{} 不是一个目录（窄扫的目录必须是项目树里已有的目录）",
+            base.display()
+        )));
+    }
     let started = Instant::now();
     let mut rep = Report::default();
     let mut buf = vec![0u8; HASH_BUF];
     let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
     let now = now_ns();
     let mut tx = db.begin();
-    for found in walker(root) {
+    for found in walker(&base) {
         // 攒满一窗就落盘并换事务。放在循环**开头**，三个 push 点就共用这一处；
         // 代价是 pending 最多 batch+1 条，不是 batch 条。
         if pending.len() >= batch {
@@ -208,19 +269,25 @@ pub fn scan(
 
     // 「这一轮完整走完了」的标记。**必须在全部行落盘之后**再写：反过来做，崩溃会留下一个
     // 指向半轮数据的 epoch，而半轮 epoch 正是我们要消灭的那种假删除的来源。
+    //
+    // **窄扫轮根本不写它**（`Scope::Dir`）：这一遍只走了一个目录，把活性线推到"本轮的时刻"
+    // 等于宣布其余目录都在盘上消失了。宁可让 commit 那侧继续用上一次完整扫描的线 ——
+    // 代价是这一轮报不出删除（下一次全量轮补上），收益是不可能假删。
     drop(tx);
-    let round = last_mark(db, pid).map_or(0, |m| m.round);
-    let mark = ScanMark {
-        epoch: now,
-        seen: rep.seen as u32,
-        walked: rep.walked as u32,
-        round: round + 1,
-    };
-    let tx = db.begin();
-    if !tx.set(&keys::scan_key(pid), encode_mark(&mark)?) {
-        return Err(Error::WriteConflict("Z 扫描标记".to_string()));
+    if scope.is_full() {
+        let round = last_mark(db, pid).map_or(0, |m| m.round);
+        let mark = ScanMark {
+            epoch: now,
+            seen: rep.seen as u32,
+            walked: rep.walked as u32,
+            round: round + 1,
+        };
+        let tx = db.begin();
+        if !tx.set(&keys::scan_key(pid), encode_mark(&mark)?) {
+            return Err(Error::WriteConflict("Z 扫描标记".to_string()));
+        }
+        tx.commit();
     }
-    tx.commit();
 
     rep.elapsed_ms = started.elapsed().as_millis();
     Ok(rep)

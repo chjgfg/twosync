@@ -899,3 +899,110 @@ fn plans_reference_reads_do_not_grow_with_the_number_of_directories() {
 fn object_budget_probe() -> u64 {
     twosync::store::object::TreeIndex::BUDGET_BYTES
 }
+
+// ── 窄扫那两轮（§11.4b 的边界，现在兑现成代码）───────────────────────────────
+//
+// 事件轮只走变化的那几个目录，**不推进活性线**（`Scope::Dir` 不写 `Z`）。
+// 于是这一轮：新增/修改照常进历史，**删除一个都不报** —— 那正是"宁可慢，不可假删"的代价。
+// 下一轮全量才把删除确认掉。两条用例分别钉这两半。
+
+#[test]
+fn a_narrow_round_reports_no_deletions_and_the_next_full_round_does() {
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("a/x.bin"), b"the x");
+    write(&proj.join("b/y.bin"), b"the y");
+    let first = site.commit(cas::DEFAULT_BLOCK, false);
+    assert_eq!(first.changes.add, 4, "两个文件 + 两个目录：{first:?}");
+
+    // 盘上删掉 a/x.bin，但这一轮**只窄扫 b/**（模拟：事件落在 b）。
+    fs::remove_file(proj.join("a/x.bin")).expect("删文件");
+    worktree::scan_scoped(
+        &*site.db,
+        site.pid,
+        &proj,
+        &worktree::Scope::Dir("b".to_string()),
+        false,
+        500,
+    )
+    .expect("窄扫");
+    let second = site.build(cas::DEFAULT_BLOCK, false);
+    assert_eq!(
+        second.changes.delete, 0,
+        "窄扫轮报出了删除 ⇒ 那就是假删除的形状（没走过 a/ 凭什么说 x.bin 没了）"
+    );
+    assert_eq!(second.changes.add, 0, "b/ 没变就不该有新增");
+    assert!(
+        second.commit.is_none(),
+        "什么都没变的一轮不该产生提交，也不该移 head"
+    );
+
+    // 下一次**全量**轮：a/ 被走了一遍，x.bin 没被盖章 ⇒ 删除在这里被确认。
+    site.scan();
+    let third = site.build(cas::DEFAULT_BLOCK, false);
+    assert_eq!(
+        third.changes.delete, 1,
+        "全量轮必须把那一笔删除补上，否则窄扫就成了永久漏记"
+    );
+    assert!(third.commit.is_some(), "有变更就该提交");
+    let listed = build::ref_heads(&*site.db, site.pid, build::MAIN).unwrap();
+    assert_eq!(listed.len(), 1, "还是单 head：{listed:?}");
+}
+
+#[test]
+fn a_narrow_round_picks_up_a_new_file_in_the_scanned_dir() {
+    // 另一半：窄扫买到的东西。事件所在目录里的**新增**必须当场进历史，
+    // 否则"事件驱动的秒级同步"就是一句空话（只剩省时间，没有更快）。
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("a/x.bin"), b"the x");
+    write(&proj.join("b/y.bin"), b"the y");
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    write(&proj.join("b/z.bin"), b"the z");
+    worktree::scan_scoped(
+        &*site.db,
+        site.pid,
+        &proj,
+        &worktree::Scope::Dir("b".to_string()),
+        false,
+        500,
+    )
+    .expect("窄扫 b/");
+    let built = site.build(cas::DEFAULT_BLOCK, false);
+    assert_eq!(built.changes.add, 1, "只该多那一个新文件：{built:?}");
+    assert_eq!(built.changes.delete, 0, "a/ 根本没被走过 ⇒ 不许报任何删除");
+    assert!(built.commit.is_some(), "有新增就该提交");
+    // 树里确实有它：`b/z.bin` 在，`a/x.bin` 也还在（活性线还是上一次全量轮那条）。
+    let heads = build::ref_heads(&*site.db, site.pid, build::MAIN).unwrap();
+    let c = object::read_commit(&*site.db, site.pid, &heads[0]).unwrap();
+    let root = object::read_tree(&*site.db, site.pid, &c.tree).unwrap();
+    let b_dir = root.iter().find(|e| e.name == "b").expect("根上要有 b");
+    let kids = object::read_tree(&*site.db, site.pid, &b_dir.hash).unwrap();
+    assert_eq!(kids.len(), 2, "b/ 里 y 与 z：{kids:?}");
+}
+
+/// 复用那一条的另一半：**没在历史里的东西不能凭空引用**。
+/// 文件是这轮新建的、随后又被删掉 ⇒ `B` 行不存在 ⇒ 我们从来没拿到过它的字节，必须报错，
+/// 不许造一条"引用不存在内容"的清单（那正是 §9.3 要防的悬空形状）。
+#[test]
+fn a_file_that_vanished_before_it_was_ever_committed_is_an_error() {
+    let site = Site::new();
+    let proj = site.proj();
+    write(&proj.join("a/x.bin"), b"the x");
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    // 新建一个文件、扫到它（于是有了 `W` 行与 `blob_hash`），然后在 commit 之前删掉。
+    write(&proj.join("a/fresh.bin"), b"never committed");
+    site.scan();
+    fs::remove_file(proj.join("a/fresh.bin")).expect("删掉新文件");
+    let err = site
+        .try_build(cas::DEFAULT_BLOCK)
+        .expect_err("内容从没进过历史 ⇒ 不能凭空引用");
+    let msg = err.to_string();
+    assert!(msg.contains("还没进过任何历史版本"), "要说清为什么不能复用：{msg}");
+    assert!(
+        site.head().len() == 1,
+        "失败的那次提交不许留下半个版本"
+    );
+}

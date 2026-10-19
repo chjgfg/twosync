@@ -44,7 +44,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 max_mbps: *max_mbps,
             },
         ),
-        Cmd::Scan { force, batch } => m0::scan(cli, *force, *batch),
+        Cmd::Scan { force, batch, only } => m0::scan(cli, *force, *batch, only.as_deref()),
         Cmd::Commit {
             msg,
             allow_mass_delete,

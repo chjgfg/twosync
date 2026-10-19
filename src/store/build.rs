@@ -264,10 +264,13 @@ pub struct Built {
     /// 本轮扫描的 epoch 与库里全部行数：命令层用它提示"上一轮扫描没覆盖到"这种情况。
     pub epoch: i64,
     pub known: u32,
+    pub blobs_new: usize,
     /// 本次新落盘的块数与字节（FR-5 的可核对数字）。
     pub blocks_stored: usize,
     pub block_bytes: u64,
-    pub blobs_new: usize,
+    /// **文件在 scan 之后消失、但内容早已在历史里**的那几条：复用那一版，不重读盘、不重记引用数。
+    /// 命令层必须打出来——它是"这一轮的树引用了一份盘上已经没有的东西"的唯一读数。
+    pub reused_missing: usize,
     /// 参照侧目录清单**是怎么读的**（整段装载还是退回点读）。命令层必须把它印出来：
     /// "改成一次前缀扫"这句话只有在能被核对时才不是口头承诺（§11.4d）。
     pub manifests: ManifestLoad,
@@ -1091,7 +1094,36 @@ fn put_blob(
     built: &mut Built,
 ) -> Result<Hash> {
     let abs = work_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let outcome = store.put_file(&abs)?;
+    let outcome = match store.put_file(&abs) {
+        Ok(o) => o,
+        // **文件在 scan 之后消失了**（用户删了它，或者这一轮是窄扫、它压根没被走过）。
+        //
+        // 这一刻的判据不是"读不到就失败"，而是"历史里有没有它"：`B` 行在 ⇒ 那些字节早就进了
+        // CAS 并且记过引用数（FR-13 的顺序：先块后行），所以这一条内容**不需要**再落一次盘，
+        // 直接复用那一版的 hash 就行。`adopt_blob` 本来就是幂等的（清单已在库里就一字不改），
+        // 复用路径连那次判断都省了。
+        //
+        // 反过来，`B` 行不在 = 这文件是新出现的、又被删了，我们**从来没拿到过它的字节** ⇒
+        // 报错，不许静默造一条引用不存在内容的清单（那正是 §9.3 要防的悬空）。
+        Err(Error::Io(ioe)) if ioe.kind() == std::io::ErrorKind::NotFound => {
+            let key = keys::blob_key(pid, &e.blob_hash);
+            let known = {
+                let tx = db.begin();
+                let got = tx.get(&key).is_some();
+                tx.commit();
+                got
+            };
+            if known {
+                built.reused_missing += 1;
+                return Ok(e.blob_hash);
+            }
+            return Err(Error::BadInput(format!(
+                "{path} 在上一次 scan 之后消失了，而它的内容还没进过任何历史版本 ⇒ 这一轮没法提交它。\
+                 重新 scan 一次（它还活着就会被盖章），或者认了它就让它过去"
+            )));
+        }
+        Err(other) => return Err(other),
+    };
     if outcome.blob.hash != e.blob_hash {
         // 扫描之后文件又被人改了：这一条本轮不提交，等下一轮扫描。绝不静默用新内容。
         return Err(Error::StaleScan {

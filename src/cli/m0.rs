@@ -340,17 +340,30 @@ pub(crate) fn resolve_project(cli: &Cli) -> Result<(String, PathBuf)> {
     Ok((project.name.clone(), root))
 }
 
-pub fn scan(cli: &Cli, force: bool, batch: usize) -> Result<()> {
+pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
     let wm = allocstats::watermark();
-    let rep = worktree::scan(&*db, pid, &root, force, batch)?;
+    // `--only <dir>` = 窄扫。范围必须打出来：同一句"walked = 12"在全量轮与窄扫轮里意思完全不同，
+    // 而只有全量轮会推进活性线（`Z`），这直接决定下一句 `commit` 能不能报删除。
+    let scope = match only {
+        None => worktree::Scope::Full,
+        Some(d) => worktree::Scope::Dir(d.to_string()),
+    };
+    let rep = worktree::scan_scoped(&*db, pid, &root, &scope, force, batch)?;
     let peak = wm.peak_growth();
 
     let secs = rep.elapsed_ms as f64 / 1000.0;
     println!("project   = {name}  (id={pid:#010x})");
     println!("root        = {}", root.display());
+    println!("范围      = {}", scope.label());
+    if !scope.is_full() {
+        println!(
+            "活性线    = **没推进**（窄扫只走一个目录，不能拿它当「本轮全体看见过」）⇒ \
+             这一轮之后的 commit 报不出删除，删除要等下一次全量 scan"
+        );
+    }
     println!("walked      = {}", rep.walked);
     println!(
         "hashed      = {}  (skipped {} / deferred {})",
@@ -436,6 +449,13 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
         b.block_bytes as f64 / 1048576.0
     );
     println!("entries     = {}  (库里 W 行 {})", b.entries, b.known);
+    // 盘上没有、历史里有的那几条：窄扫轮或"scan 之后被删"的场景，内容复用上一版。
+    if b.reused_missing > 0 {
+        println!(
+            "复用        = {} 条文件已不在盘上、但内容早已在历史里 ⇒ 直接沿用那一版（下一次全量 scan 会把删除确认掉）",
+            b.reused_missing
+        );
+    }
     // 参照侧清单的读法（一次前缀扫 or 退回点读）：这一行的数字就是"O(目录数) 次折被消掉"的凭据。
     println!("{}", b.manifests.line());
     // 这两枚旋钮各自放弃了点什么，必须打出来——不许静默生效（§14 Q11）。
