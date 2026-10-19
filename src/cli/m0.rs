@@ -436,6 +436,8 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
         b.block_bytes as f64 / 1048576.0
     );
     println!("entries     = {}  (库里 W 行 {})", b.entries, b.known);
+    // 参照侧清单的读法（一次前缀扫 or 退回点读）：这一行的数字就是"O(目录数) 次折被消掉"的凭据。
+    println!("{}", b.manifests.line());
     // 这两枚旋钮各自放弃了点什么，必须打出来——不许静默生效（§14 Q11）。
     if import.fast {
         println!(
@@ -988,6 +990,8 @@ pub fn status(cli: &Cli) -> Result<()> {
         ),
     }
     print_changes(&p.changes);
+    // 参照侧清单的读法：`status` 复用的就是 `plan` 那一趟遍历，所以同一个数（§11.4d）。
+    println!("{}", p.manifests.line());
     // 实时那一半：**只报存在性差异**。内容改了这里看不见——目录 mtime 不表达文件内容变化，
     // 那要重算 hash 才知道（与 git 的 untracked cache 同一个限制）。
     if epoch == 0 {
@@ -1131,6 +1135,8 @@ pub fn plan(cli: &Cli) -> Result<()> {
         Err(e) => println!("熔断      = 会被拒：{e}"),
     }
     println!("union     = 现在只有本机一个 head：union 判定与 collision 列表要等 M1/M3 才有对象");
+    // 参照侧清单是怎么读的（整段装载 or 退回点读）——换装载形状省下的折数必须能核对（§11.4d）。
+    println!("{}", p.manifests.line());
     println!(
         "耗时        = {:.3} s   peak heap = {:.1} MiB",
         started.elapsed().as_secs_f64(),

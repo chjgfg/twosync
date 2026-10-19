@@ -193,16 +193,20 @@ pub fn marked_objects(
     pid: ProjectId,
     commits: &BTreeSet<Hash>,
 ) -> Result<(BTreeSet<Hash>, BTreeSet<Hash>)> {
-    let mut trees = BTreeSet::new();
+    // GC 是**这些命令里最宽的一趟**：它要走完保留集里每个 commit 的每一层清单
+    // ⇒ 逐条点读的账是 O(commit 数 × 目录数)（12 GiB 站点上 `gc --sweep` 干过 226 折）。
+    // 装载一次就够：表里有的都在手里，超预算才退回点读。
+    let trees = object::TreeIndex::load(db, pid)?;
+    let mut tree_set = BTreeSet::new();
     let mut blobs = BTreeSet::new();
     for c in commits {
         let commit = object::read_commit(db, pid, c)?;
         let mut stack = vec![commit.tree];
         while let Some(t) = stack.pop() {
-            if !trees.insert(t) {
+            if !tree_set.insert(t) {
                 continue;
             }
-            for e in object::read_tree(db, pid, &t)? {
+            for e in trees.list(db, pid, &t)? {
                 match e.kind {
                     Kind::Dir => stack.push(e.hash),
                     Kind::File | Kind::Symlink => {
@@ -212,7 +216,7 @@ pub fn marked_objects(
             }
         }
     }
-    Ok((trees, blobs))
+    Ok((tree_set, blobs))
 }
 
 /// 深度优先列出一棵树的全部路径，**边遍历边回调**：`ls-files` 面对一百万个文件时
@@ -226,11 +230,14 @@ pub fn walk_tree(
     root: &Hash,
     visit: &mut TreeVisit<'_>,
 ) -> Result<()> {
+    // **一次** `T|p` 前缀扫换掉 O(目录数) 次点读（§11.4d，与 `build::Builder` 同一个装载器）。
+    // 超预算时 `list` 自动退回点读，所以这一趟的最坏内存是被预算钉住的，不是被历史钉住的。
+    let trees = object::TreeIndex::load(db, pid)?;
     // 空树在这里有特判（`read_tree`），所以根是空的也能正常走完。
-    for e in object::read_tree(db, pid, root)? {
+    for e in trees.list(db, pid, root)? {
         visit(&e.name, &e)?;
         if e.kind == Kind::Dir {
-            descend(db, pid, &e, "", visit)?;
+            descend(db, pid, &trees, &e, "", visit)?;
         }
     }
     Ok(())
@@ -239,6 +246,7 @@ pub fn walk_tree(
 fn descend(
     db: &dyn KvEngine,
     pid: ProjectId,
+    trees: &object::TreeIndex,
     dir: &object::TreeEntry,
     prefix: &str,
     visit: &mut TreeVisit<'_>,
@@ -248,10 +256,10 @@ fn descend(
     } else {
         format!("{prefix}/{}", dir.name)
     };
-    for e in object::read_tree(db, pid, &dir.hash)? {
+    for e in trees.list(db, pid, &dir.hash)? {
         visit(&format!("{path}/{}", e.name), &e)?;
         if e.kind == Kind::Dir {
-            descend(db, pid, &e, &path, visit)?;
+            descend(db, pid, trees, &e, &path, visit)?;
         }
     }
     Ok(())
@@ -269,14 +277,16 @@ pub fn walk_levels(
     root: &Hash,
     on_level: &mut dyn FnMut(&str, &[object::TreeEntry]) -> Result<()>,
 ) -> Result<()> {
-    let list = object::read_tree(db, pid, root)?;
+    let trees = object::TreeIndex::load(db, pid)?;
+    let list = trees.list(db, pid, root)?;
     on_level("", &list)?;
-    descend_levels(db, pid, "", &list, on_level)
+    descend_levels(db, pid, &trees, "", &list, on_level)
 }
 
 fn descend_levels(
     db: &dyn KvEngine,
     pid: ProjectId,
+    trees: &object::TreeIndex,
     prefix: &str,
     list: &[object::TreeEntry],
     on_level: &mut dyn FnMut(&str, &[object::TreeEntry]) -> Result<()>,
@@ -290,9 +300,9 @@ fn descend_levels(
         } else {
             format!("{prefix}/{}", e.name)
         };
-        let inner = object::read_tree(db, pid, &e.hash)?;
+        let inner = trees.list(db, pid, &e.hash)?;
         on_level(&path, &inner)?;
-        descend_levels(db, pid, &path, &inner, on_level)?;
+        descend_levels(db, pid, trees, &path, &inner, on_level)?;
     }
     Ok(())
 }

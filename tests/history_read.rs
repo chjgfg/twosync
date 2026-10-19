@@ -405,3 +405,123 @@ fn the_one_scan_closure_equals_the_step_by_step_walk() {
     // 缺亲代行（不变量 (g) 坏了）时闭包只少走那一截，不许 panic
     assert!(history::reachable_from(&index, &[g], &[]).contains(&g), "根也要在集合里");
 }
+
+// ── 这一节的最后一条是**例外** ────────────────────────────────────────────────
+// 上面全部用例只测行为。下面这条不测行为，只**量代价**：§11.4b 已经把规矩钉死了
+// ——"整段前缀扫 = 1 折，但把命中的值全物化（实测口径 ≈ 207 B/键）"，所以任何"改成一次装载"
+// 都必须先有数，才许写进实现。它要在 12 GiB 站点（`D:\ts10g`，项目 `lab`）上手动跑：
+// `cargo test --test history_read -- --ignored --nocapture`
+#[test]
+#[ignore = "需要 12 GiB 量测台 D:\\ts10g（不在 CI 上）"]
+fn ten_gib_manifest_load_cost_is_counted_before_the_batch_loader_ships() {
+    use twosync::utils::{counted, Meter};
+
+    let root = std::path::Path::new(r"D:\ts10g");
+    if !root.join(".twosync").exists() {
+        eprintln!("跳过：没有 {root:?}");
+        return;
+    }
+    let meter = Meter::default();
+    let db = counted(
+        open_store(root, EngineKind::LsmTree).expect("open_store"),
+        &meter,
+        false,
+    );
+    let pid = keys::project_id("lab");
+
+    // ① 这套历史有多大（**只用一次前缀扫**的口径）。
+    //    注意这里**不能**调 `marked_objects`：它从每个 commit 出发逐层 `read_tree`，
+    //    代价是 O(commit 数 × 目录数) 次点读 = 这一轮要消掉的那个成本本身（debug 下一折 ≈ 4 s，
+    //    一次量测会跑到天荒地老）。"当前快照有几个目录"改从 `W` 行算：那是一份扫描结果，
+    //    顺带把"W 行到底能不能整段装载"这个数也量出来（§11.4b 结论 1 留的口子）。
+    let heads = build::ref_heads(&*db, pid, build::MAIN).expect("ref_heads");
+    let commits = history::reachable_strict(&*db, pid, &heads, &[]).expect("reachable");
+
+    // ② `W|p` 整段扫：行数、value 字节、快照里的目录数（按"文件路径去掉最后一段"去重）。
+    let wrows = scan_rows(&*db, keys::TAG_WORKTREE, pid);
+    let mut w_bytes = 0u64;
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let prefix_w = prefix_of(keys::TAG_WORKTREE, pid);
+    for r in &wrows {
+        if let Some(v) = r.value.as_ref() {
+            w_bytes += v.len() as u64;
+        }
+        let Some(tail) = r.key.get(prefix_w.len()..) else { continue };
+        let path = String::from_utf8_lossy(tail).into_owned();
+        // 目录行自己带尾随 `/`；文件行取它的父段。两种都归一到"它属于哪个目录"。
+        let trimmed = path.trim_end_matches('/').to_string();
+        match trimmed.rfind('/') {
+            Some(i) => dirs.insert(trimmed[..i].to_string()),
+            None => dirs.insert(String::new()),
+        };
+    }
+
+    // ③ `T|p` 整段扫：行数、value 字节、条目总数。
+    let rows = scan_rows(&*db, keys::TAG_TREE, pid);
+    let mut value_bytes = 0u64;
+    let mut entries_total = 0usize;
+    let mut undecoded = 0usize;
+    for r in &rows {
+        let Some(v) = r.value.as_ref() else { continue };
+        value_bytes += v.len() as u64;
+        let Ok(raw) = keys::strip(v) else {
+            undecoded += 1;
+            continue;
+        };
+        match postcard::from_bytes::<Vec<TreeEntry>>(raw) {
+            Ok(list) => entries_total += list.len(),
+            Err(_) => undecoded += 1,
+        }
+    }
+    // 桶从 0 起算（这个 `Meter` 是本次探针独有的），所以直接取快照就是"这条用例折了几次"。
+    let counts = meter.snapshot();
+
+    println!("== 12 GiB 站点的目录清单装载代价（project lab）");
+    println!(
+        "规模         = head {} · 可达 commit {} · 快照目录 {}（从 W 行去重）",
+        heads.len(),
+        commits.len(),
+        dirs.len()
+    );
+    println!(
+        "T|p 整段扫    = 行 {} · value {:.2} MiB · 清单条目 {} · 平均每张 {:.0} B",
+        rows.len(),
+        value_bytes as f64 / 1048576.0,
+        entries_total,
+        value_bytes as f64 / rows.len().max(1) as f64
+    );
+    println!(
+        "W|p 整段扫    = 行 {} · value {:.2} MiB（这一条是给§11.4b 结论 1 补的数：W 不能整段装载）",
+        wrows.len(),
+        w_bytes as f64 / 1048576.0
+    );
+    println!(
+        "历史倍数      = T 行 {} ÷ 快照目录 {} = {:.1}× ⇒ 整段装载比按 head 走多拿这么多",
+        rows.len(),
+        dirs.len(),
+        rows.len() as f64 / dirs.len().max(1) as f64
+    );
+    println!("折数账        = {}", counts.line());
+    assert_eq!(undecoded, 0, "有一行的 value 解不出来：装载器不能假定编码是齐的");
+    assert!(
+        !rows.is_empty() && !wrows.is_empty(),
+        "站点是空的 ⇒ 这条量测没有意义，去看是不是开错了库"
+    );
+}
+
+/// `tag|pid` 的前缀字节。
+fn prefix_of(tag: u8, pid: ProjectId) -> Vec<u8> {
+    let mut p = vec![tag];
+    p.extend_from_slice(&pid.to_be_bytes());
+    p
+}
+
+/// **一次**前缀扫，把命中的行原样搬回来（键与 value 都在）。
+/// 探针用它，是为了让"整段装载到底搬多少东西"这个数与后面要写的装载器走同一条调用。
+fn scan_rows(db: &dyn KvEngine, tag: u8, pid: ProjectId) -> Vec<storage_engines::ExportRecord> {
+    let prefix = prefix_of(tag, pid);
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    rows
+}

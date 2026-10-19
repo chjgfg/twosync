@@ -806,3 +806,96 @@ fn unscanned_changes_show_in_reconcile_but_not_in_the_book() {
         "对账是只读的：一行都不许多（§10.1 只读判据）"
     );
 }
+
+/// 建一个 `dirs` 个目录（各 4 个文件）的站点：扫一次 + 提一次，然后只跑 `plan`，
+/// 返回**这一次 plan** 的折数账与清单装载读数。规模做成参数，是因为要判的是"随不随规模长"。
+fn plan_at_two_scales(dirs: usize) -> (twosync::utils::CallCounts, build::ManifestLoad) {
+    let tmp = tempfile::tempdir().unwrap();
+    for d in 0..dirs {
+        for i in 0..4 {
+            write(
+                &tmp.path()
+                    .join("p")
+                    .join(format!("d{d:03}"))
+                    .join(format!("f{i}.bin")),
+                format!("内容 {d}-{i}"),
+            );
+        }
+    }
+    let meter = twosync::utils::Meter::default();
+    let db = twosync::utils::counted(
+        open_store(tmp.path(), EngineKind::LsmTree).unwrap(),
+        &meter,
+        false,
+    );
+    let pid = keys::project_id("p");
+    let proj = tmp.path().join("p");
+    worktree::scan(&*db, pid, &proj, false, 100).unwrap();
+    let store = Cas::new(&objects_dir(tmp.path()), cas::DEFAULT_BLOCK).unwrap();
+    build::build(
+        &*db,
+        pid,
+        &store,
+        &proj,
+        build::Meta {
+            peer: "test-peer",
+            msg: "起点",
+            ts: 1,
+            allow_mass_delete: false,
+        },
+    )
+    .unwrap();
+    // 起点之后才算账：前面那次 commit 也走装载器，混进来就读不出 plan 自己的形状。
+    let base = meter.snapshot();
+    let b = build::plan(&*db, pid).unwrap();
+    (meter.snapshot().since(base), b.manifests)
+}
+
+/// 这一条是这次改写（O(目录数) 次点读 ⇒ 一次 `T|p` 装载）的**形状判据**。
+///
+/// 不写"plan 只许折 N 次"那种绝对数——那会被 `LiveRows` 的分页宽度牵着走，一改就红。
+/// 要判的是**随不随目录数长**：同一构建、两种规模（10 vs 40 个目录 ⇒ 4 倍清单），
+/// 点读账必须一模一样。原来它是 10 与 40（每条一次 `read_tree`），现在它是常数。
+#[test]
+fn plans_reference_reads_do_not_grow_with_the_number_of_directories() {
+    let (small, lm) = plan_at_two_scales(10);
+    let (big, bm) = plan_at_two_scales(40);
+    assert_eq!(
+        small.point_read, big.point_read,
+        "参照侧的点读账随目录数长了（装载器没生效？）：{} vs {}",
+        small.line(),
+        big.line()
+    );
+    assert!(
+        small.point_read <= 2,
+        "plan 的参照侧只剩个位数点读才对，实际 {}",
+        small.line()
+    );
+    // 反过来也要证明"这两个站点确实不一样大"——否则相等是因为两边都没干活。
+    assert!(
+        lm.rows < bm.rows,
+        "装载的行数必须随目录数长：{} vs {}",
+        lm.rows,
+        bm.rows
+    );
+    assert!(
+        bm.rows >= 40,
+        "40 个目录至少该有 40 张清单，实际 {}",
+        bm.rows
+    );
+    assert!(
+        !bm.over_budget && !lm.over_budget,
+        "这两档远不到 4 MiB 预算，不该退回点读"
+    );
+    // 内存判据用**行数与字节数**，不用进程高水位（§11.4b 结论 3）。
+    assert!(
+        bm.bytes < object_budget_probe(),
+        "装载的 value 字节必须报得出一个有界的数，实际 {:.2} MiB",
+        bm.bytes as f64 / 1048576.0
+    );
+}
+
+/// 预算本身也进判据：用例不许假设一个魔法数。
+fn object_budget_probe() -> u64 {
+    twosync::store::object::TreeIndex::BUDGET_BYTES
+}

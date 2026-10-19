@@ -6,7 +6,7 @@
 
 use storage_engines::EngineKind;
 use twosync::error::Error;
-use twosync::store::keys::{self, Kind, ProjectId};
+use twosync::store::keys::{self, Hash, Kind, ProjectId};
 use twosync::store::object::{
     self, Commit, Stats, TreeEntry, empty_tree, parents_of, put_commit, put_tree, read_commit,
     read_tree,
@@ -186,4 +186,150 @@ fn missing_object_is_reported_as_missing() {
         matches!(err, Error::MissingObject { .. }),
         "应是缺失，实际 {err}"
     );
+}
+
+// ── 批量装载器 `TreeIndex`（§11.4d：把 O(目录数) 次点读换成一次前缀扫）──────────────
+// 这三条是这次改写的**安全带**：装载器接管了原来 `read_tree` 的位置，所以它必须
+// ①给出与点读完全一样的答案，②在超预算时退回点读而不丢答案，③保留同一次 hash 自证。
+
+/// 造一棵三层树（外加一个空目录），把清单都落库，返回根 hash。
+///
+/// 层是真的层（根 → a → sub → leaf），因为要对照的正是"逐层点读"与"一次装载"；
+/// `empty` 那条指向 `empty_tree()`——空目录从不落盘，装载器对它的特判也在这一条里被走到。
+fn three_level_site(engine: &dyn storage_engines::KvEngine) -> Hash {
+    let leaf = put_tree(engine, PID, &[entry("z.bin", Kind::File, 3, 5, 0o100644)]).unwrap();
+    let sub = put_tree(
+        engine,
+        PID,
+        &[TreeEntry {
+            name: "inner".into(),
+            kind: Kind::Dir,
+            hash: leaf,
+            size: 0,
+            mode: 0o40755,
+        }],
+    )
+    .unwrap();
+    let a = put_tree(
+        engine,
+        PID,
+        &[
+            TreeEntry {
+                name: "inner".into(),
+                kind: Kind::Dir,
+                hash: sub,
+                size: 0,
+                mode: 0o40755,
+            },
+            entry("note", Kind::File, 4, 9, 0o100644),
+        ],
+    )
+    .unwrap();
+    put_tree(
+        engine,
+        PID,
+        &[
+            TreeEntry {
+                name: "a".into(),
+                kind: Kind::Dir,
+                hash: a,
+                size: 0,
+                mode: 0o40755,
+            },
+            TreeEntry {
+                name: "empty".into(),
+                kind: Kind::Dir,
+                hash: empty_tree(),
+                size: 0,
+                mode: 0o40755,
+            },
+            entry("README.md", Kind::File, 2, 17, 0o100644),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_batched_manifests_answer_exactly_like_point_reads() {
+    let (_site, engine) = db();
+    let root = three_level_site(&*engine);
+    let ix = object::TreeIndex::load(&*engine, PID).unwrap();
+    assert!(!ix.over_budget(), "三层树几十字节，不该超预算");
+    assert_eq!(ix.loaded(), ix.rows(), "预算内：搬回来的行必须都解出来了");
+    assert!(ix.rows() >= 3, "至少 leaf/a/根 三张：{}", ix.rows());
+
+    // 逐张对照：装载的答案 == 点读的答案（含根）。
+    let mut checked = 0;
+    for h in collect_hashes(&*engine, &root) {
+        assert_eq!(
+            ix.list(&*engine, PID, &h).unwrap(),
+            read_tree(&*engine, PID, &h).unwrap(),
+            "装载与点读给出不同的清单：{}",
+            keys::hex(&h)
+        );
+        checked += 1;
+    }
+    assert!(checked >= 3, "对照的张数太少，等于没测：{checked}");
+
+    // 空目录共享那一条 hash、且**从不落盘** ⇒ 装载器必须有同一个特判，否则整条路径报缺失。
+    assert_eq!(ix.list(&*engine, PID, &empty_tree()).unwrap(), Vec::new());
+    // 缺失在两条路上也必须是同一个错。
+    let ghost = [0xABu8; 32];
+    let err = ix.list(&*engine, PID, &ghost).unwrap_err();
+    assert!(matches!(err, Error::MissingObject { .. }), "实际 {err}");
+}
+
+#[test]
+fn over_budget_gives_the_answers_back_but_keeps_nothing() {
+    let (_site, engine) = db();
+    let root = three_level_site(&*engine);
+    // 预算给 1 字节 ⇒ 第一行就超。这是"历史长到装不下"的等价类，不必真造 4 MiB。
+    let ix = object::TreeIndex::with_budget(&*engine, PID, 1).unwrap();
+    assert!(ix.over_budget(), "给了 1 字节预算必须标超");
+    assert_eq!(ix.loaded(), 0, "超预算必须把已解出来的表交还——留着它就是违背 NFR-1");
+    assert!(ix.rows() >= 3, "行数照实报，退回不等于没看见：{}", ix.rows());
+    assert!(ix.bytes() >= 1);
+    for h in collect_hashes(&*engine, &root) {
+        assert_eq!(
+            ix.list(&*engine, PID, &h).unwrap(),
+            read_tree(&*engine, PID, &h).unwrap(),
+            "退回点读那一路的答案必须与整段装载一致（降级只降速度，不降正确性）"
+        );
+    }
+}
+
+#[test]
+fn the_batch_load_self_verifies_where_a_point_read_would() {
+    let (_site, engine) = db();
+    let root = three_level_site(&*engine);
+    // 把根那一行的 value 换成**另一份合法编码**（能解码，但内容与 hash 不符）。
+    let bogus: Vec<TreeEntry> = vec![entry("tampered", Kind::File, 9, 1, 0o100644)];
+    let bytes = postcard::to_allocvec(&bogus).unwrap();
+    let tx = engine.begin();
+    assert!(tx.set(&keys::tree_key(PID, &root), keys::wrap(bytes)));
+    tx.commit();
+
+    // 点读那一路本来就报 CorruptBlock（这条是既有担保）；装载那一路**必须一样**。
+    let one = read_tree(&*engine, PID, &root).unwrap_err();
+    assert!(matches!(one, Error::CorruptBlock { .. }), "点读没拦住：{one}");
+    let batch = object::TreeIndex::load(&*engine, PID).unwrap_err();
+    assert!(
+        matches!(batch, Error::CorruptBlock { .. }),
+        "批量装载少了一次自证，实际 {batch}"
+    );
+}
+
+/// 从根往下把 hash 收集起来（走点读，故意不用被测的那个装载器）。
+fn collect_hashes(engine: &dyn storage_engines::KvEngine, root: &Hash) -> Vec<Hash> {
+    let mut out = Vec::new();
+    let mut stack = vec![*root];
+    while let Some(h) = stack.pop() {
+        out.push(h);
+        for e in read_tree(engine, PID, &h).unwrap() {
+            if e.kind == Kind::Dir && e.hash != empty_tree() {
+                stack.push(e.hash);
+            }
+        }
+    }
+    out
 }

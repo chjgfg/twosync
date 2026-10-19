@@ -268,6 +268,44 @@ pub struct Built {
     pub blocks_stored: usize,
     pub block_bytes: u64,
     pub blobs_new: usize,
+    /// 参照侧目录清单**是怎么读的**（整段装载还是退回点读）。命令层必须把它印出来：
+    /// "改成一次前缀扫"这句话只有在能被核对时才不是口头承诺（§11.4d）。
+    pub manifests: ManifestLoad,
+}
+
+/// 一次遍历的**清单装载读数**。存在的理由和 `CallCounts` 一样：换装载形状这件事
+/// 省下的是折数、换来的是内存，两边都必须有数，否则下一次没人知道该不该退回。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ManifestLoad {
+    /// true = 库里还没有历史 ⇒ 参照侧一个字节都没读（连一次前缀扫都不做）。
+    pub skipped: bool,
+    /// `T|p` 整段扫搬回来的行数（超预算退回时这个数照样是真的，只是表是空的）。
+    pub rows: usize,
+    /// 同上，value 字节数。
+    pub bytes: u64,
+    /// true = 超过 [`object::TreeIndex::BUDGET_BYTES`] ⇒ 逐条点读（慢、不吃内存）。
+    pub over_budget: bool,
+}
+
+impl ManifestLoad {
+    /// 一行给人看的读数。命令层不许静默换路。
+    pub fn line(&self) -> String {
+        if self.skipped {
+            return "参照清单 = 库里没有历史，一次都不读".to_string();
+        }
+        if self.over_budget {
+            return format!(
+                "参照清单 = 整段扫 {} 行 / {:.2} MiB **超出预算 ⇒ 退回逐条点读**（慢但不吃内存，NFR-1）",
+                self.rows,
+                self.bytes as f64 / 1048576.0
+            );
+        }
+        format!(
+            "参照清单 = 一次前缀扫装载 {} 张 / {:.2} MiB（O(目录数) 次点读 ⇒ 1 次折）",
+            self.rows,
+            self.bytes as f64 / 1048576.0
+        )
+    }
 }
 
 /// 一次提交要带的外部信息。单独成结构体而不是一路摊成参数：`build` 已经有四个
@@ -791,9 +829,14 @@ impl Walk<'_> {
 
 /// 流式建树 + 逐层比对的**栈**。
 ///
-/// 内存 = O(一条祖先链上各层的清单，新旧各一份)，与文件总数无关。根那一帧装着顶层全部
-/// 条目——树对象本身就是一层一份清单，要算它的 hash 就得把这一层拿在手里，这是格式的
-/// 固有代价，git 的 tree 也一样。
+/// 内存有两笔，得分开说（这里以前只有一笔，装载器上线之后那笔被藏起来就是撒谎）：
+/// 1. **遍历本身** = O(一条祖先链上各层的清单，新旧各一份)，与文件总数无关。根那一帧装着
+///    顶层全部条目——树对象本身就是一层一份清单，要算它的 hash 就得把这一层拿在手里，这是
+///    格式的固有代价，git 的 tree 也一样。
+/// 2. **参照侧的整段装载** = `object::TreeIndex`，最坏 `BUDGET_BYTES`（4 MiB value ⇒ 解出来
+///    约 9 MB，放大率实测 ≈ 2.1×）。它是 O(清单条目总数)，**不是**与文件总数无关——
+///    所以它带预算：超预算自动退回逐目录点读，那一支回到第 1 笔的形状（慢，但内存有界）。
+///    NFR-1 的"峰值与文件数无关"靠的是这个退回，不是靠注释。
 ///
 /// 老实现是"先按目录把所有条目分桶，再按逆字典序自底向上收"。顶层目录静默丢失那个 bug
 /// （§17 补记二）就住在那套分桶 + `collect_children` 里，而它编译期防不住；栈式只需要问
@@ -804,27 +847,61 @@ struct Builder<'a, 'w> {
     dir_cap: usize,
     built: &'a mut Built,
     stack: Vec<Frame>,
+    /// 参照侧清单的**整段装载**（`None` = 库里还没有历史，一次都不读）。
+    /// 它把"每个目录点读一次旧清单"那 O(目录数) 次折换成 1 次前缀扫（§11.4d）；
+    /// 超出预算时表是空的、`over_budget` 为真，`old_list` 自动退回点读。
+    trees: Option<object::TreeIndex>,
 }
 
 impl<'a, 'w> Builder<'a, 'w> {
     fn new(w: &Walk<'w>, built: &'a mut Built) -> Result<Self> {
-        // 根帧的参照清单只在"真有历史"时读一次；没有历史就连这一次都不读。
-        let old = match w.old_root {
-            Some(h) => Some(object::read_tree(w.db, w.pid, &h)?),
+        // 只在"真有历史"时装载：没有历史就连那一次前缀扫都不做（第一次 commit 的路径）。
+        let trees = match w.old_root {
+            Some(_) => Some(object::TreeIndex::load(w.db, w.pid)?),
             None => None,
         };
-        Ok(Self {
+        built.manifests = match &trees {
+            Some(ix) => ManifestLoad {
+                skipped: false,
+                rows: ix.rows(),
+                bytes: ix.bytes(),
+                over_budget: ix.over_budget(),
+            },
+            None => ManifestLoad {
+                skipped: true,
+                ..Default::default()
+            },
+        };
+        let me = Self {
             db: w.db,
             pid: w.pid,
             built,
             dir_cap: w.dir_cap,
+            stack: Vec::new(),
+            trees,
+        };
+        let old = match w.old_root {
+            Some(h) => Some(me.old_list(&h)?),
+            None => None,
+        };
+        Ok(Self {
             stack: vec![Frame {
                 dir: w.at.to_string(),
                 mode: 0o40755,
                 entries: Vec::new(),
                 old,
             }],
+            ..me
         })
+    }
+
+    /// 参照侧拿一张清单的**唯一出口**：装载命中就查表（零引擎调用），没装载或超预算就点读。
+    /// 两条路的担保必须一样——点读那条自带 hash 自证，装载那条在 `TreeIndex::load` 里逐行证过。
+    fn old_list(&self, hash: &Hash) -> Result<Vec<object::TreeEntry>> {
+        match &self.trees {
+            Some(ix) => ix.list(self.db, self.pid, hash),
+            None => object::read_tree(self.db, self.pid, hash),
+        }
     }
 
     fn row(
@@ -887,7 +964,7 @@ impl<'a, 'w> Builder<'a, 'w> {
             .filter(|e| e.kind == Kind::Dir)
             .map(|e| e.hash);
         let old = match want {
-            Some(h) => Some(object::read_tree(self.db, self.pid, &h)?),
+            Some(h) => Some(self.old_list(&h)?),
             None => None,
         };
         self.stack.push(Frame {
