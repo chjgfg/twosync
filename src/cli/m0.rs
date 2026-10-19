@@ -16,7 +16,7 @@ use crate::cli::config::Config;
 use crate::cli::registry::{self, Registry};
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
-use crate::store::{build, cas, checkout, history, object, restore, worktree};
+use crate::store::{build, cas, checkout, history, object, restore, sessions, worktree};
 use crate::utils::{self, db_dir, journal_dir, log_dir, objects_dir, projects_file, site_dir};
 
 /// `Commit.peer` 的占位值。真正的 peer id 要等 M1 的 `peer add|trust`；现在填什么都一样——
@@ -988,6 +988,36 @@ pub fn status(cli: &Cli) -> Result<()> {
             p.entries,
             p.known
         ),
+    }
+    // 上次会话那一格（FR-16：耗时/传输字节/对端 head 集合）。读的是 `S` 表最新一行。
+    // **措辞是判据的一部分**：它是"上次会话时看到的那一面"，不是对端现状——对面后来又提交了几轮，
+    // 这一行看不见（§15：不签名、不实时）。缩成"对端的 head"就会有人拿它当真相排产。
+    match sessions::last(&*db, pid)? {
+        None => println!("上次会话  = 从来没有同步过（库里没有 S 行）"),
+        Some(r) => {
+            println!(
+                "上次会话  = {} · {} · 对端 {:?} · {} 块 / {:.2} MiB{}",
+                history::fmt_ts(r.ts),
+                r.dir.label(),
+                r.peer,
+                r.blocks,
+                r.bytes as f64 / 1048576.0,
+                if r.dir.is_send() {
+                    format!("，跳过 {} 块（对面已有）", r.skipped)
+                } else {
+                    String::new()
+                }
+            );
+            // 耗时只有**发起方**那一侧记得到：服务端的 `serve` 是从中途被叫起来的，
+            // 它没有"整场会话"的起点。给 0 会被读成"这场只花了 0 秒"，所以宁可写"没记"。
+            if r.ms > 0 {
+                println!("          = 墙钟 {:.1} s（发起方计时）", r.ms as f64 / 1000.0);
+            } else {
+                println!("          = 耗时未记（这一侧是被拨的，没有整场起点）");
+            }
+            let ab = sessions::ahead_behind(&*db, pid, &heads, &r.their_heads)?;
+            println!("          = {}", ab.line());
+        }
     }
     print_changes(&p.changes);
     // 参照侧清单的读法：`status` 复用的就是 `plan` 那一趟遍历，所以同一个数（§11.4d）。

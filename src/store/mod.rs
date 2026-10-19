@@ -8,4 +8,5 @@ pub mod history;
 pub mod keys;
 pub mod object;
 pub mod restore;
+pub mod sessions;
 pub mod worktree;

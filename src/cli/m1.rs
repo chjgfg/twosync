@@ -37,6 +37,7 @@
 use std::format;
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::time::Instant;
 
 use crate::cli::Cli;
 use crate::cli::cmd::PeerCmd;
@@ -51,7 +52,20 @@ use crate::store::cas::Cas;
 use crate::store::gc;
 use crate::store::history;
 use crate::store::keys;
+use crate::store::sessions::{self, Dir, SessionRecord};
+use crate::store::worktree;
 use crate::utils::{self, objects_dir, site_id};
+
+/// 写一行会话账（FR-16 的"上次会话耗时/传输字节/对端 head"）。
+///
+/// **写失败只警告，不改命令的成败**：同步已经发生了，让一次已完成的 push 因为记账失败而退出码
+/// 非零，会让 `daemon` 走退避曲线、甚至再推一遍——那是把"账本没写上"升级成"数据出事"。
+/// 磁盘真满了由下一次 `status`/`doctor` 的磁盘账暴露（FR-14 说的第一杀手就是它）。
+fn note_session(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, r: &SessionRecord) {
+    if let Err(e) = sessions::record(db, pid, r) {
+        println!("会话账      = 没写上（{e}）⇒ 这一场的数只在屏幕上，`status` 读不到");
+    }
+}
 
 /// 一根管子：读一头、写一头。会话层只认 `Read + Write` 这个形状，所以子进程的 stdio
 /// 与进程自己的 stdio（`agent`）共用同一份会话代码。
@@ -134,6 +148,8 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
         max_mbps,
         allow_mass_delete,
     } = *a;
+    // 会话耗时从"起 ssh"开始算（FR-16 那一格要的是"上次会话花了多久"，拨号时间也是它的代价）。
+    let started = Instant::now();
     let (name, _) = match project {
         Some(p) => (p.to_string(), cli.root.clone()),
         None => m0::resolve_project(cli)?,
@@ -235,6 +251,23 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    note_session(
+        &*db,
+        pid,
+        &SessionRecord {
+            ts: worktree::now_ns(),
+            project: name.clone(),
+            peer: peer.to_string(),
+            dir: Dir::Push,
+            blocks: rep.blocks_sent,
+            bytes: rep.bytes_sent,
+            skipped: rep.blocks_skipped,
+            ms: started.elapsed().as_millis() as u64,
+            our_heads: build::ref_heads(&*db, pid, build::MAIN)?,
+            their_heads: rep.their_heads.clone(),
+            accepted: rep.accepted.first().copied(),
+        },
+    );
     io.finish()
 }
 
@@ -255,11 +288,13 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
         max_mbps,
         allow_mass_delete,
     } = *a;
+    let started = Instant::now();
     let (name, _) = match project {
         Some(p) => (p.to_string(), cli.root.clone()),
         None => m0::resolve_project(cli)?,
     };
     let db = cli.store()?;
+    let pid = keys::project_id(&name);
     // 收进来的块要落 CAS ⇒ 限速挂在这个进程的桶上（与 commit/push/gc 同一个把手，FR-15）。
     let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
         .with_bucket(&cli.budget((max_mbps * 1048576.0) as u64));
@@ -335,6 +370,25 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
     // 验收是**本端**做的，所以拒绝的原因在这里就有，不必等对面报错回来。
     // 但会话必须仍然以非零退出收尾：对面（发送方）那边 `push_body` 会收到我们的 `RejectCommit`
     // 并以错误结束，我们若安静退场，两边看到的就是"成功了"和"失败了"两个故事。
+    note_session(
+        &*db,
+        pid,
+        &SessionRecord {
+            ts: worktree::now_ns(),
+            project: name.clone(),
+            peer: peer.to_string(),
+            dir: Dir::Pull,
+            // 接收方向：`blocks`/`bytes` 是**落盘**的数；`skipped` 在这里没有意义（协商是对面算的）。
+            blocks: rep.blocks_written,
+            bytes: rep.bytes_in,
+            skipped: 0,
+            ms: started.elapsed().as_millis() as u64,
+            our_heads: rep.heads_after.clone(),
+            their_heads: rep.their_heads.clone(),
+            // 本端就是验收的那一侧：拒了就没有新 head。
+            accepted: if rep.accepted { rep.heads_after.first().copied() } else { None },
+        },
+    );
     let verdict = io.finish();
     if !rep.accepted {
         return Err(Error::BadInput(format!(
@@ -393,6 +447,37 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
         match session::serve(&mut io, &*db, &cas, &site, !0, &mut resolve, false) {
             Ok(rep) => {
                 sessions += 1;
+                // 服务端也要记账（这一侧的账只有它自己知道：落盘块数、验收结果、当时看到的对面 head）。
+                // `peer` 留空是**如实**：被拨的一侧在协议里拿不到"谁拨的"——对端身份可以照抄（§9.5.2
+                // 不签名），所以这里不编一个名字出来，宁可空着让人看见"这一格没有"。
+                let (dir, blocks, bytes, skipped) = match &rep.sent {
+                    Some(s) => (Dir::ServeOut, s.blocks_sent, s.bytes_sent, s.blocks_skipped),
+                    None => (Dir::ServeIn, rep.blocks_written, rep.bytes_in, 0usize),
+                };
+                note_session(
+                    &*db,
+                    keys::project_id(&rep.project),
+                    &SessionRecord {
+                        ts: worktree::now_ns(),
+                        project: rep.project.clone(),
+                        peer: String::new(),
+                        dir,
+                        blocks,
+                        bytes,
+                        skipped,
+                        // 服务端没有"整场会话"的起点计时：`serve` 已经在里面读完了帧，
+                        // 所以这里能给的只有**这一场结束时刻**的纳秒低位（不是耗时）。
+                        // 不给假数：`status` 打印 `ms` 时会写明发起方才有耗时。
+                        ms: 0,
+                        our_heads: rep.heads_after.clone(),
+                        their_heads: rep.their_heads.clone(),
+                        accepted: if rep.accepted {
+                            rep.heads_after.first().copied()
+                        } else {
+                            None
+                        },
+                    },
+                );
                 // 两种角色两种账：`sent` 有值 = 对面 `pull` 了我们，这一场本端是**发送方**。
                 // 打印形状必须分开——"上线/跳过"与"落盘/入库"不是同一组数（§10.4 差分表就吃这个数）。
                 match &rep.sent {

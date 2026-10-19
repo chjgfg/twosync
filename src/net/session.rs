@@ -100,6 +100,9 @@ pub struct Report {
     pub caps: u32,
     /// `true` = 这个对端是**第一次**见到，身份刚刚入表（§9.5.1 的告警归命令层打）。
     pub first_contact: bool,
+    /// 对面在这场会话里报上来的 head 集合。**留给会话账**（FR-16 的 ahead/behind 要用
+    /// "上次看到的那一面"，而会话一结束这个数就取不回来了）。
+    pub their_heads: Vec<Hash>,
 }
 
 // ── TOFU 表（§9.5.1，`P` 前缀）────────────────────────────────────────────
@@ -213,6 +216,9 @@ pub struct ServeReport {
     pub sent: Option<Report>,
     /// `true` = 这个对端是**第一次**见到，身份刚刚入表（§9.5.1）。只有发起方那侧可能是真。
     pub first_contact: bool,
+    /// 对面这场报上来的 head 集合（发起方 = `BeginSession`/`PullRequest` 里那份；
+    /// 本端是发送方时 = `PullRequest` 里对面那份）。同 `Report::their_heads`，为会话账留的。
+    pub their_heads: Vec<Hash>,
 }
 
 /// 发起端。
@@ -319,6 +325,7 @@ pub fn push_body(
     // ③ union 判定：要推的 = 从我方 head 可达、且不在"对端 head + 对端自报祖先"里的那些。
     let mine = reachable(db, pid, my_heads, &[]);
     let theirs_reachable = reachable(db, pid, their_heads, their_ancestors);
+    rep.their_heads = their_heads.to_vec();
     let to_send = topo_pending(db, pid, &mine, &theirs_reachable);
     rep.commits = to_send.len();
 
@@ -684,6 +691,7 @@ pub fn serve(
             rep.accepted = true;
             rep.reason = "本端是发送方：对面已验收".to_string();
             rep.heads_after = sent.accepted.clone();
+            rep.their_heads = sent.their_heads.clone();
             rep.sent = Some(sent);
         }
     }
@@ -714,6 +722,8 @@ pub fn serve_body(
     rep: &mut ServeReport,
 ) -> Result<()> {
     let ReceiveCtx { pid, our_heads, their_heads, known, allow_mass_delete } = *ctx;
+    // 会话账要留"对面这一场的 head 集合"（FR-16 的 ahead/behind 靠它，见 `store::sessions`）。
+    rep.their_heads = their_heads.to_vec();
     // 收 want 集合。
     let mut want: BTreeSet<Hash> = BTreeSet::new();
     loop {

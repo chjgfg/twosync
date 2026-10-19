@@ -2032,6 +2032,24 @@ fn pull_over_a_real_child_process_and_pipes() {
         assert_eq!(inner.len(), 1, "每层一个文件");
         assert_eq!(inner[0].size, 120_000, "尺寸是从盘上算出来的，不是听来的");
     }
+
+    // 对面（服务端）那侧的会话账必须也落下来：它是"这一侧看到的那一面"的唯一记录点，
+    // 而记账走的是 `m1::agent` 里那一行 —— 只有跨进程才验得到（内存管子里没有 agent 进程）。
+    let p_db = open_store(peer_tmp.path(), EngineKind::LsmTree).expect("再开一次对面的库");
+    let logged = twosync::store::sessions::last(&*p_db, keys::project_id(PROJECT))
+        .expect("读会话账")
+        .expect("agent 那侧必须写下一条 S 行");
+    assert_eq!(
+        logged.dir,
+        twosync::store::sessions::Dir::ServeOut,
+        "对面这场是**发送方**（被 pull）：{logged:?}"
+    );
+    assert_eq!(logged.blocks, 3, "它上线了三个块：{logged:?}");
+    assert!(
+        logged.their_heads.is_empty(),
+        "我们拉之前本端没有 head，所以它记下的对面 head 是空的：{logged:?}"
+    );
+    assert_eq!(logged.peer, "", "被拨的一侧拿不到对端名字，宁可空着也不编一个");
 }
 
 #[test]
