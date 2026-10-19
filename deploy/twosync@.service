@@ -1,0 +1,68 @@
+# 一个项目一个实例：`systemctl --user enable --now twosync@lab.service`
+#
+# 装法（把本文件复制到 ~/.config/systemd/user/，然后 `daemon-reload`）：
+#   install -Dm644 deploy/twosync@.service ~/.config/systemd/user/twosync@.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now twosync@lab
+#   systemctl --user status twosync@lab        # 看它是否活着
+#   journalctl --user -u twosync@lab -f        # 看每一轮的打印
+#
+# 为什么是模板单元（`@`）而不是一个写死的 unit：§13 的多项目布局下"一个站点若干项目"是常态，
+# 而每个项目的 `--project` 不同。做成模板 ⇒ 起第二个项目只要 `enable twosync@另一名字`，
+# 不用复制一份 unit（两份文件迟早会被改得只剩一份是对的）。
+#
+# 为什么**不**在这里写 `--rounds`：那是排障用的"跑两轮就退出"，常驻必须是 0（一直跑）。
+# Type=simple + 前台进程也是这条的理由：`daemon` 不自己 fork，交给 systemd 管生命周期。
+
+[Unit]
+Description=twosync daemon（项目 %i）
+Documentation=file:%h/twosync-site/REQUIREMENTS.md
+# 网络没起来就拨号只会失败（然后按退避曲线重试，浪费一轮全量 scan 的 CPU）。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── 要改的两条路径 ────────────────────────────────────────────────────────────
+# 站点根（里面有 `.twosync/` 与各项目目录）与 twosync 可执行文件的位置。
+# 用 drop-in 覆盖比改这份文件好：`systemctl --user edit twosync@lab` 写
+#   [Service]
+#   Environment=TS_ROOT=/data/twosync-site
+#   ExecStart=
+#   ExecStart=/usr/local/bin/twosync --root ${TS_ROOT} ...
+Environment=TS_ROOT=%h/twosync-site
+Environment=TS_PEER=ubuntu
+Environment=TS_INTERVAL=900
+
+# `--interval` 的 900 不是随手写的：12 GiB 站点上一轮**全量** scan 实测要几十秒 CPU
+# （§11.4b 的地板价），按 NFR-2 的"稳态 ≤ 10% 单核"倒推兜底间隔下限 ≈ 轮长 ÷ 0.10。
+# 事件轮现在走窄扫（不推活性线，只盖它走过的那些行），所以常见的轮很便宜；
+# 贵的永远是那一次兜底全量。
+ExecStart=/usr/local/bin/twosync --root ${TS_ROOT} --project %i daemon \
+    --peer ${TS_PEER} --interval ${TS_INTERVAL}
+
+Restart=on-failure
+RestartSec=30
+# 崩溃循环的兜底：一小时内重启超过 5 次就别再起来了（否则一台盘坏了的机器会一直烧 CPU）。
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+# ── NFR-2 / NFR-3：CPU 与内存的硬闸交给内核，不靠我们自己数 ────────────────────
+#
+# `CPUQuota` 是**绝对上限**，不是优先级：超了就被内核 throttled。
+# 一条要算清的账（很多人会在这里选错）：一轮全量要 X 秒 CPU，配额给 10% ⇒
+# 那一轮会被拉成长到 10×X 秒墙钟 —— 期间扫描是"慢但仍在推进"，不会更省磁盘。
+# 所以配额该按"能容忍的最长一轮"来定，而不是照抄 NFR 的那个 10%。
+# 数值留成注释里的示例，装的人按自己机器上的实测填（本机实测见 REQUIREMENTS.md §11.4f）。
+# CPUQuota=50%
+# MemoryMax 是 RSS 的天花板（NFR-1 的 80 MB 是**全部项目之和**，所以每个实例要留余量）：
+# 超限直接被杀 ⇒ 这一轮的事没做完，下一轮照旧从头开始（幂等，见 §9.3 的 pending-delete）。
+MemoryMax=200M
+
+# 站点目录要能写：只读根 + 单独放行站点，比整个用户目录可写安全。
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
