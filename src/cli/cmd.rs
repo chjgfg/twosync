@@ -280,7 +280,11 @@ pub enum Cmd {
         /// **前提是本站点没有别的写者**：与 `commit`/`push`/`agent` 并发会把正在成形的历史判成垃圾。
         #[arg(long)]
         sweep: bool,
-        /// 配合 `--sweep`：真的落改动。不带就是 dry-run
+        /// 真的落改动。**两半都归它管**：引擎版本链（`vacuum`）与 `--sweep` 的 mark-sweep
+        ///
+        /// 为什么不只 gate `--sweep`：第一版只 gate 了 mark-sweep，结果"`gc --sweep` 不带 --apply"
+        /// 照样把 12 GiB 站点从 `rows 191 672` 裁到 `84 258`（§17 补记廿九第三条那次）。
+        /// 现在整条规矩与 FR-7 同源：**不带 `--apply` 就只许读**。
         #[arg(long)]
         apply: bool,
         /// 一趟 unlink 最多删几个块文件（§9.3 的"可中断、可续"）；0 = 不限个数，只受 `--max-mbps` 管

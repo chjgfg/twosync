@@ -576,18 +576,32 @@ pub fn gc(
         );
     }
 
-    let stats = db.vacuum()?;
-    println!(
-        "本轮        = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
-        stats.rows_scanned, stats.versions_removed, stats.xmin
-    );
-    if matches!(stats.blob_rewritten, Some(true)) {
-        println!("blob 文件   = 已重写（外置 value 被压实过）");
-    }
-    if stats.skipped_active_txn {
+    // ── 第一半：引擎版本链。这一半**也要 `--apply`**（2026-10-20 的更正）──
+    //
+    // 原来它无条件执行，于是"`gc --sweep` 不带 `--apply` = dry-run、一个字不改"这句在整个命令上
+    // 是假的：12 GiB 站点复测那一次，`rows 191 672 → 84 258`（`rows_above_one 105 903 → 0`）就是
+    // 这一半干的，而 mark-sweep 那半确实一个字节没动。测量台被自己改了一遍 ⇒ 前后两批墙钟不能比。
+    // 规矩收敛成一条与 FR-7 同源的：**改东西的那一步必须 `--apply`，不带就只许读。**
+    if apply {
+        let stats = db.vacuum()?;
         println!(
-            "注意        = 有活跃事务 ⇒ **整轮跳过，一个版本都没裁**（`versions_removed = 0` \
-             不等于「没垃圾」，是「没开工」，§9.6.2）"
+            "本轮        = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
+            stats.rows_scanned, stats.versions_removed, stats.xmin
+        );
+        if matches!(stats.blob_rewritten, Some(true)) {
+            println!("blob 文件   = 已重写（外置 value 被压实过）");
+        }
+        if stats.skipped_active_txn {
+            println!(
+                "注意        = 有活跃事务 ⇒ **整轮跳过，一个版本都没裁**（`versions_removed = 0` \
+                 不等于「没垃圾」，是「没开工」，§9.6.2）"
+            );
+        }
+    } else {
+        println!(
+            "版本链      = **只报账，没裁**（没给 `--apply`）。多余版本行的上界 = rows_above_one {}；\
+             要真裁就 `gc --apply`",
+            before.rows_above_one
         );
     }
 

@@ -155,3 +155,51 @@ fn push_needs_a_pairing_and_remote_root_cannot_replace_it() {
     let e = m1::paired_root(&cli, "nonesuch", None).expect_err("没有这个项目");
     assert!(e.to_string().contains("没有项目"), "要说清是没注册：{e}");
 }
+
+/// `gc` 不带 `--apply` 就是**只读**——两半都只读（2026-10-20 的更正）。
+///
+/// 起因是一条实测事故：12 GiB 站点上复测折数时跑了 `gc --sweep`（没给 `--apply`），
+/// 库从 `rows 191 672` 掉到 `84 258`。mark-sweep 那半确实没动，动的是**引擎版本链那半**——
+/// 它当时无条件执行 `db.vacuum()`。"dry-run 只报账"这句话在半个命令上成立，等于整句是假的，
+/// 而后果是测量台被自己改了、前后两批墙钟再也不能比。
+#[test]
+fn gc_without_apply_writes_nothing() {
+    use twosync::cli::m1;
+    let site = Site::new(&[("a.txt", b"v1 body"), ("d/b.txt", b"other body")]);
+    site.scan();
+    m0::commit(&site.cli(), Some("第一次"), false, Import::default()).unwrap();
+    // 再扫一遍再提交：同一个 `W` 行被盖了第二个版本 ⇒ 库里现在有"多余版本行"可裁。
+    site.scan();
+    m0::commit(&site.cli(), Some("第二次"), false, Import::default()).unwrap();
+
+    let before = site.rows();
+    let h = open_store(&site.root(), EngineKind::LsmTree)
+        .unwrap()
+        .health();
+    assert!(
+        h.rows_above_one > 0,
+        "台架前提：得有可裁的旧版本（rows {} / rows_above_one {}）",
+        h.total_rows,
+        h.rows_above_one
+    );
+
+    // ① 裸 `gc`：一行都不许多也不许少
+    m1::gc(&site.cli(), None, false, false, 0, 0.0, 0.0).unwrap();
+    assert_eq!(site.rows(), before, "不带 --apply 的 gc 改动了库");
+
+    // ② `--sweep` 不带 `--apply`：这就是出事的那一条形状
+    m1::gc(&site.cli(), None, true, false, 0, 0.0, 0.0).unwrap();
+    assert_eq!(
+        site.rows(),
+        before,
+        "`gc --sweep`（dry-run）动了库 ⇒ 报的账不再是同一份现场"
+    );
+
+    // ③ 给了 `--apply` 才真的裁：证明上面两条不是"vacuum 本来就没活干"
+    m1::gc(&site.cli(), None, false, true, 0, 0.0, 0.0).unwrap();
+    let after = site.rows();
+    assert!(
+        after < before,
+        "--apply 之后版本链必须真的变短：{before} → {after}"
+    );
+}
