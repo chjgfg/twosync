@@ -921,6 +921,26 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
         session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT)).expect("崩溃之后的一次完整 push");
     io.finish().expect("agent 该正常收尾");
     assert!(rep.bytes_sent > 0, "第三块得补发出去");
+    // 这一对数是 §11 的 M2 判据"**拔网重连自动续传**"的实际形状：重连不是"从头再传一遍"。
+    // 协商（`want/have`）问的是"对面 CAS 里**文件**在不在"，所以已经落盘的块会被跳过——
+    // 哪怕它们一行账都还没写（上面刚验过 `K`/`B` 都是 0 行）。
+    assert_eq!(
+        rep.blocks_sent + rep.blocks_skipped,
+        3,
+        "三块都得在账上，要么上线要么跳过：{rep:?}"
+    );
+    assert!(
+        rep.blocks_sent < 3,
+        "重连把已经落盘的块也重发了 ⇒ 那不叫续传（上线 {} / 跳过 {}）",
+        rep.blocks_sent,
+        rep.blocks_skipped
+    );
+    println!(
+        "续传读数 = 上线 {} 块 / {:.1} MiB，跳过 {} 块（已经落盘的那几块）",
+        rep.blocks_sent,
+        rep.bytes_sent as f64 / 1048576.0,
+        rep.blocks_skipped
+    );
 
     let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("再开一次对端的库");
     assert_eq!(
