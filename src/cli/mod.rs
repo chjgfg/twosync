@@ -45,11 +45,29 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = engine_parser)]
     pub engine: Option<EngineKind>,
 
+    /// **这一个进程唯一的 IO 桶**（FR-15 / §16.3"资源预算不叠加"）。不由命令行填，
+    /// `--max-mbps` 的各条命令通过 [`Cli::budget`] 把它灌进这里。
+    ///
+    /// 为什么住在 `Cli` 而不是各命令自己 `new` 一个：单条命令只有一个阶段，看不出差别；
+    /// `daemon` 一轮有 scan→commit→push 三个阶段，各开各的桶就是三倍预算，
+    /// 而那正是 §16.3 点名叫出来的错误形状。
+    #[arg(skip)]
+    pub io_bucket: crate::store::cas::Bucket,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
 
 impl Cli {
+    /// 拿到本进程的 IO 桶，并把它设成 `max_bps` 的预算（`0` = 这条命令没给限速，不改已有预算）。
+    ///
+    /// 所有 `Cas::with_bucket(&cli.budget(x))` 都指向**同一个**把手：漏桶记的是"从第一次扣字节
+    /// 起的累计期望时间"，所以共用把手才能让整轮的平均速率被一个数管住。
+    pub fn budget(&self, max_bps: u64) -> crate::store::cas::Bucket {
+        self.io_bucket.configure(max_bps);
+        self.io_bucket.clone()
+    }
+
     /// 打开存储基座。"命令行 > 配置文件 > 内置默认"这条顺序**只在这里实现一次**——
     /// 两处各判一遍，就会出现 `status` 看着 lsm、`commit` 写进 bplus 的那种分裂。
     ///

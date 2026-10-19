@@ -349,6 +349,10 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
             let size = *out.block_size.get(h).unwrap_or(&0);
             let body = cas.read_block(h, size)?;
             frame::write_segment(io, h, &body)?;
+            // 上行字节也过**同一个桶**（FR-15 / NFR-3"总预算不叠加"）：`daemon` 一个进程里
+            // scan 写盘、commit 落块、push 上行、gc 删除用的是同一个 `Bucket`（`Cas::with_bucket`）。
+            // 放在 `write_segment` 之后：没发出去的不该扣预算（与 CAS 的 `rename` 之后才扣同理）。
+            cas.pace(body.len() as u64);
             rep.blocks_sent += 1;
             rep.bytes_sent += body.len() as u64;
         }

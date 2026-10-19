@@ -206,6 +206,13 @@ pub enum Cmd {
         /// 本次会话最多发多少 MiB 的块（§9.4.5 的配额）。0 = 不限
         #[arg(long, default_value_t = 0.0)]
         max_send_mib: f64,
+        /// 上行字节的平均速率上限（MiB/s，FR-15 的桶）。0 = 不限速
+        ///
+        /// 与 `commit --max-mbps`、`gc --max-mbps` 是**同一个桶的形状**：扣的是"这次真的搬走的字节"。
+        /// 单条命令里只有一个阶段，所以各自一个桶不叠加；`daemon` 里也一样是顺序阶段
+        /// （平均仍被压住），要跨阶段共享同一个桶就用 `Cas::with_bucket`（把手已经备好）。
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
         /// 本端越过 FR-10 熔断。**注意对端仍然按它自己的闸判**——这条旗标不跨机器传
         #[arg(long)]
         allow_mass_delete: bool,
@@ -264,6 +271,44 @@ pub enum Cmd {
         quota_mib: f64,
     },
 
+    /// 常驻：watch 事件驱动 + debounce + 周期兜底 ⇒ 自动 `scan`/`commit`，可选自动 `push`（M2）
+    ///
+    /// 一轮 = 静默期到 ⇒ 全量 scan ⇒ commit（**无变更就不产生提交也不移 head**）⇒ 配对了才 push。
+    /// 默认间隔 900 s 是量出来的，不是拍的：12 GiB 站点上"什么都不改"的一轮 scan 要
+    /// **68.2 s / 20 215 次点读**（§11.4b），按 NFR-2 的"稳态 ≤ 10 % 单核"倒推下限 ≈ 680 s。
+    /// 事件驱动只用来**提前**触发这一轮，不做"只扫变更目录"的窄扫——那要先解决删除判定
+    /// （`scanned_at >= epoch` 才算活着 ⇒ 没被重扫的目录会被判成删除，§8 的第一杀手）。
+    Daemon {
+        /// 周期兜底间隔（秒）：哪怕一个事件都没收到，最迟这么久也走一轮
+        #[arg(long, default_value_t = 900)]
+        interval: u64,
+        /// 静默期（秒）：收到事件后等这么多秒没有新事件才开始一轮（防"边写边扫"扫到半成品）
+        #[arg(long, default_value_t = 5)]
+        debounce: u64,
+        /// 只跑 N 轮就退出（0 = 一直跑）。给排障与用例用
+        #[arg(long, default_value_t = 0)]
+        rounds: u64,
+        /// 全站 IO 总预算（MiB/s，FR-15）。0 = 不限速。
+        ///
+        /// commit 落块与 push 上行扣的是**同一个把手**（`Cli::budget`），所以这个数管的是整轮平均，
+        /// 不是"每个阶段各 8 MiB/s"。
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
+        /// 只本地提交，不推送（对端还没接上时先这么跑）
+        #[arg(long)]
+        no_push: bool,
+        /// 推送目标（交给 ssh 的 host 别名）。`--no-push` 时可省略
+        #[arg(long)]
+        peer: Option<String>,
+        /// 远端的 twosync 可执行文件（在远端 PATH 里时给个名字就够）。转给 push 阶段
+        #[arg(long, default_value = "twosync")]
+        agent_bin: String,
+        /// 允许自动提交"大批删除"（FR-10）。**默认不给**：常驻进程不该有越过熔断的权力，
+        /// 删了一半的项目要人来决定（§7 那行说的就是这个）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
     /// 对端身份表（§9.5.1 的 TOFU）：`list` 看库里记了谁，`forget` 忘掉一条以便重新确认
     ///
     /// **没有 `add`**：手工 add 要求人先知道对方的站点身份，而那个身份只能从"第一次连上它"看到
@@ -275,7 +320,7 @@ pub enum Cmd {
     },
 
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
-    // ── M2 ── daemon / watch
+    // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 ── pull / sync
     // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
 }
@@ -300,6 +345,40 @@ impl Import {
             (self.max_mbps * 1048576.0) as u64
         }
     }
+}
+
+/// `m1::push` 要带的旋钮。收成结构而不是八个位置参数，有两个原因：
+/// `daemon` 要把同一套旗标**转手**给 push（位置参数传反过一次，见 [`Import`] 那段），
+/// 而 clippy 的 7 参上限报的就是这形状 —— 一次会话的旗标本来就是一组，不是一个列表。
+#[derive(Debug, Clone, Copy)]
+pub struct PushArgs<'a> {
+    pub peer: &'a str,
+    pub agent_bin: &'a str,
+    pub remote_root: Option<&'a str>,
+    pub project: Option<&'a str>,
+    /// §9.4.5 的单次会话发送配额，MiB；0 = 不限
+    pub max_send_mib: f64,
+    /// FR-15 的桶，MiB/s；0 = 不限速
+    pub max_mbps: f64,
+    pub allow_mass_delete: bool,
+}
+
+/// `m2::daemon` 要带的旋钮。理由与 [`PushArgs`] 同一条，另外这里还有一层：
+/// `daemon` 的 `--max-mbps`/`--allow-mass-delete` 要**原样**落到 commit 与 push 两个阶段，
+/// 散在签名里最容易漏的就是"只给了一半"。
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonArgs<'a> {
+    /// 周期兜底间隔，秒
+    pub interval: u64,
+    /// 事件静默期，秒
+    pub debounce: u64,
+    /// 跑满 N 轮退出；0 = 常驻
+    pub rounds: u64,
+    pub max_mbps: f64,
+    pub no_push: bool,
+    pub peer: Option<&'a str>,
+    pub agent_bin: &'a str,
+    pub allow_mass_delete: bool,
 }
 
 /// §9.5.1 的 TOFU 表操作。

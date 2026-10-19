@@ -115,9 +115,9 @@ pub struct Cas {
     block_size: u64,
     /// 落块要不要等 fsync（默认 `true`）。关掉放弃了什么，见模块头。
     fsync_blocks: bool,
-    /// CAS 写字节的平均速率闸。`None` = 不限速。放在 `Mutex` 里是因为 `Cas` 全程按
-    /// `&self` 传（`put_file`/`read_blob` 都是），而限速需要累计已写字节。
-    pacer: Mutex<Option<Pacer>>,
+    /// 写字节的平均速率闸。**`Cas` 全程按 `&self` 传**（`put_file`/`read_blob` 都是），
+    /// 而限速要累计已写字节 ⇒ 放进 `Bucket` 的 `Arc<Mutex<..>>` 里。
+    bucket: Bucket,
 }
 
 /// 漏桶限速：**只保证平均速率**，不削瞬时突发。
@@ -151,6 +151,67 @@ impl Pacer {
     }
 }
 
+/// **一个桶可以被多方持有**的 IO 总预算：克隆它得到的是把手，不是第二个桶。
+///
+/// 为什么要把手而不是"每个 `Cas` 自己一个 `Pacer`"：FR-15 / NFR-3 要的数是"这台机器一共能吃
+/// 多少 IO"，而 `scan`/`commit` 写盘、`push` 上行、`gc` 删除是同一台机器上的同一件事 ——
+/// 各开各的桶就是双倍速率，那正是 §16.3"资源预算不叠加"点名叫出来的错误形状。
+///
+/// 一条如实的边界：**常驻循环目前是单线程顺序执行**，把手买到的是"整轮平均速率由一个数管"
+/// 与"累计扣了多少字节可核对"（`written()`），而不是"并发阶段互相压速"；哪天某一步挪到别的线程上
+/// （M2 之后的 pull/并行 GC），同一个 `Bucket` 传下去就还是同一份预算。这一句别省着不写。
+#[derive(Clone, Default)]
+pub struct Bucket(std::sync::Arc<Mutex<Option<Pacer>>>);
+
+impl Bucket {
+    /// `max_bps = 0` 当"不限速"处理（与 [`Cas::with_rate_limit`] 同一条除零防线）。
+    pub fn limited(max_bps: u64) -> Self {
+        let p = if max_bps == 0 { None } else { Some(Pacer::new(max_bps)) };
+        Bucket(std::sync::Arc::new(Mutex::new(p)))
+    }
+
+    /// 从桶里扣 `n` 字节：不够就睡到够。
+    pub fn charge(&self, n: u64) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = guard.as_mut() {
+            p.charge(n);
+        }
+    }
+
+    /// 把**这个**桶设成 `max_bps` 的预算：`daemon` 一轮里 commit 与 push 要共用一个总预算，
+    /// 而 `--max-mbps` 是各阶段各自给的参数，所以"共享"必须落在把手上而不是构造点上。
+    ///
+    /// 三条要命的细节，都在这一个函数里：
+    /// - 同一个值重复配置 ⇒ **原样保留**（起点与累计字节不动）。否则 daemon 第二轮一进 commit
+    ///   就把起点重置，一整轮的平均速率重新算，限速形同虚设。
+    /// - `max_bps = 0` ⇒ **只补空缺，不解除已有限速**。否则一轮里某个阶段忘了带旗标，
+    ///   就把其它阶段挣来的预算整个关掉。
+    /// - 值不同 ⇒ 换新预算（不是取小者）。取小会让"上一阶段是 8 MiB/s、这一阶段没给"变成静默变慢，
+    ///   而调用方打的是自己那一条的值。
+    pub fn configure(&self, max_bps: u64) {
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if max_bps == 0 {
+            // 0 = "这一条命令没说话"：不解除已经存在的预算。
+            return;
+        }
+        if let Some(p) = guard.as_ref()
+            && p.max_bps == max_bps
+        {
+            return; // 同一个值：起点与累计字节必须留着。
+        }
+        *guard = Some(Pacer::new(max_bps));
+    }
+
+    pub fn limit(&self) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|p| p.max_bps)
+    }
+
+    /// 累计已扣的字节数（写 + 删 + 上行）。`None` = 没开限速。
+    pub fn written(&self) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|p| p.written)
+    }
+}
+
 impl Cas {
     pub fn new(objects_dir: &Path, block_size: u64) -> Result<Self> {
         fs::create_dir_all(objects_dir)?;
@@ -158,7 +219,7 @@ impl Cas {
             dir: objects_dir.to_path_buf(),
             block_size,
             fsync_blocks: true,
-            pacer: Mutex::new(None),
+            bucket: Bucket::default(),
         })
     }
 
@@ -171,13 +232,20 @@ impl Cas {
 
     /// 限制写 CAS 的平均字节/秒；`0` 当"不限速"处理（省得调用方传个 0 变成除零）。
     pub fn with_rate_limit(mut self, max_bps: u64) -> Self {
-        let pacer = if max_bps == 0 {
-            None
-        } else {
-            Some(Pacer::new(max_bps))
-        };
-        self.pacer = Mutex::new(pacer);
+        self.bucket = Bucket::limited(max_bps);
         self
+    }
+
+    /// 用**别人的桶**（同一个预算）。`--max-mbps` 在常驻循环里只该有一个所有者，
+    /// 所以每个阶段（scan/commit/push/gc）都拿同一个把手来构造自己的 `Cas`。
+    pub fn with_bucket(mut self, bucket: &Bucket) -> Self {
+        self.bucket = bucket.clone();
+        self
+    }
+
+    /// 命令层要把它印出来（"这一轮的预算是多少、有没有共享"），不许静默生效。
+    pub fn bucket(&self) -> Bucket {
+        self.bucket.clone()
     }
 
     /// 命令层用它把"放弃了什么"如实印出来。
@@ -186,11 +254,7 @@ impl Cas {
     }
 
     pub fn rate_limit_bps(&self) -> Option<u64> {
-        self.pacer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .map(|p| p.max_bps)
+        self.bucket.limit()
     }
 
     /// 从这个 `Cas` 建立起累计扣过桶的字节数（写 + 删）；没开限速时是 `None`。
@@ -198,11 +262,7 @@ impl Cas {
     /// 存在的唯一理由是 §9.3/FR-15 那条"删除也要过同一个桶"**必须可核对**：用例拿它断言
     /// "一趟 unlink 扣掉的字节 = 被删块的 size 之和"，这比掐墙钟可靠（单核机上计时用例本身就是噪声源）。
     pub fn paced_bytes(&self) -> Option<u64> {
-        self.pacer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .map(|p| p.written)
+        self.bucket.written()
     }
 
     /// 块在库内的相对路径：`<hash[0:2]>/<hash[2:]>`，两级目录避免单目录爆十万文件。
@@ -502,10 +562,7 @@ impl Cas {
     /// 一次 unlink 几万个块文件在机械盘上同样是突发。写与删共用一个 `Pacer` 是刻意的：
     /// 两个各自的桶加起来就是双倍的速率，而配额是按"这台机器一共能吃多少 IO"定的。
     pub fn pace(&self, n: u64) {
-        let mut guard = self.pacer.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(p) = guard.as_mut() {
-            p.charge(n);
-        }
+        self.bucket.charge(n);
     }
 
     /// 把库里一个块流式拷进 `dst`。**两个 hasher 各管各的**：

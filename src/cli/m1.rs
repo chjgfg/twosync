@@ -40,6 +40,7 @@ use std::process::{Child, Command, Stdio};
 
 use crate::cli::Cli;
 use crate::cli::cmd::PeerCmd;
+use crate::cli::cmd::PushArgs;
 use crate::cli::m0;
 use crate::error::{Error, Result};
 use crate::net::frame::caps;
@@ -120,22 +121,34 @@ impl Duplex {
 }
 
 /// `push` 的一次会话：起 ssh、握手、协商、传块与清单、等对端 verdict。
-pub fn push(
-    cli: &Cli,
-    peer: &str,
-    agent_bin: &str,
-    remote_root: Option<&str>,
-    project: Option<&str>,
-    max_send_mib: f64,
-    allow_mass_delete: bool,
-) -> Result<()> {
+pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
+    // 一次解构，后面全部按原名用：把结构体拆成局部变量，比到处写 `a.xxx` 少一层噪音，
+    // 也不会出现"参数表和函数体两套命名"（`remote_root_opt` 那种）。
+    let PushArgs {
+        peer,
+        agent_bin,
+        remote_root,
+        project,
+        max_send_mib,
+        max_mbps,
+        allow_mass_delete,
+    } = *a;
     let (name, _) = match project {
         Some(p) => (p.to_string(), cli.root.clone()),
         None => m0::resolve_project(cli)?,
     };
     let db = cli.store()?;
     let pid = keys::project_id(&name);
-    let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    // `--max-mbps` 挂在这个进程的桶上（`cli.budget`）：`session::push` 每发完一个块段就扣一次字节
+    // （FR-15 的同一个桶；`commit` 写盘与 `gc` 删除走的是同一条 `Cas::pace` 路径）。
+    let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
+        .with_bucket(&cli.budget((max_mbps * 1048576.0) as u64));
+    if let Some(bps) = cas.rate_limit_bps() {
+        println!(
+            "上行限速    = {:.1} MiB/s（FR-15 的桶，与同进程的 commit/gc **共用同一个把手**；扣的是真发出去的块字节）",
+            bps as f64 / 1048576.0
+        );
+    }
     let heads = build::ref_heads(&*db, pid, build::MAIN)?;
     if heads.is_empty() {
         return Err(Error::BadInput(format!(
@@ -387,7 +400,7 @@ pub fn gc(
         );
         let unlink_max = if unlink_max_files == 0 { usize::MAX } else { unlink_max_files };
         let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
-            .with_rate_limit((max_mbps * 1048576.0) as u64);
+            .with_bucket(&cli.budget((max_mbps * 1048576.0) as u64));
         let cap = if unlink_max == usize::MAX {
             "不限个数".to_string()
         } else {

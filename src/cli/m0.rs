@@ -394,7 +394,7 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
     // 块仓是**站点级**的一份（挂在 `--root` 下），不是每项目一份：跨项目去重靠这个。
     let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
         .with_fsync(!import.fast)
-        .with_rate_limit(import.rate_bytes_per_sec());
+        .with_bucket(&cli.budget(import.rate_bytes_per_sec()));
 
     let started = Instant::now();
     let wm = allocstats::watermark();

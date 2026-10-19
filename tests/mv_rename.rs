@@ -62,6 +62,7 @@ impl Site {
             // None = 让 `Cli::store()` 去问配置文件，再退到内置默认：这条路径也要被用例走到。
             engine: None,
             // mv 不看 cmd，但 `Cli` 要求它存在：给个最便宜的变体，不假装是别的命令。
+            io_bucket: Default::default(),
             cmd: Cmd::Init,
         }
     }

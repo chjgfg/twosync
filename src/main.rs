@@ -3,7 +3,8 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use twosync::cli::{m0, m1};
+use twosync::cli::cmd::{DaemonArgs, PushArgs};
+use twosync::cli::{m0, m1, m2};
 use twosync::cli::{Cli, Cmd, Import};
 use twosync::error::Result;
 
@@ -64,15 +65,41 @@ fn dispatch(cli: &Cli) -> Result<()> {
             remote_root,
             project,
             max_send_mib,
+            max_mbps,
             allow_mass_delete,
         } => m1::push(
             cli,
+            &PushArgs {
+                peer,
+                agent_bin,
+                remote_root: remote_root.as_deref(),
+                project: project.as_deref(),
+                max_send_mib: *max_send_mib,
+                max_mbps: *max_mbps,
+                allow_mass_delete: *allow_mass_delete,
+            },
+        ),
+        Cmd::Daemon {
+            interval,
+            debounce,
+            rounds,
+            max_mbps,
+            no_push,
             peer,
             agent_bin,
-            remote_root.as_deref(),
-            project.as_deref(),
-            *max_send_mib,
-            *allow_mass_delete,
+            allow_mass_delete,
+        } => m2::daemon(
+            cli,
+            &DaemonArgs {
+                interval: *interval,
+                debounce: *debounce,
+                rounds: *rounds,
+                max_mbps: *max_mbps,
+                no_push: *no_push,
+                peer: peer.as_deref(),
+                agent_bin,
+                allow_mass_delete: *allow_mass_delete,
+            },
         ),
         Cmd::Agent { project } => m1::agent(cli, project.as_deref()),
         Cmd::Gc {
