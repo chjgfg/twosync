@@ -63,6 +63,7 @@ impl Site {
             engine: None,
             // mv 不看 cmd，但 `Cli` 要求它存在：给个最便宜的变体，不假装是别的命令。
             io_bucket: Default::default(),
+            store_slot: Default::default(),
             cmd: Cmd::Init,
         }
     }

@@ -2,6 +2,7 @@
 //! 分发在 `main.rs`（加一条命令要动三处：枚举变体 + 批次函数 + match 分支）。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 
@@ -54,6 +55,16 @@ pub struct Cli {
     #[arg(skip)]
     pub io_bucket: crate::store::cas::Bucket,
 
+    /// 第一次 [`Cli::store`] 时打开、之后**一直复用**的那个引擎句柄。同样不由命令行填
+    /// （`pub` 只为测试能拼出 `Cli`；命令层一律走 [`Cli::store`]，别自己去 `open_store`，
+    /// 那会绕过 FR-21 启动自检与这个缓存）。
+    ///
+    /// 为什么是 `Arc` 而不是把 `&dyn KvEngine` 直接递出去：49 处调用点写的是 `&*db`，
+    /// 换成引用会让它们全变成 `clippy::deref_addrof`（一次纯 API 改动不该逼出 49 处手改），
+    /// 而 `Arc` 的克隆是免费的、`&*db` 那个形状也照常成立。
+    #[arg(skip)]
+    pub store_slot: std::sync::OnceLock<Arc<dyn KvEngine>>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -72,12 +83,31 @@ impl Cli {
     /// 两处各判一遍，就会出现 `status` 看着 lsm、`commit` 写进 bplus 的那种分裂。
     ///
     /// 也不许在命令层自己拼 `StorageConfig`：那会绕过 `open_store` 里的 FR-21 启动自检。
-    pub fn store(&self) -> Result<Box<dyn KvEngine>> {
+    ///
+    /// **句柄是缓存的**（本进程第一次打开之后一直复用），理由是一个实测数：12 GiB 站点上
+    /// "只开库 + `health()`" 的 `doctor` 要 2.20 s CPU（§11.4f），而 `daemon` 一轮原来要开五次
+    /// （scan / 读 head 两次 / commit / push）⇒ **每轮约 8.8 s CPU 纯开库**，比窄扫本身（约 1 s）
+    /// 还贵。常驻循环里这叫结构性浪费，而且它随阶段数线性涨——加一个阶段就多 2.2 s。
+    ///
+    /// 代价要写清：句柄活到 `Cli` 结束，所以"同一个进程里再开一个句柄去开同一份库"这条路径
+    /// 从此走不通（引擎持**库级文件锁**，第二个句柄 `WouldBlock`）。本来也不该走：要开另一份站点
+    /// 就换 `--root`（那是另一个 `Cli`），要开同一份就用这个函数。
+    pub fn store(&self) -> Result<Arc<dyn KvEngine>> {
+        if let Some(db) = self.store_slot.get() {
+            return Ok(db.clone());
+        }
         let kind = match self.engine {
             Some(k) => k,
             None => Config::load(&self.root)?.engine()?,
         };
-        open_store(&self.root, kind)
+        let db: Arc<dyn KvEngine> = Arc::from(open_store(&self.root, kind)?);
+        // 真并发时会有一个人 `set` 输：他那份句柄当场释放（文件锁也还回去），大家看到赢的那个。
+        let _ = self.store_slot.set(db);
+        Ok(self
+            .store_slot
+            .get()
+            .expect("上面要么 set 成功，要么已经有人 set 过")
+            .clone())
     }
 
     /// CAS 块大小。同 `store()`：优先级判定只有一处。

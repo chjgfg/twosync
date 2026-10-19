@@ -187,7 +187,6 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         let db = cli.store()?;
         let pid = crate::store::keys::project_id(&name);
         let before = build::all_ref_heads(&*db, pid, None)?;
-        drop(db);
         m0::commit(
             cli,
             Some(&format!("daemon 第 {round} 轮（{trigger:?}）")),
@@ -199,7 +198,6 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         )?;
         let db = cli.store()?;
         let after = build::all_ref_heads(&*db, pid, None)?;
-        drop(db);
         let committed = after != before;
 
         // ── pull（先收，再送）──

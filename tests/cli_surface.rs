@@ -49,6 +49,7 @@ impl Site {
             engine: None,
             // 每命令一个 `Cli` ⇒ 每命令一个新桶（和真实 CLI 一样）。只有 `daemon` 会跨阶段共用。
             io_bucket: Default::default(),
+            store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         }
     }
@@ -201,5 +202,35 @@ fn gc_without_apply_writes_nothing() {
     assert!(
         after < before,
         "--apply 之后版本链必须真的变短：{before} → {after}"
+    );
+}
+
+/// `Cli::store()` 的缓存：同一个 `Cli` 只开一次库。
+///
+/// 断言的是**句柄身份**，不是"快了多少"：省下的那几秒（12 GiB 站点上每次开库 2.20 s CPU，
+/// `daemon` 一轮原来要开五次，§11.4f）是这条性质的推论，用不着拿墙钟当证据。
+#[test]
+fn one_cli_opens_the_store_exactly_once() {
+    let site = Site::new(&[("a.txt", b"body")]);
+    let cli = site.cli();
+    let first = cli.store().expect("第一次开库");
+    let second = cli.store().expect("第二次该拿缓存");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "同一个 `Cli` 拿到了两个不同的句柄 ⇒ 缓存没生效"
+    );
+
+    // 反面：引擎持**库级文件锁**，所以另一个 `Cli` 想同时开同一份库必须失败。
+    // 这一条以前是"顺手掉句柄就行"，现在是**结构性**的：句柄活到 `Cli` 结束。
+    // 写在这儿是为了让下一个想"在命令层再 open 一次"的人当场看到，而不是在生产的常驻进程里看到。
+    let other = site.cli();
+    let err = match other.store() {
+        Ok(_) => panic!("同一份库的第二个句柄该被文件锁挡住，结果它开成功了"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("lock") || err.to_string().contains("WouldBlock")
+            || err.to_string().contains("锁"),
+        "要报的是锁，不是别的：{err}"
     );
 }

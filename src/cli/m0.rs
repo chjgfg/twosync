@@ -314,7 +314,8 @@ fn print_row(db: &dyn KvEngine, reg: &Registry, name: &str) -> Result<()> {
 }
 
 /// `project` 里几条命令都要开引擎，但 `add`/`list`/`use` 不需要——所以不在函数开头统一开。
-fn db_or_open(cli: &Cli) -> Result<Box<dyn KvEngine>> {
+/// （句柄本身在 `Cli` 里缓存，所以"这里开一次、那里再开一次"已经是免费的。）
+fn db_or_open(cli: &Cli) -> Result<std::sync::Arc<dyn storage_engines::KvEngine>> {
     cli.store()
 }
 

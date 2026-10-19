@@ -55,6 +55,7 @@ impl Site {
             project: Some("p".to_string()),
             engine: Some(EngineKind::LsmTree),
             io_bucket: bucket,
+            store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         }
     }
@@ -237,6 +238,7 @@ fn zero_intervals_are_clamped_to_one_second() {
             project: Some("p".to_string()),
             engine: Some(EngineKind::LsmTree),
             io_bucket: Bucket::default(),
+            store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         };
         m2::daemon(
