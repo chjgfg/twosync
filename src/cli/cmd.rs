@@ -218,6 +218,35 @@ pub enum Cmd {
         allow_mass_delete: bool,
     },
 
+    /// 反方向取历史：拨到对端，让它把它那边缺给我们的东西**推过来**（M2，§16.3"拨号方向对称"）
+    ///
+    /// 与 `push` 是同一条会话、同一批帧、同一套闸（FR-10、§9.4.1 路径、缺块自证、闭合性），
+    /// 只是本端站到了**收**的那一侧。为什么要有这条：新机器/重装过的站点**还没有任何 head**，
+    /// 那时"两边各 push 一次"里有一边根本推不动，而取回历史恰恰是它最需要做的事。
+    /// 配额在这里换了声明的人：`--max-recv-mib` 是本端愿意被灌多少，交给对面按它自我了断。
+    Pull {
+        /// 对端标识，直接交给 ssh：`[user@]host[:port]`
+        peer: String,
+        /// 远端的 twosync 可执行文件
+        #[arg(long, default_value = "twosync")]
+        agent_bin: String,
+        /// 远端的站点根。**省略 = 用 `project pair` 记下的那个**（没配对过就拉不动，§9.5.3）
+        #[arg(long)]
+        remote_root: Option<String>,
+        /// 只拉这一个项目；省略 = 当前项目
+        #[arg(long)]
+        project: Option<String>,
+        /// 本次会话最多**收**多少 MiB 的块。0 = 不限
+        #[arg(long, default_value_t = 0.0)]
+        max_recv_mib: f64,
+        /// 落盘字节的平均速率上限（MiB/s，FR-15 的桶）。0 = 不限速
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
+        /// 本端越过 FR-10 熔断（收进来的那一版删了太多东西时，由**收的这侧**决定）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
     /// 会话的服务端：从 stdin 读帧、往 stdout 写帧。**给 `ssh` 调，不是给人敲的**
     ///
     /// stdout 只能有帧，诊断一律走 stderr（多写一行到 stdout，对端就把它当帧解，
@@ -359,6 +388,21 @@ pub struct PushArgs<'a> {
     /// §9.4.5 的单次会话发送配额，MiB；0 = 不限
     pub max_send_mib: f64,
     /// FR-15 的桶，MiB/s；0 = 不限速
+    pub max_mbps: f64,
+    pub allow_mass_delete: bool,
+}
+
+/// `m1::pull` 要带的旋钮。形状与 [`PushArgs`] 一对一，只有配额那一格换了方向：
+/// pull 里"愿意被灌多少"是本端（收的一方）的预算，所以它走 `PullRequest.max_bytes`
+/// 交给对面，由**发送方**照它自我了断（§9.4.5 那条"超了就 Abort、一个字不发"没变，变的是谁声明）。
+#[derive(Debug, Clone, Copy)]
+pub struct PullArgs<'a> {
+    pub peer: &'a str,
+    pub agent_bin: &'a str,
+    pub remote_root: Option<&'a str>,
+    pub project: Option<&'a str>,
+    /// 本次最多收多少 MiB 的块。0 = 不限
+    pub max_recv_mib: f64,
     pub max_mbps: f64,
     pub allow_mass_delete: bool,
 }

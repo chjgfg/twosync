@@ -40,6 +40,7 @@ use std::process::{Child, Command, Stdio};
 
 use crate::cli::Cli;
 use crate::cli::cmd::PeerCmd;
+use crate::cli::cmd::PullArgs;
 use crate::cli::cmd::PushArgs;
 use crate::cli::m0;
 use crate::error::{Error, Result};
@@ -237,6 +238,113 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
     io.finish()
 }
 
+/// `pull`：拨到对端，让它把它那边的历史**推给我们**（同一套帧，本端站在收的那一侧）。
+///
+/// 与 `push` 的差别只有三处，其余全共用（起 ssh 的引号规矩、TOFU 的顺序、配对闸门、管子收尾）：
+/// 1. 会话开成 `PullRequest`（本端的 head 集合 + 自报祖先 + **本端愿意收的配额**）；
+/// 2. 配额换人声明：`--max-recv-mib` 是收货方的预算，由对面（发送方）照它自我了断；
+/// 3. 验收在这台机器上做，所以 **FR-10 熔断看的是本端的旗标**——`pull` 回来的那一版要是删了
+///    半个项目，拒的是我们，不是对面。
+pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
+    let PullArgs {
+        peer,
+        agent_bin,
+        remote_root,
+        project,
+        max_recv_mib,
+        max_mbps,
+        allow_mass_delete,
+    } = *a;
+    let (name, _) = match project {
+        Some(p) => (p.to_string(), cli.root.clone()),
+        None => m0::resolve_project(cli)?,
+    };
+    let db = cli.store()?;
+    // 收进来的块要落 CAS ⇒ 限速挂在这个进程的桶上（与 commit/push/gc 同一个把手，FR-15）。
+    let cas = Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
+        .with_bucket(&cli.budget((max_mbps * 1048576.0) as u64));
+    if let Some(bps) = cas.rate_limit_bps() {
+        println!(
+            "落盘限速    = {:.1} MiB/s（FR-15 的桶，与同进程的 commit/push/gc 共用一个把手）",
+            bps as f64 / 1048576.0
+        );
+    }
+
+    let remote_root = paired_root(cli, &name, remote_root)?;
+    let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
+    let child = Command::new("ssh")
+        .arg(peer)
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            Error::BadInput(format!(
+                "起不了 `ssh {peer} {remote_cmd}`：{e}\n  \
+                 对端要能免密登录，且那边装了 twosync"
+            ))
+        })?;
+    let mut io = Duplex::from_child(child)?;
+    let site = site_id(&cli.root)?;
+    let opts = PushOpts {
+        project: &name,
+        peer_id: &site,
+        peer_name: peer.as_bytes(),
+        caps: caps::FIXED_CHUNK | caps::SPARSE | caps::XATTR_MODE,
+        max_block_bytes: if max_recv_mib > 0.0 {
+            (max_recv_mib * 1048576.0) as u64
+        } else {
+            u64::MAX
+        },
+        allow_mass_delete,
+    };
+    let rep = match session::pull(&mut io, &*db, &cas, &opts) {
+        Ok(rep) => rep,
+        Err(e) => {
+            // 先收尾再报错（与 `push` 同一条理由：不关写端，对面会一直等在管子上）。
+            let why = match io.finish() {
+                Ok(()) => e.to_string(),
+                Err(done) => format!("{e}\n  对端进程那一侧的读数：{done}"),
+            };
+            return Err(Error::BadInput(why));
+        }
+    };
+    if rep.first_contact {
+        println!(
+            "TOFU      = 首次连接 {peer}，它的站点身份已进 P 表。以后**身份一变就拒**；\
+             对端确实重装过就 `peer forget {peer}` 重新确认"
+        );
+    }
+    println!("project     = {name}");
+    println!("peer        = {peer}  (经 ssh 起的 agent；这一场本端是**接收方**)");
+    println!(
+        "收          = 块 {} 个 / {:.1} MiB 落盘，清单 blobs {} 份 / tree {} 份",
+        rep.blocks_written,
+        rep.bytes_in as f64 / 1048576.0,
+        rep.blobs_in,
+        rep.trees_in
+    );
+    println!(
+        "head(本端)  = {}",
+        rep.heads_after
+            .iter()
+            .map(keys::short)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // 验收是**本端**做的，所以拒绝的原因在这里就有，不必等对面报错回来。
+    // 但会话必须仍然以非零退出收尾：对面（发送方）那边 `push_body` 会收到我们的 `RejectCommit`
+    // 并以错误结束，我们若安静退场，两边看到的就是"成功了"和"失败了"两个故事。
+    let verdict = io.finish();
+    if !rep.accepted {
+        return Err(Error::BadInput(format!(
+            "本端拒绝收这一版：{}\n  （FR-10 是按**本端**的账判的；确认过了再加 --allow-mass-delete）",
+            rep.reason
+        )));
+    }
+    verdict
+}
+
 /// 服务端：stdin 读帧、stdout 写帧。**给人用 `ssh` 调，不是给人敲的**。
 ///
 /// 一条连接上连续服务多场会话 ⇒ FR-19 的"20 个 project 一轮只 1 次认证"。管子 EOF
@@ -285,20 +393,39 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
         match session::serve(&mut io, &*db, &cas, &site, !0, &mut resolve, false) {
             Ok(rep) => {
                 sessions += 1;
-                eprintln!(
-                    "agent #{sessions}: project={} 收块 {} 个 / {:.1} MiB，清单 {} 份，tree {} 份 ⇒ {}；head = {}",
-                    rep.project,
-                    rep.blocks_written,
-                    rep.bytes_in as f64 / 1048576.0,
-                    rep.blobs_in,
-                    rep.trees_in,
-                    if rep.accepted { "接受" } else { "拒绝" },
-                    rep.heads_after
-                        .iter()
-                        .map(keys::short)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                // 两种角色两种账：`sent` 有值 = 对面 `pull` 了我们，这一场本端是**发送方**。
+                // 打印形状必须分开——"上线/跳过"与"落盘/入库"不是同一组数（§10.4 差分表就吃这个数）。
+                match &rep.sent {
+                    Some(sent) => eprintln!(
+                        "agent #{sessions}: project={} 本端是**发送方**（对面 pull）：上线 {} 块 / {:.1} MiB，\
+                         跳过 {} 个（对面已有），清单 blobs {} 份 / tree {} 份；对面 head = {}",
+                        rep.project,
+                        sent.blocks_sent,
+                        sent.bytes_sent as f64 / 1048576.0,
+                        sent.blocks_skipped,
+                        sent.blobs_sent,
+                        sent.trees_sent,
+                        sent.accepted
+                            .iter()
+                            .map(keys::short)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    None => eprintln!(
+                        "agent #{sessions}: project={} 收块 {} 个 / {:.1} MiB，清单 {} 份，tree {} 份 ⇒ {}；head = {}",
+                        rep.project,
+                        rep.blocks_written,
+                        rep.bytes_in as f64 / 1048576.0,
+                        rep.blobs_in,
+                        rep.trees_in,
+                        if rep.accepted { "接受" } else { "拒绝" },
+                        rep.heads_after
+                            .iter()
+                            .map(keys::short)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                }
                 if !rep.accepted {
                     eprintln!("agent:   原因 = {}", rep.reason);
                 }

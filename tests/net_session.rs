@@ -1826,3 +1826,218 @@ fn incremental_push_counts(n: usize) -> (utils::CallCounts, utils::CallCounts) {
         mb.snapshot().since(before_b),
     )
 }
+
+// ── `pull`：同一套帧，反方向（M2，§16.3"拨号方向对称"）────────────────────────
+//
+// 这一组用例盯的是"换边之后闸还在不在"：`push` 那一侧验过的每一件事（闭合性、FR-10、
+// 配额、空集合必须是 0 字节），在 pull 里都必须由**另一边**重新成立一次。
+
+/// 反方向的一轮：一头 `pull`（本端收），另一头 `serve`（对面变成发送方）。
+/// 与 [`round`] 一样必须两条线程——会话是"说一句等一句"的形状。
+fn round_pull(
+    puller: &Site,
+    sender: &Site,
+    opts: &PushOpts<'_>,
+) -> (Result<ServeReport, Error>, Result<ServeReport, Error>) {
+    let (mut pa, mut pb) = duplex();
+    std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let cas_s = sender.cas();
+            let mut resolve = |_n: &str| Ok::<u32, String>(sender.pid);
+            session::serve(
+                &mut pb,
+                &*sender.db,
+                &cas_s,
+                b"peer-sender",
+                0xFFFF_FFFF,
+                &mut resolve,
+                false,
+            )
+        });
+        let cas_p = puller.cas();
+        let got = session::pull(&mut pa, &*puller.db, &cas_p, opts);
+        drop(pa);
+        let served = match h.join() {
+            Ok(r) => r,
+            Err(_) => Err(Error::BadInput("serve 线程 panic（见上面的 panic 输出）".into())),
+        };
+        (got, served)
+    })
+}
+
+#[test]
+fn a_pull_brings_the_history_to_a_site_with_no_head() {
+    // 新机器/重装过的站点：**本端一个 head 都没有**，而"两边各 push 一次"在这种形状里
+    // 有一边根本推不动（发起方自己没 head 就直接报错）。这一条演的正是那个缺口。
+    let a = Site::open();
+    let b = Site::open();
+    let files = seed(4);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, body)| (p.as_str(), body.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
+    assert!(b.heads().is_empty(), "台架前提：B 还没有任何历史");
+
+    let (got, served) = round_pull(&b, &a, &opts(PROJECT));
+    let got = got.expect("空站点也该拉得动");
+    let served = served.expect("对面（发送方）该成功");
+
+    assert!(got.accepted, "本端验收：{}", got.reason);
+    assert_eq!(got.blobs_in, 4, "4 份清单落到本端");
+    assert!(got.blocks_written > 0, "块必须真的落盘");
+    assert_eq!(
+        b.heads(),
+        a.heads(),
+        "拉完之后两边的 head 集合要一模一样（差一个字节都不行）"
+    );
+    assert_eq!(b.block_count(), a.block_count(), "本端 CAS 的块数该对得上对面");
+    // 对面那份账必须记成"我是发送方"，而不是伪装成一场收东西的会话。
+    let sent = served.sent.expect("对面是发送方 ⇒ sent 必须有值");
+    assert_eq!(sent.commits, 1, "它推了一个 commit：{sent:?}");
+    assert!(sent.blocks_sent > 0);
+    assert!(served.heads_after == a.heads(), "发送方的 head 集合不因发送而改变");
+}
+
+#[test]
+fn pull_then_pull_converges_two_independently_committed_sites() {
+    // §7 的 union 那一行，走 pull 这条路：两边各有一笔**互不相干**的提交，
+    // 互相拉一次之后两边的 head 集合必须相等，而且**两笔历史都还在**（谁也没被覆盖掉）。
+    let a = Site::open();
+    let b = Site::open();
+    a.commit(&[("x0/f.bin", b"the content on side A")], 1);
+    b.commit(&[("y0/f.bin", b"the content on side B")], 2);
+    let (ha, hb) = (a.heads(), b.heads());
+    assert_ne!(ha, hb, "台架前提：两边各有各的 head");
+
+    // B 拉 A：B 收下 A 的历史，自己的那一笔不动 ⇒ union。
+    let (got, _) = round_pull(&b, &a, &opts(PROJECT));
+    got.expect("第一次 pull");
+    let after_first = b.heads();
+    assert_eq!(after_first.len(), 2, "B 应该同时持有自己那一笔与 A 那一笔：{after_first:?}");
+    assert!(after_first.contains(&ha[0]) && after_first.contains(&hb[0]));
+
+    // A 拉 B：A 收到 B 那一笔（以及它自己那笔的孙——B 那边已经合并过的 head 集合）。
+    let (got, _) = round_pull(&a, &b, &opts(PROJECT));
+    got.expect("第二次 pull");
+    assert_eq!(
+        a.heads(),
+        b.heads(),
+        "互相拉一次之后两边的 head 集合必须相等（§7 union 的可核对形状）"
+    );
+    assert!(a.heads().contains(&ha[0]) && a.heads().contains(&hb[0]), "两笔历史都还在：{:#?}", a.heads());
+    // 内容两边都能取回：拉过来的不是"只有 head 的空壳"。
+    assert_eq!(a.block_count(), b.block_count(), "块数也该一致");
+}
+
+#[test]
+fn pulling_from_a_site_with_nothing_to_send_is_refused_with_a_reason() {
+    // 对面是个空站点 ⇒ 它必须**明确说**"没有东西可发"，而不是让本端等到管子到尾。
+    // 常驻循环第一天的常态就是这个形状（所以 `daemon` 里 pull 失败不进退避曲线）。
+    let a = Site::open();
+    let b = Site::open();
+    a.commit(&[("x0/f.bin", b"only side A has this")], 1);
+    let before = a.heads();
+    let err = round_pull(&a, &b, &opts(PROJECT))
+        .0
+        .expect_err("对面没有 head ⇒ 该被拒");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("还没有任何 head"),
+        "报错要说清是对面空，实际：{msg}"
+    );
+    assert_eq!(a.heads(), before, "被拒的一轮不许动本端 head");
+}
+
+/// 真子进程那一条路也必须能反着走：对面是**真的 `twosync agent` 进程**，本端 `pull`。
+///
+/// 为什么值得再起一次进程：`Side::Send` 那半是这次新加的分支，它在真管子上的收尾形状
+/// （发送完之后 agent 读到 EOF、退出码 0）只有跨进程才验得到——内存管道里 `drop(pa)`
+/// 就能造出尾，而 agent 那边是 `stdin` 被关闭。
+#[test]
+fn pull_over_a_real_child_process_and_pipes() {
+    let peer_tmp = tempfile::tempdir().expect("对面站点");
+    register(EXE, peer_tmp.path(), PROJECT, "D:/peer-site-root");
+    // 对面的内容用**真命令**造（scan + commit）：这份历史不是我们手搓的对象，
+    // 才是"从一个装了 twosync 的站点把历史拉回来"。
+    for i in 0..3 {
+        let p = peer_tmp
+            .path()
+            .join(PROJECT)
+            .join(format!("d{i}"))
+            .join(format!("f{i}.bin"));
+        fs::create_dir_all(p.parent().expect("父目录")).expect("mkdir");
+        fs::write(&p, body(i, 120_000)).expect("写文件");
+    }
+    for sub in ["scan", "commit"] {
+        let out = Command::new(EXE)
+            .args([
+                "--root",
+                &peer_tmp.path().to_string_lossy(),
+                "--project",
+                PROJECT,
+                sub,
+            ])
+            .output()
+            .expect("起不了对面的子命令");
+        assert!(
+            out.status.success(),
+            "对面 {sub} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 本端：全新站点，一个 head 都没有。
+    let puller = Site::open();
+    assert!(puller.heads().is_empty(), "台架前提：本端还没有历史");
+    let mut io = agent_child(EXE, peer_tmp.path(), PROJECT);
+    let rep = session::pull(&mut io, &*puller.db, &puller.cas(), &opts(PROJECT))
+        .expect("真管道上的一次 pull 该成功");
+    io.finish()
+        .expect("关写端之后 agent（那一侧是发送方）该读到尾、退出码 0");
+
+    assert!(rep.accepted, "本端该验收：{}", rep.reason);
+    assert_eq!(rep.blobs_in, 3, "3 份清单落到本端");
+    assert!(rep.blocks_written >= 3, "块要真的落盘：{}", rep.blocks_written);
+    assert_eq!(puller.heads().len(), 1, "本端 head 该恰好一个");
+    assert_eq!(puller.block_count(), 3, "本端 CAS 里该有那 3 个块");
+    // 拉回来的不是"只有一个 head 的空壳"：内容逐字节要对得上对面写的东西。
+    let got = object::read_commit(&*puller.db, puller.pid, &puller.heads()[0]).expect("读 commit");
+    let list = object::read_tree(&*puller.db, puller.pid, &got.tree).expect("读根清单");
+    assert_eq!(list.len(), 3, "根上三个目录：{list:?}");
+    for (i, e) in list.iter().enumerate() {
+        assert_eq!(e.name, format!("d{i}"), "目录名对得上：{e:?}");
+        assert_eq!(e.kind, keys::Kind::Dir);
+        let inner = object::read_tree(&*puller.db, puller.pid, &e.hash).expect("读子层");
+        assert_eq!(inner.len(), 1, "每层一个文件");
+        assert_eq!(inner[0].size, 120_000, "尺寸是从盘上算出来的，不是听来的");
+    }
+}
+
+#[test]
+fn the_puller_declares_the_quota_and_the_sender_honors_it() {
+    // §9.4.5 换了方向也必须成立：配额由**收货的一方**声明（`PullRequest.max_bytes`），
+    // 由发送方自己算清单并自我了断 —— 一个字都不发，而不是发一半。
+    let a = Site::open();
+    let b = Site::open();
+    let files = seed(4); // 4 × 300 000 B，远大于这里给的 1 字节上限
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, body)| (p.as_str(), body.as_slice()))
+        .collect();
+    a.commit(&refs, 1);
+
+    let tight = PushOpts {
+        project: PROJECT,
+        max_block_bytes: 1,
+        ..Default::default()
+    };
+    let (got, _) = round_pull(&b, &a, &tight);
+    let err = got.expect_err("超出本端声明的配额 ⇒ 该失败");
+    assert!(
+        err.to_string().contains("配额"),
+        "要看得懂是哪道闸拦的，实际：{err}"
+    );
+    assert!(b.heads().is_empty(), "被配额拦住的这一轮不许留任何 head");
+    assert_eq!(b.block_count(), 0, "一个字都没收：这才是 Abort 的意思");
+}

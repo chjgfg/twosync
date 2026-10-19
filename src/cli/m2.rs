@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! 触发（事件静默 debounce 秒 / 或兜底间隔到）
-//!   → scan（全量）→ commit（无变更 ⇒ 不产生提交、不动 head）→ 配对了才 push
+//!   → scan（全量）→ commit（无变更 ⇒ 不产生提交、不动 head）
+//!   → 配对了就先 pull（收对面的历史）再 push（§16.3"拨号方向对称"）
 //! ```
 //!
 //! 顺序执行、单线程。三个阶段共用 **`Cli` 上那一个 IO 桶**（`cli.budget` ⇒ `Cas::with_bucket`）：
@@ -40,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use crate::cli::cmd::{DaemonArgs, Import, PushArgs};
+use crate::cli::cmd::{DaemonArgs, Import, PullArgs, PushArgs};
 use crate::cli::{m0, m1, Cli};
 use crate::error::{Error, Result};
 use crate::store::build;
@@ -163,6 +164,33 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         drop(db);
         let committed = after != before;
 
+        // ── pull（先收，再送）──
+        // 顺序是有理由的：先把对面的历史收进来，本端的 head 集合就完整了，随后那次 push
+        // 才是"互相补齐"而不是"各推各的"。§16.3 那句"拨号方向对称"在常驻循环里就是这两步。
+        //
+        // **pull 失败不进退避曲线**：对端还是个空站点（没有 head）时它必然拒开场，
+        // 那是**正常状态**不是网络故障；把它算进 `failures` 会让第一天的循环一路退避到 15 分钟。
+        let mut pulled = false;
+        if !no_push {
+            match m1::pull(
+                cli,
+                &PullArgs {
+                    peer: peer.unwrap_or(""),
+                    agent_bin,
+                    remote_root: None,
+                    project: Some(&name),
+                    // 常驻循环不给体积上限：它的预算是**速率**（`--max-mbps`），
+                    // 而"这次愿意被灌多少"是一次性人工操作的旋钮。
+                    max_recv_mib: 0.0,
+                    max_mbps,
+                    allow_mass_delete,
+                },
+            ) {
+                Ok(()) => pulled = true,
+                Err(e) => println!("pull 失败   = {e}\n             不算失败：这一轮照旧尝试 push"),
+            }
+        }
+
         // ── push ──
         let mut pushed = false;
         if !no_push {
@@ -202,11 +230,18 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
             }
         }
         println!(
-            "第 {round} 轮   = {} · {} · 墙钟 {:.1} s",
+            "第 {round} 轮   = {} · 拉={} · 推={} · 墙钟 {:.1} s",
             if committed {
                 "有提交"
             } else {
                 "无变更，未提交"
+            },
+            if no_push {
+                "跳过".to_string()
+            } else if pulled {
+                "收到".to_string()
+            } else {
+                "未收到".to_string()
             },
             if no_push {
                 "未推送（--no-push）".to_string()

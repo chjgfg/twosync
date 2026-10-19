@@ -206,6 +206,13 @@ pub struct ServeReport {
     pub accepted: bool,
     pub reason: String,
     pub heads_after: Vec<Hash>,
+    /// 本端这场是**发送方**（对面 `pull` 我们）时，这里带的是 `push_body` 那份账；接收方是 `None`。
+    ///
+    /// 为什么不摊平成上面那几个 `*_in` 字段：发送方关心"上线/跳过"，接收方关心"落盘/入库"，
+    /// 两组数**语义不同**，混在一列里迟早有人拿错的那个数去填 §10.4 的差分表。
+    pub sent: Option<Report>,
+    /// `true` = 这个对端是**第一次**见到，身份刚刚入表（§9.5.1）。只有发起方那侧可能是真。
+    pub first_contact: bool,
 }
 
 /// 发起端。
@@ -266,9 +273,52 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
         other => Err(unexpected(&other, "HeadsState")),
     }?;
 
+    // ③–⑦ 发送方那一半。**抽成一个函数不是为了好看**：`pull` 的反方向会话里，
+    // 本端是接收方、对面是发送方，而对面跑的就是这一份实现 —— 两条路必须同一条代码，
+    // 否则"push 能过、pull 出来的东西却过不了闸"这种分裂迟早会出现在第二份实现里。
+    push_body(
+        io,
+        db,
+        cas,
+        opts,
+        &SendCtx {
+            pid,
+            my_heads: &my_heads,
+            their_heads: &their_heads,
+            their_ancestors: &their_ancestors,
+        },
+        &mut rep,
+    )?;
+    Ok(rep)
+}
+
+/// 发送方一场的"两边各有什么"。收成结构而不是四个位置参数（同 `ReceiveCtx`、`PushOpts`）。
+#[derive(Clone, Copy)]
+pub struct SendCtx<'a> {
+    pub pid: ProjectId,
+    /// **发送方**自己的 head 集合（非空，调用方保证）。
+    pub my_heads: &'a [Hash],
+    /// 接收方的 head 集合与它自报的祖先：差集算的就是"我可达 \ 它已知的这些"。
+    pub their_heads: &'a [Hash],
+    pub their_ancestors: &'a [Hash],
+}
+
+/// 发送方的步骤 ③–⑦：算差集 → 收集要运的对象与块 → `want/have` 协商 → 先块后清单 → 等 verdict。
+///
+/// 握手（`Hello`）、TOFU、开场（`BeginSession`/`PullRequest`）都由调用方做完：那三段在
+/// "我拨出去"与"别人拨我、让我发"两种情形里不一样，而这一段完全一样。
+pub fn push_body(
+    io: &mut impl Io,
+    db: &dyn KvEngine,
+    cas: &Cas,
+    opts: &PushOpts<'_>,
+    ctx: &SendCtx<'_>,
+    rep: &mut Report,
+) -> Result<()> {
+    let SendCtx { pid, my_heads, their_heads, their_ancestors } = *ctx;
     // ③ union 判定：要推的 = 从我方 head 可达、且不在"对端 head + 对端自报祖先"里的那些。
-    let mine = reachable(db, pid, &my_heads, &[]);
-    let theirs_reachable = reachable(db, pid, &their_heads, &their_ancestors);
+    let mine = reachable(db, pid, my_heads, &[]);
+    let theirs_reachable = reachable(db, pid, their_heads, their_ancestors);
     let to_send = topo_pending(db, pid, &mine, &theirs_reachable);
     rep.commits = to_send.len();
 
@@ -389,6 +439,97 @@ pub fn push(io: &mut impl Io, db: &dyn KvEngine, cas: &Cas, opts: &PushOpts<'_>)
         }
         other => return Err(unexpected(&other, "UnionAccept/RejectCommit")),
     }
+    Ok(())
+}
+
+/// 发起一次 `pull`：握手 → TOFU → `PullRequest`（本端的 head 集合 + 自报祖先 + 愿意收的配额），
+/// 然后本端跑**接收方那一半**。对面在 `agent` 里变成发送方（`serve` 的 `Side::Send`）。
+///
+/// 为什么不开第二套协议：这里的每一道闸（FR-10 熔断、§9.4.1 路径校验、缺块自证、闭合性差集）
+/// 都住在**收的那一侧**，与谁拨号无关。写第二份就迟早有一份漏掉闸——本项目已经为"两份实现"买过单。
+///
+/// 本端**没有 head 也能 pull**（对面可能比我们早）：那 `my_heads` 是空集合，对面算出的差集
+/// 就是它的全部历史，本端从第一版开始收。`push` 那边没有这一条（没 head 就没东西可推），
+/// 所以这里不照抄那个报错。
+pub fn pull(
+    io: &mut impl Io,
+    db: &dyn KvEngine,
+    cas: &Cas,
+    opts: &PushOpts<'_>,
+) -> Result<ServeReport> {
+    let pid = keys::project_id(opts.project);
+    let mut rep = ServeReport {
+        project: opts.project.to_string(),
+        ..Default::default()
+    };
+
+    // ① 握手。与 `push` 一字一样：版本不等就停，别让两边各算各的树。
+    frame::encode(
+        io,
+        &Proto::Hello {
+            proto_ver: PROTO_VER,
+            peer_id: opts.peer_id.to_vec(),
+            caps: opts.caps,
+        },
+    )?;
+    let theirs = match frame::decode(io)? {
+        Proto::Hello {
+            proto_ver,
+            caps,
+            peer_id,
+        } => (proto_ver, caps, peer_id),
+        other => return Err(unexpected(&other, "Hello")),
+    };
+    if theirs.0 != PROTO_VER {
+        return Err(Error::BadInput(format!(
+            "对端协议版本 {} ≠ 本端 {}：先对齐版本再同步",
+            theirs.0, PROTO_VER
+        )));
+    }
+
+    // ①' TOFU：**在说出任何一个项目名字之前**先核对对端身份（与 `push` 同一条顺序、同一个理由）。
+    if !opts.peer_name.is_empty() {
+        rep.first_contact = check_or_record_peer(db, opts.peer_name, &theirs.2)?;
+    }
+
+    // ② 反方向开场：把"我有什么"一次说全，对面才有办法算差集。
+    let my_heads = build::ref_heads(db, pid, build::MAIN)?;
+    let known = reachable(db, pid, &my_heads, &[]);
+    let mut anc: Vec<Hash> = known.iter().cloned().collect();
+    anc.sort();
+    frame::encode(
+        io,
+        &Proto::PullRequest {
+            project: opts.project.to_string(),
+            pid,
+            heads: my_heads.clone(),
+            ancestors: anc,
+            max_bytes: opts.max_block_bytes,
+        },
+    )?;
+
+    // ③ 对面先报它自己的 head 集合（`UnionAccept.from_heads` 要用），然后开始发。
+    //     它自报的祖先本端**用不上**：要算差集的是发送方，而它已经从上面的 `PullRequest` 拿到了我们这一侧。
+    let their_heads = match frame::decode(io)? {
+        Proto::HeadsState { heads, .. } => heads,
+        Proto::Abort { msg } => {
+            return Err(Error::BadInput(format!("对端拒绝开场：{msg}")));
+        }
+        other => return Err(unexpected(&other, "HeadsState")),
+    };
+    serve_body(
+        io,
+        db,
+        cas,
+        &ReceiveCtx {
+            pid,
+            our_heads: &my_heads,
+            their_heads: &their_heads,
+            known: &known,
+            allow_mass_delete: opts.allow_mass_delete,
+        },
+        &mut rep,
+    )?;
     Ok(rep)
 }
 
@@ -429,13 +570,26 @@ pub fn serve(
         },
     )?;
 
-    let (project, pid_claimed, their_heads) = match frame::decode(io)? {
+    // 开场帧决定本端这一场站哪一边：`BeginSession` = 对面推给我们（收），`PullRequest` =
+    // 对面要我们推过去（发）。§16.3 那句"拨号方向对称"落到实现上就是这一个 match。
+    enum Side {
+        Receive,
+        Send,
+    }
+    let (project, pid_claimed, their_heads, their_ancestors, side, quota) = match frame::decode(io)? {
         Proto::BeginSession {
             project,
             pid,
             my_heads,
-        } => (project, pid, my_heads),
-        other => return Err(unexpected(&other, "BeginSession")),
+        } => (project, pid, my_heads, Vec::new(), Side::Receive, u64::MAX),
+        Proto::PullRequest {
+            project,
+            pid,
+            heads,
+            ancestors,
+            max_bytes,
+        } => (project, pid, heads, ancestors, Side::Send, max_bytes),
+        other => return Err(unexpected(&other, "BeginSession/PullRequest")),
     };
     frame::check_project_id(&project, pid_claimed)?;
     let pid = match resolve(&project) {
@@ -451,16 +605,115 @@ pub fn serve(
 
     let our_heads = build::ref_heads(db, pid, build::MAIN)?;
     let known = reachable(db, pid, &our_heads, &[]);
-    let mut anc: Vec<Hash> = known.iter().cloned().collect();
-    anc.sort();
-    frame::encode(
-        io,
-        &Proto::HeadsState {
-            heads: our_heads.clone(),
-            ancestors: anc,
-        },
-    )?;
+    match side {
+        Side::Receive => {
+            let mut anc: Vec<Hash> = known.iter().cloned().collect();
+            anc.sort();
+            frame::encode(
+                io,
+                &Proto::HeadsState {
+                    heads: our_heads.clone(),
+                    ancestors: anc,
+                },
+            )?;
+            // 接收方那一半。抽出来与 `push_body` 对称：`pull` 的时候本端就走这条路，而开场那
+            // 几帧在两种方向里形状不同，这一段一个字都一样。
+            serve_body(
+                io,
+                db,
+                cas,
+                &ReceiveCtx {
+                    pid,
+                    our_heads: &our_heads,
+                    their_heads: &their_heads,
+                    known: &known,
+                    allow_mass_delete,
+                },
+                &mut rep,
+            )?;
+        }
+        Side::Send => {
+            // 本端当发送方。对面已经把它的 head 集合与自报祖先带来了 —— 那正是差集要的两样，
+            // 所以这里**不再发 `HeadsState`**：发了就变成两边各等一帧，会话卡死。
+            if our_heads.is_empty() {
+                let msg = format!("本端项目 {project:?} 还没有任何 head：没有东西可发（先 scan + commit）");
+                frame::encode(io, &Proto::Abort { msg: msg.clone() })?;
+                return Err(Error::BadInput(msg));
+            }
+            // 配额这一趟换了声明的人：`pull` 的那一方在 `PullRequest.max_bytes` 里说它愿意收多少，
+            // 本端照它自我了断（超了就 `Abort`，一个字不发）。§9.4.5 的"发起方自己算清单"没被削弱：
+            // 算清单的还是发送方，只是上限由收货的一方给——那本来就是收货方的预算。
+            let caps = my_caps & their_caps;
+            // 先把本端的 head 集合报过去，再当发送方。`pull` 的差集不需要它（对面在
+            // `PullRequest` 里已经把它那份交来了），但**接收方需要**：`UnionAccept.from_heads`
+            // 要原样带回"你当时有哪些 head"，而那一半的账是按头算的。
+            {
+                let mut anc: Vec<Hash> = known.iter().cloned().collect();
+                anc.sort();
+                frame::encode(
+                    io,
+                    &Proto::HeadsState {
+                        heads: our_heads.clone(),
+                        ancestors: anc,
+                    },
+                )?;
+            }
+            let opts = PushOpts {
+                project: &project,
+                peer_id: my_peer_id,
+                // 空 = 不做 TOFU：本端是被拨的那一侧，对端身份由**它**在开场时核我们（§9.5.1）。
+                peer_name: &[],
+                caps,
+                max_block_bytes: quota,
+                allow_mass_delete,
+            };
+            let mut sent = Report { caps, ..Default::default() };
+            push_body(
+                io,
+                db,
+                cas,
+                &opts,
+                &SendCtx {
+                    pid,
+                    my_heads: &our_heads,
+                    their_heads: &their_heads,
+                    their_ancestors: &their_ancestors,
+                },
+                &mut sent,
+            )?;
+            rep.accepted = true;
+            rep.reason = "本端是发送方：对面已验收".to_string();
+            rep.heads_after = sent.accepted.clone();
+            rep.sent = Some(sent);
+        }
+    }
+    Ok(rep)
+}
 
+/// 接收方一场的上下文。收成结构而不是八个位置参数（同 `build::Meta`、`PushOpts` 那条理由）。
+#[derive(Clone, Copy)]
+pub struct ReceiveCtx<'a> {
+    pub pid: ProjectId,
+    /// 本端当前的 head 集合（验收时 union 的那一半）。
+    pub our_heads: &'a [Hash],
+    /// 对面报上来的 head 集合（`UnionAccept.from_heads` 要原样带回去）。
+    pub their_heads: &'a [Hash],
+    /// 本端**已经可达**的对象闭包。差集那道闸要用它当基线（§15.22），所以由调用方算一次
+    /// 传进来：同一场会话里它被问很多次，每次重算就是又一次全库折叠。
+    pub known: &'a BTreeSet<Hash>,
+    /// 本端的 FR-10 旗标。**对端的旗标不跨机器传**（§9.4 要点）。
+    pub allow_mass_delete: bool,
+}
+
+/// 接收方：`want/have` 答复 → 块落盘（FR-13 的顺序在这里）→ 收清单 → 过闸 → 回 verdict。
+pub fn serve_body(
+    io: &mut impl Io,
+    db: &dyn KvEngine,
+    cas: &Cas,
+    ctx: &ReceiveCtx<'_>,
+    rep: &mut ServeReport,
+) -> Result<()> {
+    let ReceiveCtx { pid, our_heads, their_heads, known, allow_mass_delete } = *ctx;
     // 收 want 集合。
     let mut want: BTreeSet<Hash> = BTreeSet::new();
     loop {
@@ -576,9 +829,9 @@ pub fn serve(
         cas,
         &Accept {
             pid,
-            our_heads: &our_heads,
-            their_heads: &their_heads,
-            known: &known,
+            our_heads,
+            their_heads,
+            known,
             newest: &newest,
             allow_mass_delete,
             got: &got,
@@ -592,7 +845,7 @@ pub fn serve(
             frame::encode(
                 io,
                 &Proto::UnionAccept {
-                    from_heads: their_heads.clone(),
+                    from_heads: their_heads.to_vec(),
                     to_heads,
                 },
             )?;
@@ -610,7 +863,7 @@ pub fn serve(
             )?;
         }
     }
-    Ok(rep)
+    Ok(())
 }
 
 // ── 验收 ──────────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use twosync::cli::cmd::{DaemonArgs, PushArgs};
+use twosync::cli::cmd::{DaemonArgs, PullArgs, PushArgs};
 use twosync::cli::{m0, m1, m2};
 use twosync::cli::{Cli, Cmd, Import};
 use twosync::error::Result;
@@ -75,6 +75,26 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 remote_root: remote_root.as_deref(),
                 project: project.as_deref(),
                 max_send_mib: *max_send_mib,
+                max_mbps: *max_mbps,
+                allow_mass_delete: *allow_mass_delete,
+            },
+        ),
+        Cmd::Pull {
+            peer,
+            agent_bin,
+            remote_root,
+            project,
+            max_recv_mib,
+            max_mbps,
+            allow_mass_delete,
+        } => m1::pull(
+            cli,
+            &PullArgs {
+                peer,
+                agent_bin,
+                remote_root: remote_root.as_deref(),
+                project: project.as_deref(),
+                max_recv_mib: *max_recv_mib,
                 max_mbps: *max_mbps,
                 allow_mass_delete: *allow_mass_delete,
             },
