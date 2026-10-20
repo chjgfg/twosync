@@ -14,7 +14,7 @@
 //! 有 `--max-count`，而"0 = 全部"必须写成显式选项而不是默认（十万历史 × 32 B 也要 3 MB）。
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 
 use storage_engines::{KvEngine, SearchQuery};
 
@@ -486,4 +486,144 @@ mod tests {
         );
         assert_eq!(hex_prefix("").unwrap(), Vec::<u8>::new(), "空前缀 = 全表");
     }
+}
+
+// ── §7 第五行：collision（并集之后同一条路径被两个 head 各改成不同的东西）─────────────
+//
+// v1 的语义是"union，不猜"：多 head 是**正常状态**（§7.4），只有当两条线**动了同一条路径**、
+// 且动出来的结果不一样时，才必须由人选（FR-11）。所以这里要做的不是"怎么合"，而是
+// **把"哪条路径两边不一样"算准**——算漏了就是自动替用户选了一边，算多了就是每次 union 都在报警。
+
+/// 一条冲突：路径 + 卷进去的那几个 head（按哈希排序，稳定输出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    pub path: String,
+    pub heads: Vec<Hash>,
+}
+
+/// head 集合里的 collision 列表（`heads.len() < 2` 时恒为空）。
+///
+/// 判据是"**与共同祖先比，两边都动了这条路径，而且动出来的不一样**"：
+/// - 只有一边动 ⇒ 不冲突（另一边跟着走，这是 union 的本意）；
+/// - 两边动到**同一个结果**（同 hash 同 mode）⇒ 也不冲突（字节一样的两份改动没有可裁的东西）。
+///
+/// 共同祖先不止一个（criss-cross）时用的是"与**任一个**祖先比都一样就算没动"这条近似：
+/// 真正的 recursive merge base 是一个**决策**（选哪几个虚拟祖先、多个基怎么叠），不是实现细节，
+/// 这里不偷偷替 v1 定。真要上多端合并再记进 §14。
+///
+/// 引擎调用：亲代索引一次 + 目录清单一次（都是前缀扫），剩下的是内存里走 ⇒ 两个 head、
+/// 每个差 1 万条路径时约 2 万条 `String`，这是判据的固有代价，只在 head 数 ≥ 2 时才付。
+pub fn collisions(db: &dyn KvEngine, pid: ProjectId, heads: &[Hash]) -> Result<Vec<Collision>> {
+    if heads.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let index = object::parent_index(db, pid)?;
+    let trees = object::TreeIndex::load(db, pid)?;
+    let mut mine = BTreeMap::new();
+    for h in heads {
+        let c = object::read_commit(db, pid, h)?;
+        mine.insert(*h, c.tree);
+    }
+    let mut by_path: BTreeMap<String, BTreeSet<Hash>> = BTreeMap::new();
+    for (i, a) in heads.iter().enumerate() {
+        for b in &heads[i + 1..] {
+            let Some((a_tree, b_tree)) = mine.get(a).zip(mine.get(b)) else {
+                continue;
+            };
+            // 共同祖先是 **commit** 哈希，而清单要的是它们的 tree —— 这一步换算不能省
+            // （省了就是拿 commit 哈希去查 `T`，报出来的会是 MissingObject）。
+            let base_trees: Vec<Hash> = merge_bases(&index, a, b)
+                .iter()
+                .map(|c| object::read_commit(db, pid, c).map(|cc| cc.tree))
+                .collect::<Result<_>>()?;
+            let ca = changed_paths(db, pid, &trees, &base_trees, a_tree)?;
+            let cb = changed_paths(db, pid, &trees, &base_trees, b_tree)?;
+            for (path, ea) in &ca {
+                let Some(eb) = cb.get(path) else { continue };
+                if ea == eb {
+                    continue; // 两边改成同一个东西：没有要人选的东西
+                }
+                let entry = by_path.entry(path.clone()).or_default();
+                entry.insert(*a);
+                entry.insert(*b);
+            }
+        }
+    }
+    Ok(by_path
+        .into_iter()
+        .map(|(path, hs)| Collision { path, heads: hs.into_iter().collect() })
+        .collect())
+}
+
+/// `a` 与 `b` 的**极大**共同祖先（可能多个，见 [`collisions`] 那条近似）。空 = 没有共同祖先。
+fn merge_bases(index: &std::collections::BTreeMap<Hash, Vec<Hash>>, a: &Hash, b: &Hash) -> Vec<Hash> {
+    let ra = reachable_from(index, &[*a], &[]);
+    let rb = reachable_from(index, &[*b], &[]);
+    let common: Vec<Hash> = ra.intersection(&rb).cloned().collect();
+    // 极大 = 不是别的共同祖先的**严格祖先**。用闭包比，一次一个：共同祖先本来就少。
+    common
+        .iter()
+        .filter(|c| {
+            !common
+                .iter()
+                .any(|d| d != *c && reachable_from(index, &[*d], &[]).contains(*c))
+        })
+        .cloned()
+        .collect()
+}
+
+/// 一棵树相对**若干基的清单**（`bases` 是 tree 哈希，不是 commit 哈希）的变更集：路径 → 那条路径上的 `(hash, mode)`（新增时基里没有 ⇒ 也算变更）。
+///
+/// `bases` 为空 = 没有共同祖先 ⇒ 与空树比，两边所有路径都算"自己动的"。
+fn changed_paths(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    trees: &object::TreeIndex,
+    bases: &[Hash],
+    head: &Hash,
+) -> Result<BTreeMap<String, (Hash, u32)>> {
+    let mut out = BTreeMap::new();
+    collect_changed(db, pid, trees, bases, head, "", &mut out)?;
+    Ok(out)
+}
+
+/// 深度优先比一层：`head` 这一层的每条与基层的同名条比，不同就记下来；目录继续往下走。
+fn collect_changed(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    trees: &object::TreeIndex,
+    bases: &[Hash],
+    head: &Hash,
+    prefix: &str,
+    out: &mut BTreeMap<String, (Hash, u32)>,
+) -> Result<()> {
+    // 基那一侧可能有几张候选清单（criss-cross）：只要**任何**一个基里这条路径一模一样，
+    // 就算"这一侧没动过它"（§7 那条近似的落点）。
+    let base_lists: Vec<Vec<object::TreeEntry>> = bases
+        .iter()
+        .map(|h| trees.list(db, pid, h))
+        .collect::<Result<_>>()?;
+    for e in trees.list(db, pid, head)? {
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        let untouched = base_lists.iter().any(|list| {
+            list.iter()
+                .any(|x| x.name == e.name && x.hash == e.hash && x.mode == e.mode)
+        });
+        if untouched {
+            // 这一条与某个基一模一样。目录的情况到这里就够了：**整棵子树没动**，
+            // 不用下去（NFR-6 那条 hash 短路在冲突检测上的同一份用法）。
+            continue;
+        }
+        if e.kind == Kind::Dir {
+            // 目录自己不一样不算一条冲突：子项各算各的（否则改一个文件会把整层报成冲突）。
+            collect_changed(db, pid, trees, bases, &e.hash, &path, out)?;
+        } else {
+            out.insert(path, (e.hash, e.mode));
+        }
+    }
+    Ok(())
 }

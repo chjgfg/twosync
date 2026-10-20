@@ -2079,3 +2079,33 @@ fn the_puller_declares_the_quota_and_the_sender_honors_it() {
     assert!(b.heads().is_empty(), "被配额拦住的这一轮不许留任何 head");
     assert_eq!(b.block_count(), 0, "一个字都没收：这才是 Abort 的意思");
 }
+
+/// §7 第五行端到端：两边对同一路径各改一份 ⇒ push **照样被接受**（union 不猜、也不许因为
+/// 冲突就把历史挡住），但 verdict 的 `reason` 里必须带出"哪几条路径要人选"（FR-11 的"默认只报账"）。
+#[test]
+fn accepting_a_diverged_head_reports_the_collision_instead_of_choosing() {
+    let a = Site::open();
+    let b = Site::open();
+    a.commit(&[("same.bin", b"the common start")], 1);
+    // 先把共同历史铺平：两边从此有同一个祖先。
+    round_ok(&a, &b, &opts(PROJECT));
+    assert_eq!(a.heads(), b.heads(), "台架前提：两边同 head");
+
+    a.commit(&[("same.bin", b"side A wrote this")], 2);
+    b.commit(&[("same.bin", b"side B wrote that")], 3);
+    assert_ne!(a.heads(), b.heads(), "台架前提：两边各有各的提交");
+
+    let (_sent, served) = round_ok(&a, &b, &opts(PROJECT));
+    let heads_after = b.heads();
+    assert!(served.accepted, "冲突不许把会话拒了：{}", served.reason);
+    assert!(
+        served.reason.contains("collision"),
+        "验收的读数里必须带出冲突，实际：{}",
+        served.reason
+    );
+    assert!(served.reason.contains("same.bin"), "要报得出是哪条路径");
+    assert_eq!(heads_after.len(), 2, "两边 head 都在（没替谁选）：{heads_after:?}");
+    // "选一边落地"那一格（`checkout` 在多 head 下必须拒绝猜）不在这里断言：这个台架的站点
+    // 是 `Site::open()` 手搓的，没有注册表，走命令行只会先撞"没有这个项目"。
+    // 那条闸在 `m0::one_commit`，由 tests/cli_surface.rs 那一侧覆盖（有注册表才有意义）。
+}

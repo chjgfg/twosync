@@ -525,3 +525,101 @@ fn scan_rows(db: &dyn KvEngine, tag: u8, pid: ProjectId) -> Vec<storage_engines:
     tx.commit();
     rows
 }
+
+// ── §7 第五行：collision 检测（v1 的语义是"union，不猜"，所以先把"哪条路径两边不一样"算准）──
+
+/// 造一棵只含一个文件的树。
+fn tree_with(db: &dyn KvEngine, name: &str, seed: u8) -> Hash {
+    object::put_tree(db, PID, &[file(name, seed, 10)]).unwrap()
+}
+
+fn paths(cs: &[history::Collision]) -> Vec<String> {
+    cs.iter().map(|c| c.path.clone()).collect()
+}
+
+#[test]
+fn two_heads_that_changed_the_same_path_differently_collide() {
+    let (_d, engine) = db();
+    let base = tree_with(&*engine, "a.bin", 1);
+    let g = commit(&*engine, PID, &[], &base, 100);
+    let h1 = commit(&*engine, PID, &[g], &tree_with(&*engine, "a.bin", 2), 200);
+    let h2 = commit(&*engine, PID, &[g], &tree_with(&*engine, "a.bin", 3), 300);
+
+    let cs = history::collisions(&*engine, PID, &[h1, h2]).unwrap();
+    assert_eq!(paths(&cs), vec!["a.bin".to_string()], "两边把 a.bin 改成了不同东西：{cs:?}");
+    assert_eq!(cs[0].heads.len(), 2, "要报出卷进来的两个 head：{cs:?}");
+    assert!(cs[0].heads.contains(&h1) && cs[0].heads.contains(&h2));
+}
+
+#[test]
+fn disjoint_changes_and_identical_changes_are_not_collisions() {
+    let (_d, engine) = db();
+    let base = object::put_tree(
+        &*engine,
+        PID,
+        &[file("a.bin", 1, 10), file("b.bin", 2, 10)],
+    )
+    .unwrap();
+    let g = commit(&*engine, PID, &[], &base, 100);
+
+    // ① 各改各的路径 ⇒ union 的正常态（§7 第四行），一条都不该报。
+    let left = object::put_tree(&*engine, PID, &[file("a.bin", 9, 10), file("b.bin", 2, 10)]).unwrap();
+    let right = object::put_tree(&*engine, PID, &[file("a.bin", 1, 10), file("b.bin", 8, 10)]).unwrap();
+    let h1 = commit(&*engine, PID, &[g], &left, 200);
+    let h2 = commit(&*engine, PID, &[g], &right, 300);
+    assert!(
+        history::collisions(&*engine, PID, &[h1, h2]).unwrap().is_empty(),
+        "路径无交集却报了 collision ⇒ 会把每次 union 都变成报警"
+    );
+
+    // ② 两边改成**一模一样**的东西 ⇒ 也没有要人选的东西（字节都一样，裁什么？）
+    let same = object::put_tree(&*engine, PID, &[file("a.bin", 7, 10), file("b.bin", 2, 10)]).unwrap();
+    let h3 = commit(&*engine, PID, &[g], &same, 400);
+    let h4 = commit(&*engine, PID, &[g], &same, 500);
+    assert!(
+        history::collisions(&*engine, PID, &[h3, h4]).unwrap().is_empty(),
+        "同一条改动不该算冲突"
+    );
+
+}
+
+/// 单 head 是常态（每次会话验收都会问一遍 collision），所以那一格必须**零引擎调用**。
+/// 这条用的是"从建库起就套着计数器"的句柄：同一份库第二个句柄只会读到旧视图，
+/// 量不到真东西（`Site`/`Cli` 缓存句柄之后这条更要注意）。
+#[test]
+fn a_single_head_costs_the_engine_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let meter = twosync::utils::Meter::default();
+    let engine = twosync::utils::counted(
+        open_store(tmp.path(), EngineKind::LsmTree).unwrap(),
+        &meter,
+        false,
+    );
+    let t = tree_with(&*engine, "a.bin", 1);
+    let h = commit(&*engine, PID, &[], &t, 100);
+    let base = meter.snapshot();
+
+    let cs = history::collisions(&*engine, PID, &[h]).unwrap();
+    assert!(cs.is_empty(), "单 head 没有可对的另一边：{cs:?}");
+    assert_eq!(
+        meter.snapshot().since(base).folds(),
+        0,
+        "单 head 的 collision 检测付了引擎调用：{}",
+        meter.snapshot().since(base).line()
+    );
+}
+
+#[test]
+fn two_independent_roots_collide_on_every_shared_path_they_differ_on() {
+    // 没有共同祖先（两台机器各自从空开始）：与"空树"比 ⇒ 两边都有、内容不同的那条就是冲突。
+    let (_d, engine) = db();
+    let a = commit(&*engine, PID, &[], &tree_with(&*engine, "same.bin", 1), 100);
+    let b = commit(&*engine, PID, &[], &tree_with(&*engine, "same.bin", 2), 200);
+    let cs = history::collisions(&*engine, PID, &[a, b]).unwrap();
+    assert_eq!(paths(&cs), vec!["same.bin".to_string()], "实际 {cs:?}");
+
+    // 而"只有一边有的路径"不算冲突：那是纯粹的并集，没有要人选的东西。
+    let c = commit(&*engine, PID, &[], &tree_with(&*engine, "only.c", 3), 400);
+    let cs2 = history::collisions(&*engine, PID, &[a, c]).unwrap();
+    assert!(cs2.is_empty(), "各有一条独有路径 ⇒ 不该报：{cs2:?}");
+}

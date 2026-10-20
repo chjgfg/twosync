@@ -655,7 +655,9 @@ fn one_commit(heads: Vec<Hash>, rev: &str) -> Result<Hash> {
             kind: "commit".to_string(),
         }),
         many => Err(Error::Codec(format!(
-            "{rev} 指向 {} 个 commit：多 head 的 union 还没做（M3），请指定具体 commit",
+            "{rev} 指向 {} 个 commit ⇒ 落地必须人选一个（§7：union 之后不许猜）。\
+             先看 `status` 的「碰撞」那一格：没有同路径冲突时随便挑一个 head 检出现都行；\
+             有冲突就按 FR-11 那三条出路选。也可以直接给具体 commit。",
             many.len()
         ))),
     }
@@ -1043,6 +1045,33 @@ pub fn status(cli: &Cli) -> Result<()> {
     print_changes(&p.changes);
     // 参照侧清单的读法：`status` 复用的就是 `plan` 那一趟遍历，所以同一个数（§11.4d）。
     println!("{}", p.manifests.line());
+    // FR-16 的"碰撞列表"那一格（§7 第五行）。head 只有一个时 `collisions` 直接返回空，
+    // **不付任何引擎调用**，所以这条打印在正常站点上是免费的。
+    let cs = history::collisions(&*db, pid, &heads)?;
+    if cs.is_empty() {
+        if heads.len() > 1 {
+            println!("碰撞      = {} 个 head 并集，没有同路径冲突（§7 第四行：多 head 是正常状态）", heads.len());
+        }
+    } else {
+        println!(
+            "碰撞      = **{} 条路径被两个 head 各改成不同东西**（v1 不猜，人选一条路径只能整体选一个 head）",
+            cs.len()
+        );
+        for c in cs.iter().take(10) {
+            println!(
+                "          - {} （卷进 {} 个 head：{}）",
+                c.path,
+                c.heads.len(),
+                c.heads.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+            );
+        }
+        if cs.len() > 10 {
+            println!("          …另有 {} 条（全量要脚本读的话这里加 --json）", cs.len() - 10);
+        }
+        println!(
+            "出路      = `checkout --at <某个 head>` 选一边（其余 head 仍留在库里，历史不丢）；             路径无交集才谈 `--keep-both` 的结构合并；有交集要内容级合并请交给真 git（§1）"
+        );
+    }
     // 实时那一半：**只报存在性差异**。内容改了这里看不见——目录 mtime 不表达文件内容变化，
     // 那要重算 hash 才知道（与 git 的 untracked cache 同一个限制）。
     if epoch == 0 {

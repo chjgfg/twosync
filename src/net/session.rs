@@ -932,6 +932,28 @@ fn accept(db: &dyn KvEngine, cas: &Cas, a: &Accept<'_>) -> Result<(Vec<Hash>, St
     cand.push(*a.newest);
     let heads = maximal_heads(db, pid, &cand);
     build::set_ref(db, pid, build::MAIN, &heads)?;
+    // §7 第五行：union 之后如果两条 head 动了**同一条路径**，那是 collision —— 这里**照收**
+    // （对象与 head 集合都是可逆的，收下不等于选了），但必须把"哪几条路径要人选"跟着 verdict 带回去。
+    // 为什么不在这里停：动 head 是"两边各看见各的历史"，检出才是"选一边"；拦在前一趟只会让
+    // 对面永远收不到我们的东西，而 collision 不会因为不收就消失。真正拒绝落地的是 `checkout`
+    // （FR-11：默认只报账 + 给出路，不猜）。
+    let why = match history::collisions(db, pid, &heads)? {
+        cs if cs.is_empty() => why,
+        cs => {
+            let paths: Vec<String> = cs.iter().take(5).map(|c| c.path.clone()).collect();
+            let more = cs.len().saturating_sub(paths.len());
+            format!(
+                "{why} · **collision {} 条路径**（同一条被两个 head 各改成不同东西）：{}{}",
+                cs.len(),
+                paths.join(", "),
+                if more > 0 {
+                    format!(" …另有 {more} 条")
+                } else {
+                    String::new()
+                }
+            )
+        }
+    };
     Ok((heads, why))
 }
 
