@@ -348,6 +348,17 @@ pub enum Cmd {
         /// 删了一半的项目要人来决定（§7 那行说的就是这个）
         #[arg(long)]
         allow_mass_delete: bool,
+        /// 每隔多少秒跑一次 `gc --sweep --apply`（回收不可达对象 + 删归零的块）。0 = 不回收
+        ///
+        /// 为什么常驻进程要带这个：mark-sweep 那半**没人周期叫过**，不可达的 blob/tree/commit
+        /// 与 refcnt 归零的块就一直堆在库里（配额那格就是这么满的）。
+        /// 一条要分清的账：**版本链**（`max_chain` / `rows_above_one`）住的是引擎的
+        /// `vacuum_auto_slice`（每攒够 N 行新版本自裁一片），**不是这条 gc 在管**；
+        /// 这一条管的是"没有任何 head 可达的对象"。两者各自打印自己的读数（§11.4c、§17 补记廿九）。
+        /// 默认一天一次：mark-sweep 要走一遍保留集（现在一次折全库），比一轮 scan 贵，
+        /// 挂在事件轮后面跑会让"改一个文件"的那一轮变成一次全库遍历。
+        #[arg(long, default_value_t = 86400)]
+        gc_every_secs: u64,
     },
 
     /// 对端身份表（§9.5.1 的 TOFU）：`list` 看库里记了谁，`forget` 忘掉一条以便重新确认
@@ -435,6 +446,8 @@ pub struct DaemonArgs<'a> {
     pub peer: Option<&'a str>,
     pub agent_bin: &'a str,
     pub allow_mass_delete: bool,
+    /// 每隔多少秒跑一次 `gc --sweep --apply`（0 = 常驻期间不回收）
+    pub gc_every_secs: u64,
 }
 
 /// §9.5.1 的 TOFU 表操作。

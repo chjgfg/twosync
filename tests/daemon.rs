@@ -60,6 +60,19 @@ impl Site {
         }
     }
 
+    /// 引擎健康度。开一次、读一次、马上放掉句柄 —— 同一份库的第二个句柄会被库级文件锁挡住
+    /// （`Cli` 缓存句柄之后这条更要注意，见 `587d6ce`）。
+    fn health(&self) -> storage_engines::MvccHealth {
+        let db = open_store(&self.root(), EngineKind::LsmTree).expect("开库");
+        let h = db.health();
+        drop(db);
+        h
+    }
+
+    fn rows_above_one(&self) -> u64 {
+        self.health().rows_above_one
+    }
+
     fn write(&self, rel: &str, body: &[u8]) {
         let p = self
             .work()
@@ -100,6 +113,7 @@ fn one_round(max_mbps: f64) -> DaemonArgs<'static> {
         peer: None,
         agent_bin: "twosync",
         allow_mass_delete: false,
+        gc_every_secs: 0,
     }
 }
 
@@ -254,4 +268,63 @@ fn zero_intervals_are_clamped_to_one_second() {
     let site = Site::new(&[("a.txt", b"one")]);
     clamp_check(&site.root(), 0, 0);
     assert_eq!(site.commits(), 1, "第一轮照样要出提交");
+}
+
+/// ② 常驻循环自己收尾：一轮末尾跑一次 `gc --sweep --apply`。
+///
+/// 断言的是**它能改变的那件事**：版本链（`rows_above_one` / `max_chain`）。
+/// 反过来说清楚为什么不能拿"块文件变少"当证据 —— 删掉一个文件**不会**让它的块变成垃圾：
+/// 上一个 commit 仍然可达、仍然引用那份 blob（不变量 (d)：gc 无权删历史），
+/// 真正腾地方要等 M4 的 `reset`/`prune --expire`。把这条写进用例，是因为它正是
+/// "为什么这轮 gc 什么都没删"最容易看错的地方。
+#[test]
+fn a_daemon_round_trims_the_version_chain_that_scans_keep_adding() {
+    let site = Site::new(&[("a.bin", b"v1")]);
+    // 三轮：每轮 scan 都给每一行盖新版本（活性判据的命根子），版本链就是这么长出来的。
+    m2::daemon(&site.cli(Bucket::default()), &one_round(0.0)).expect("第 1 轮");
+    site.write("a.bin", b"v2");
+    m2::daemon(&site.cli(Bucket::default()), &one_round(0.0)).expect("第 2 轮");
+    let rows_mid = site.rows_above_one();
+
+    site.write("a.bin", b"v3");
+    let args = DaemonArgs {
+        gc_every_secs: 86400,
+        ..one_round(0.0)
+    };
+    m2::daemon(&site.cli(Bucket::default()), &args).expect("带 gc 的一轮");
+
+    let h = site.health();
+    assert_eq!(site.commits(), 3, "三轮三轮都该有提交（内容确实在变）");
+    assert!(
+        rows_mid > 0,
+        "台架前提：跑到这里版本链已经长出来了（rows_above_one {rows_mid}）"
+    );
+    assert_eq!(h.rows_above_one, 0, "gc --apply 之后不该有多版本行：{h:?}");
+    assert_eq!(h.max_chain, 1, "版本链被压回一格：{h:?}");
+    // 而历史一格没少：三个 commit、head 仍然是单条。
+    let pid = keys::project_id("p");
+    let heads = {
+        let db = open_store(&site.root(), EngineKind::LsmTree).expect("开库");
+        build::ref_heads(&*db, pid, build::MAIN).expect("head")
+    };
+    assert_eq!(heads.len(), 1, "回收不许把 head 弄成多条：{heads:?}");
+}
+
+/// `--gc-every-secs 0` = 明确关掉：常驻期间一次都不回收（要把 gc 交给 cron 的人用这个）。
+#[test]
+fn gc_can_be_turned_off_and_then_the_version_chain_stays() {
+    let site = Site::new(&[("a.bin", b"v1")]);
+    let no_gc = one_round(0.0); // 默认就是 0 = 关
+    m2::daemon(&site.cli(Bucket::default()), &no_gc).expect("第 1 轮");
+    site.write("a.bin", b"v2");
+    m2::daemon(&site.cli(Bucket::default()), &no_gc).expect("第 2 轮");
+    site.write("a.bin", b"v3");
+    m2::daemon(&site.cli(Bucket::default()), &no_gc).expect("第 3 轮");
+
+    let above = site.rows_above_one();
+    assert!(
+        above > 0,
+        "关着 gc 就该看得见堆：rows_above_one {above}"
+    );
+    assert_eq!(site.commits(), 3, "关回收不影响历史照常前进");
 }

@@ -107,6 +107,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         peer,
         agent_bin,
         allow_mass_delete,
+        gc_every_secs,
     } = *args;
     let (name, _) = match &cli.project {
         Some(p) => (p.clone(), cli.root.clone()),
@@ -130,7 +131,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     let debounce = Duration::from_secs(debounce.max(1));
 
     println!(
-        "daemon      = project {name} 根 {} · 兜底 {} s · 静默 {} s · 限速 {}",
+        "daemon      = project {name} 根 {} · 兜底 {} s · 静默 {} s · 限速 {} · gc {}",
         work.display(),
         interval.as_secs(),
         debounce.as_secs(),
@@ -138,11 +139,17 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
             format!("{max_mbps:.1} MiB/s")
         } else {
             "未设".to_string()
+        },
+        if gc_every_secs == 0 {
+            "关闭（常驻期间不回收）".to_string()
+        } else {
+            format!("每 {gc_every_secs} s 一趟 --sweep --apply")
         }
     );
     println!(
-        "注意        = 每一轮都是**全量 scan**（12 GiB 站点实测 68.2 s/轮 ⇒ 兜底间隔按 10 % 单核倒推）。\n\
-                  窄扫还没做：它要先解决删除判定（`scanned_at >= epoch` 会把没重扫的目录看成已删，§8 第一杀手）。"
+        "注意        = 事件轮只窄扫事件所在的目录（不推进活性线 ⇒ **这一轮报不出删除**），\n\
+                  兜底轮是全量：12 GiB 站点实测 scan 一轮 12.6 s（热缓存）～125.7 s（冷缓存）CPU。\n\
+                  删除一定由某一次全量轮确认，最坏等一个兜底间隔。"
     );
 
     // 事件订阅。建不了 watcher（权限、平台、网络盘）不是错误：**退化成纯周期**，但必须说出来。
@@ -158,6 +165,13 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     let mut failures = 0u32;
     let mut round = 0u64;
     let mut next_forced = Instant::now();
+    // gc 的第一次**就在第一轮末尾**：一个刚装好/刚重启的站点，库里那堆不可达对象是"上一次运行"
+    // 留下的，不该再等一整个周期。之后才按 `--gc-every-secs` 走。
+    let mut next_gc = if gc_every_secs == 0 {
+        None
+    } else {
+        Some(Instant::now())
+    };
     loop {
         round += 1;
         let trigger = if round == 1 {
@@ -263,6 +277,19 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                         std::thread::sleep(w);
                     }
                 }
+            }
+        }
+        // ── gc（按自己的周期，不是每轮）──
+        // mark-sweep 那半没人周期叫过 ⇒ 不可达对象与归零的块永远堆着。失败同样**不进退避曲线**：
+        // 它不是网络问题，报出来就行（`gc` 自己会带 FR-15 的桶账与"为什么这一趟没删"）。
+        if let Some(at) = next_gc
+            && Instant::now() >= at
+        {
+            next_gc = Some(Instant::now() + Duration::from_secs(gc_every_secs));
+            if let Err(e) = m1::gc(cli, None, true, true, 0, max_mbps, 0.0) {
+                println!(
+                    "gc 失败     = {e}\n             不算网络故障：下一轮照常，gc 按下个周期再试"
+                );
             }
         }
         println!(

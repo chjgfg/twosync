@@ -108,6 +108,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
             peer,
             agent_bin,
             allow_mass_delete,
+            gc_every_secs,
         } => m2::daemon(
             cli,
             &DaemonArgs {
@@ -119,6 +120,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 peer: peer.as_deref(),
                 agent_bin,
                 allow_mass_delete: *allow_mass_delete,
+                gc_every_secs: *gc_every_secs,
             },
         ),
         Cmd::Agent { project } => m1::agent(cli, project.as_deref()),
