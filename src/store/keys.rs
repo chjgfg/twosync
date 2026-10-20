@@ -100,6 +100,17 @@ pub const TAG_PEER: u8 = b'P';
 /// 崩在中间就是"清单引用一个不存在的块"。归零的块先进这张表，unlink 是**后面一趟限额的活**，
 /// 崩了下次接着做，而且 `gc` 能报出"还欠着多少个没删"。
 pub const TAG_PENDING: u8 = b'D';
+/// deferred 名单（§7.2）：`R|p|<path>` → `worktree::DeferredRec`。
+///
+/// 为什么要有这么一行而不只把 deferred 当扫描报告里的一个数：§7.2 要求两件事——
+/// ① `status` 里**看得见**（人是敲另一条命令才看到她的，进程早就退了，内存里那份报告已经没了），
+/// ② 检出时**拒绝写这些路径**（`checkout`/`restore` 也是另一条命令）。两件都要跨进程，
+/// 所以名单必须落库。
+///
+/// 语义是"**这一轮**读不了"，不是"永远读不了"：下一次**全量**扫描会把整张表重建
+/// （先删旧的再写本轮失败的），于是文件一旦能读，它的行就自己消失了。
+/// 窄扫轮只补不删——它只走了一个目录，没有资格宣布别处的项已经好了。
+pub const TAG_DEFERRED: u8 = b'R';
 
 /// 内容 hash 的唯一入口。换算法/改截断长度只改这一处
 pub fn hash_of(bytes: &[u8]) -> Hash {
@@ -215,6 +226,13 @@ pub fn peer_key(peer_id: &[u8]) -> Vec<u8> {
 /// unlink 那一趟要按字节数从 FR-15 的桶里扣，而这不该再回头点查 `K`（门面每次读折全库，§9.6.1）。
 pub fn pending_key(pid: ProjectId, hash: &Hash) -> Vec<u8> {
     keyed(TAG_PENDING, pid, hash)
+}
+
+/// deferred 的一行：路径是变长段，**放在键尾**（§9.2 规则 3）。
+/// 这里存的是工作树里的相对路径原样（`rel_path` 出来的那种，`/` 分隔），
+/// 所以同一串的键序就是路径序，`prefix_scan(R|p)` 一趟能把她全读出来。
+pub fn deferred_key(pid: ProjectId, path: &str) -> Vec<u8> {
+    keyed(TAG_DEFERRED, pid, path.as_bytes())
 }
 
 /// NFC 归一化助手。**目前只服务于比较**（`fold_path`），还没有用于"仓库内路径的身份"——

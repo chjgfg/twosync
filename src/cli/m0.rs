@@ -390,8 +390,27 @@ pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<
     }
     if rep.deferred > 0 {
         println!(
-            "注意：{n} 项读不了，已 deferred（不是删除）",
+            "注意：{n} 项读不了，已记进 deferred 名单（不是删除，检出会跳过她们）",
             n = rep.deferred
+        );
+        if !rep.deferred_sample.is_empty() {
+            let more = rep.deferred - rep.deferred_sample.len();
+            println!(
+                "          {list}{more_txt}（全量看 `status`）",
+                list = rep.deferred_sample.join(", "),
+                more_txt = if more > 0 {
+                    format!("…另 {more} 条")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
+    // 只有全量轮会收名单（窄扫没资格宣布别处的项好了），所以窄扫轮这一行不打。
+    if rep.deferred_swept > 0 {
+        println!(
+            "deferred 名单收掉 {n} 行过期项（这一轮读得通了，或盘上已经没有她）",
+            n = rep.deferred_swept
         );
     }
     Ok(())
@@ -455,6 +474,14 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
         println!(
             "复用        = {} 条文件已不在盘上、但内容早已在历史里 ⇒ 直接沿用那一版（下一次全量 scan 会把删除确认掉）",
             b.reused_missing
+        );
+    }
+    // 在盘上但**读不了**的那几条（被占用/权限）：保持历史里那一版，整轮不许因为她们停下来。
+    // 与上面那格分开报，因为处置不同——前者下一次全量扫描自动变成删除，后者会一直卡着等人放手。
+    if b.kept_locked > 0 {
+        println!(
+            "deferred    = {} 条这一轮读不了（被占用/权限）⇒ 保持历史里那一版，其余照常提交；              名单逐条看 `status`（§7.2）",
+            b.kept_locked
         );
     }
     // 参照侧清单的读法（一次前缀扫 or 退回点读）：这一行的数字就是"O(目录数) 次折被消掉"的凭据。
@@ -828,8 +855,19 @@ pub fn checkout(
         return Ok(());
     }
     println!(
-        "动作      = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}",
-        r.create, r.mkdir, r.overwrite, r.delete, r.rmdir, r.skipped
+        "动作      = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}{}",
+        r.create,
+        r.mkdir,
+        r.overwrite,
+        r.delete,
+        r.rmdir,
+        r.skipped,
+        // deferred 单列，不混进"跳过"：那一格是形状不合适（类型互换），这一格是磁盘上读不到。
+        if r.deferred > 0 {
+            format!(" / deferred 不动 {}", r.deferred)
+        } else {
+            String::new()
+        }
     );
     if r.dirty > 0 {
         println!(
@@ -1071,6 +1109,22 @@ pub fn status(cli: &Cli) -> Result<()> {
         println!(
             "出路      = `checkout --at <某个 head>` 选一边（其余 head 仍留在库里，历史不丢）；             路径无交集才谈 `--keep-both` 的结构合并；有交集要内容级合并请交给真 git（§1）"
         );
+    }
+    // FR-16 / §7.2：deferred 名单。健康站点上是空表 ⇒ 这里什么都不打（只花一次前缀扫，
+    // 与碰撞那一格同一口径：正常形状下不产生噪音）。
+    let df = worktree::list_deferred(&*db, pid)?;
+    if !df.is_empty() {
+        println!(
+            "deferred  = **{} 条路径现在读不了**（§7.2：不进删除判定，检出会跳过她们）",
+            df.len()
+        );
+        for (p, r) in df.iter().take(10) {
+            println!("          - {p} —— {}", r.reason);
+        }
+        if df.len() > 10 {
+            println!("          …另有 {} 条", df.len() - 10);
+        }
+        println!("处理      = 让占用她的进程放手或修好权限，再 `scan` 一轮（读得通了这行自动消失）");
     }
     // 实时那一半：**只报存在性差异**。内容改了这里看不见——目录 mtime 不表达文件内容变化，
     // 那要重算 hash 才知道（与 git 的 untracked cache 同一个限制）。

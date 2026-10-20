@@ -94,12 +94,32 @@ pub struct ScanMark {
     pub round: u32,
 }
 
+/// deferred 的一行（`R|p|path`，§7.2）。
+///
+/// 为什么只存"为什么读不了 + 哪一轮读的"：这张表的用途有两个（`status` 给人看、
+/// 检出层拒绝写这些路径），两个都只需要**路径集合**本身。把 mtime/size 也存一份就会
+/// 出现"表里的值和 `W` 行不一致"这种第二个真相源，而它一定会在某一天变成 bug。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct DeferredRec {
+    /// 失败原因的**原话**（`io::Error` 的 Display）。打印时不再加工。
+    pub reason: String,
+    /// 本轮扫描的时刻 = 这一行的"活性戳"。全量轮结束时，戳不等于本轮时刻的就是过期行
+    /// （那条路径这一轮没能再失败 ⇒ 已能读或已从盘上消失）。
+    pub at_ns: i64,
+}
+
 #[derive(Debug, Default)]
 pub struct Report {
     pub walked: usize,
     pub hashed: usize,
     pub skipped: usize,
     pub deferred: usize,
+    /// 读不了的项的**路径样本，最多 [`SAMPLE_MAX`] 条**。全量名单在库里（`R` 表，
+    /// [`list_deferred`]），这里只够打印与"本轮为什么少了几行"的追问。
+    pub deferred_sample: Vec<String>,
+    /// 全量轮末尾从 `R` 表里清掉的**过期行**数（那一轮没再失败的 ⇒ 已能读或已消失）。
+    /// 窄扫轮恒为 0：它只走了一个目录，没资格宣布别处的项好了。
+    pub deferred_swept: usize,
     /// 本轮**实际重算 hash** 的字节数。吞吐只能用它算——`bytes` 含 skipped，
     /// 用它当分子会把"跳过"显示成"速度暴跌"。
     pub hashed_bytes: u64,
@@ -188,28 +208,53 @@ pub fn scan_scoped(
     let mut rep = Report::default();
     let mut buf = vec![0u8; HASH_BUF];
     let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+    // deferred 的行走**另一个**缓冲。为什么不并进 `pending`：那个的长度决定 `ScanMark.seen`
+    // （"本轮盖了几行 `W`"），混进去就把名单数报成了盖章数——而这两个数在 §8 的判据里是分开的。
+    let mut pending_def: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let now = now_ns();
     let mut tx = db.begin();
     for found in walker(&base) {
         // 攒满一窗就落盘并换事务。放在循环**开头**，三个 push 点就共用这一处；
         // 代价是 pending 最多 batch+1 条，不是 batch 条。
-        if pending.len() >= batch {
+        // `pending_def` 单独比一次：满盘权限错误时 `pending` 一条都不涨，只看它就会让名单缓冲
+        // 长成 O(文件数)——那是 §9.6.1 那条常数内存承诺的直接违反。
+        if pending.len() >= batch || pending_def.len() >= batch {
             rep.seen += flush(&mut *tx, &mut pending, bucket)?;
+            // 这里**不**把返回值加进 `seen`：那不是 W 行。
+            flush(&mut *tx, &mut pending_def, bucket)?;
             tx.commit();
             drop(tx);
             tx = db.begin(); // 一事务一批，别让它跨整棵树
         }
 
-        let Ok(entry) = found else {
-            rep.deferred += 1;
-            continue;
+        // 用 match 而不是 let-else：else 分支里要拿到错误**原话**存进名单，let-else 绑不住那个值。
+        let entry = match found {
+            Ok(e) => e,
+            Err(err) => {
+                // 遍历器自己报错（进不去的目录、中途消失的条目…）。能问出项目内路径才记名单：
+                // 键必须是相对路径，拿绝对路径当尾段会造出一行**永远匹配不上**的 deferred。
+                // `ignore::Error`（0.4.33）没有 path 访问器，路径住在 `WithPath` 变体里。
+                let shown = err.to_string();
+                let rel = match &err {
+                    ignore::Error::WithPath { path, .. } => rel_path(root, path),
+                    _ => None,
+                };
+                match rel {
+                    Some(r) => note_deferred(&mut rep, &mut pending_def, pid, &r, shown, now)?,
+                    None => rep.deferred += 1,
+                }
+                continue;
+            }
         };
         let Some(rel) = rel_path(root, entry.path()) else {
             continue;
         };
-        let Ok(md) = fs::symlink_metadata(entry.path()) else {
-            rep.deferred += 1;
-            continue;
+        let md = match fs::symlink_metadata(entry.path()) {
+            Ok(md) => md,
+            Err(err) => {
+                note_deferred(&mut rep, &mut pending_def, pid, &rel, err.to_string(), now)?;
+                continue;
+            }
         };
         rep.walked += 1;
         let kind = kind_of(&md);
@@ -239,9 +284,9 @@ pub fn scan_scoped(
 
         let (blob_hash, size, symlink_target) = match digest(entry.path(), kind, &mut buf) {
             Ok(v) => v,
-            Err(_) => {
+            Err(err) => {
                 // 打不开/读失败 = deferred，**不是** missing，更不是删除（§8 第一杀手）。
-                rep.deferred += 1;
+                note_deferred(&mut rep, &mut pending_def, pid, &rel, err.to_string(), now)?;
                 refresh_liveness(&*tx, &key, now, &mut pending);
                 continue;
             }
@@ -264,8 +309,9 @@ pub fn scan_scoped(
         };
         pending.push((key, encode(&value)?));
     }
-    if !pending.is_empty() {
+    if !pending.is_empty() || !pending_def.is_empty() {
         rep.seen += flush(&mut *tx, &mut pending, bucket)?;
+        flush(&mut *tx, &mut pending_def, bucket)?;
         tx.commit();
     }
 
@@ -277,6 +323,9 @@ pub fn scan_scoped(
     // 代价是这一轮报不出删除（下一次全量轮补上），收益是不可能假删。
     drop(tx);
     if scope.is_full() {
+        // 先收名单再推 `Z`：`Z` 是"这一轮完整跑完了"的凭据，名单没收干净就推它，
+        // 崩溃会留下一张永远没人收的表。
+        rep.deferred_swept = sweep_stale_deferred(db, pid, now)?;
         let round = last_mark(db, pid).map_or(0, |m| m.round);
         let mark = ScanMark {
             epoch: now,
@@ -293,6 +342,126 @@ pub fn scan_scoped(
 
     rep.elapsed_ms = started.elapsed().as_millis();
     Ok(rep)
+}
+
+/// 记一笔 deferred（§7.2）：计数 + 打印样本 + `R` 表的一行（先攒在 `pending_def` 里）。
+///
+/// 三处调用点（遍历器报错 / `stat` 失败 / 内容读失败）都走这里，为的是**只有一个地方**决定
+/// "什么叫做 deferred"。计数与名单必须同源，否则会出现"报告说 3 条、`status` 列出 2 条"。
+fn note_deferred(
+    rep: &mut Report,
+    pending: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    pid: ProjectId,
+    rel: &str,
+    reason: String,
+    now: i64,
+) -> Result<()> {
+    rep.deferred += 1;
+    if rep.deferred_sample.len() < SAMPLE_MAX {
+        rep.deferred_sample.push(rel.to_string());
+    }
+    let rec = DeferredRec { reason, at_ns: now };
+    pending.push((keys::deferred_key(pid, rel), keys::wrap(keys::enc(&rec, "deferred 记录")?)));
+    Ok(())
+}
+
+/// 全量轮末尾把 `R` 表里**本轮没再失败**的行收掉。
+///
+/// 判据是那个活性戳，不是"路径还在不在"：本轮读成功的那条会把戳写成 `now`，于是"已经能读"
+/// 和"盘上真没了"两种情况都表现为"戳是旧的"，都该从名单里出去——前者是好消息（检出层的闸
+/// 随之打开），后者本来就该由 `commit` 那侧按删除处理。
+///
+/// **窄扫轮不调用它**：`Scope::Dir` 只走了一个目录，其余目录里 deferred 项本轮**没被看过**，
+/// 戳当然是旧的。拿旧戳当"已恢复"会把整张名单清成空的，而那份名单正是检出层拒绝写入的依据。
+fn sweep_stale_deferred(db: &dyn KvEngine, pid: ProjectId, now: i64) -> Result<usize> {
+    let prefix = keys::project_prefix(keys::TAG_DEFERRED, pid);
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    drop(tx);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    let tx = db.begin();
+    for row in &rows {
+        let fresh = match row
+            .value
+            .as_ref()
+            .map(|v| keys::rec::<DeferredRec>(v, "deferred 记录"))
+        {
+            Some(Ok(rec)) => rec.at_ns == now,
+            // 解不出来的行不是任何证据（值坏了 ⇒ 既不能说它还读不了，也不能替它说话），收掉。
+            _ => false,
+        };
+        if !fresh {
+            tx.delete(&row.key);
+            removed += 1;
+        }
+    }
+    tx.commit();
+    Ok(removed)
+}
+
+/// 当前的 deferred 名单（路径按键序 = 路径序）。`status` 与检出层都读她。
+///
+/// 坏行**跳过而不是报错**：这条是"看一眼"的读法，一行坏账不该让 `status` 不能用
+/// （与 `sessions::recent` 同一把尺）。
+pub fn list_deferred(db: &dyn KvEngine, pid: ProjectId) -> Result<Vec<(String, DeferredRec)>> {
+    let prefix = keys::project_prefix(keys::TAG_DEFERRED, pid);
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    drop(tx);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(tail) = row.key.get(prefix.len()..) else {
+            continue;
+        };
+        let Some(v) = row.value.as_ref() else {
+            continue;
+        };
+        match keys::rec::<DeferredRec>(v, "deferred 记录") {
+            Ok(rec) => out.push((String::from_utf8_lossy(tail).into_owned(), rec)),
+            Err(_) => continue,
+        }
+    }
+    Ok(out)
+}
+
+/// 单条路径点查（`restore` 的闸用）。为什么不给 `restore` 也读整张表：她只动一条路径，
+/// 而这两种读法在 0.4.0 上都只折一遍全库（§9.6.1）——读整张表不会更便宜，只会更吵。
+/// 解不出来的行按"不是 deferred"处理：那条路径没有证据说她读不了，而 `restore` 后面还有
+/// §7.3 那道门等着她。
+pub fn is_deferred(db: &dyn KvEngine, pid: ProjectId, path: &str) -> Result<Option<DeferredRec>> {
+    let tx = db.begin();
+    let raw = tx.get(&keys::deferred_key(pid, path));
+    tx.commit();
+    let Some(raw) = raw else { return Ok(None) };
+    match keys::rec::<DeferredRec>(&raw, "deferred 记录") {
+        Ok(rec) => Ok(Some(rec)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 由**非扫描方**补记一行 deferred（§7.2）。给 `commit` 用：文件是在 scan 之后才被占住的，
+/// 扫描那一轮没有理由记她，而"读不了"这件事必须在 `status` 里看得见、在检出层被拒。
+///
+/// 戳用调用时刻：下一次**全量**扫描会重新裁决这条路径，读得通了就自然收掉（`at_ns` 不相等）。
+pub fn note_deferred_row(db: &dyn KvEngine, pid: ProjectId, path: &str, reason: &str) -> Result<()> {
+    let rec = DeferredRec {
+        reason: reason.to_string(),
+        at_ns: now_ns(),
+    };
+    let tx = db.begin();
+    if !tx.set(
+        &keys::deferred_key(pid, path),
+        keys::wrap(keys::enc(&rec, "deferred 记录")?),
+    ) {
+        return Err(Error::WriteConflict(format!("deferred {path}")));
+    }
+    tx.commit();
+    Ok(())
 }
 
 /// `require_git(false)`：没有 `.git` 的目录也要认 `.gitignore`；`hidden(false)`：隐藏文件

@@ -16,9 +16,11 @@ use twosync::error::Error;
 use twosync::store::build::{self, BlockMeta};
 use twosync::store::cas::{self, Cas};
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
-use twosync::store::object;
+use twosync::store::{history, object};
 use twosync::store::worktree;
 use twosync::utils::{objects_dir, open_store};
+
+mod common;
 
 /// 一个测试站点：`.twosync` 挂在 `site` 下，项目目录是 `site/p`。
 struct Site {
@@ -1007,4 +1009,71 @@ fn a_file_that_vanished_before_it_was_ever_committed_is_an_error() {
         site.head().len() == 1,
         "失败的那次提交不许留下半个版本"
     );
+}
+
+/// §7.2 的 **commit 侧**：一条读不了的项不许拖垮整轮。
+///
+/// 与 `tests/checkout_worktree.rs` 那条用例的分工：那条管"检出层不许碰她"，这一条管
+/// "提交层不许因为她而停"。两条合起来才是 §7.2 那句"其余照常"。
+///
+/// 形状是 Windows 上最常见的那种：文件在 scan 之后被别的进程占住（改过、又碰不得）。
+/// 历史里已经有她上一版 ⇒ 保持那一版，本轮其余改动照常进账，同时补记一行 deferred。
+#[test]
+fn a_locked_file_stays_at_its_last_proven_version_and_the_rest_of_the_round_completes(
+) {
+    let site = Site::new();
+    let proj = site.proj();
+    fs::create_dir_all(proj.join("d")).unwrap();
+    fs::write(proj.join("d/a.txt"), b"one").unwrap();
+    fs::write(proj.join("d/b.txt"), b"b").unwrap();
+    site.commit(cas::DEFAULT_BLOCK, false);
+
+    // a.txt：内容变了 + 立刻被别人占住（扫描读不到 ⇒ `W` 行保持上一版，只续期盖章）
+    fs::write(proj.join("d/a.txt"), b"a much longer body we cannot open").unwrap();
+    let guard = common::lock_out(&proj.join("d/a.txt"));
+    // b.txt：同一轮里一条**正常**的改动，它必须照常进账
+    fs::write(proj.join("d/b.txt"), b"b changed and readable").unwrap();
+    site.scan();
+
+    let built = site
+        .try_build(cas::DEFAULT_BLOCK)
+        .expect("一条读不了的项不许让整轮 commit 停");
+    assert!(built.commit.is_some(), "有 b.txt 的改动就该产生一个版本");
+    assert_eq!(
+        built.kept_locked, 1,
+        "读不了的那条该被单独记账（不是 `reused_missing`，也不是删除）"
+    );
+    assert_eq!(built.changes.delete, 0, "读不了 ≠ 盘上没了");
+
+    // 名单里必须有她：`status` 看得见、检出层的闸才关得上
+    let list = worktree::list_deferred(&*site.db, site.pid).unwrap();
+    assert_eq!(list.len(), 1, "commit 侧补记的名单：{list:?}");
+    assert_eq!(list[0].0, "d/a.txt");
+
+    // 新那一版里 d/a.txt 引用的仍然是**旧字节**（"one"），而那份内容是真取得回来的
+    let tree = object::read_commit(&*site.db, site.pid, &built.commit.unwrap())
+        .unwrap()
+        .tree;
+    let e = history::resolve(&*site.db, site.pid, &tree, "d/a.txt")
+        .unwrap()
+        .expect("a.txt 不许从这一版里消失");
+    assert_eq!(e.hash, bh(b"one"), "保持的必须是上一版，不是新内容也不是空");
+
+    // 放手之后：下一轮就该把新内容收进来，名单自己消失（闸不是焊死的）
+    drop(guard);
+    let built = site.commit(cas::DEFAULT_BLOCK, false);
+    assert_eq!(built.kept_locked, 0, "解锁之后还记一笔 = 名单永远收不掉");
+    assert!(
+        worktree::list_deferred(&*site.db, site.pid)
+            .unwrap()
+            .is_empty(),
+        "读得通了名单还在"
+    );
+    let tree = object::read_commit(&*site.db, site.pid, &built.commit.unwrap())
+        .unwrap()
+        .tree;
+    let e = history::resolve(&*site.db, site.pid, &tree, "d/a.txt")
+        .unwrap()
+        .expect("用例前提：a.txt 一直在");
+    assert_eq!(e.hash, bh(b"a much longer body we cannot open"));
 }

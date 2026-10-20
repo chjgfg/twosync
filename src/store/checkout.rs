@@ -62,7 +62,7 @@ use storage_engines::KvEngine;
 
 use crate::error::{Error, Result};
 use crate::store::keys::{self, Hash, Kind, ProjectId};
-use crate::store::{build, cas, history, object, restore};
+use crate::store::{build, cas, history, object, restore, worktree};
 use crate::utils;
 
 /// 一次 `checkout` 的三个开关。它们全是"敢不敢动手"的档位，拆成三个位置参数迟早会被
@@ -85,6 +85,9 @@ pub struct Report {
     pub rmdir: usize,
     /// 类型互换、以及"预告要删但删不掉"等原样留下的条目。
     pub skipped: usize,
+    /// §7.2：因为"现在读不了"而**不动**的路径数（含她的子树）。不进 `skipped`，
+    /// 因为原因不是"形状不合适"，而是"磁盘上那份我们没法证实"。
+    pub deferred: usize,
     /// 工作树相对 HEAD 的未提交改动数。**只告知，不拦**（理由见模块头）。
     pub dirty: u32,
     pub deleted_bytes: u64,
@@ -96,8 +99,18 @@ pub struct Report {
 
 impl Report {
     /// 注意 `dirty` **不在**里面：工作树可以既是脏的、又不需要这次 checkout 动任何东西。
+    ///
+    /// `deferred` **在里面**：全部差异都被跳过时，"工作树已经是这个样子"是一句谎话——
+    /// 她是"本来要变成另一个样子，但我们不敢碰"。这条判据错了会让人以为检出完成了。
     pub fn is_noop(&self) -> bool {
-        self.create + self.mkdir + self.overwrite + self.delete + self.rmdir + self.skipped == 0
+        self.create
+            + self.mkdir
+            + self.overwrite
+            + self.delete
+            + self.rmdir
+            + self.skipped
+            + self.deferred
+            == 0
     }
 
     fn note(&mut self, line: String) {
@@ -138,6 +151,7 @@ pub fn checkout(
         store,
         work_root,
         dirty: cur.changes.add + cur.changes.modify + cur.changes.delete,
+        deferred: Deferred::load(db, pid)?,
     };
 
     let mut rep = run(&ctx, false, old_root, clean)?;
@@ -218,6 +232,46 @@ struct Ctx<'a> {
     work_root: &'a Path,
     /// 工作树相对 HEAD 的未提交改动数。**只告知，不拦**（理由见模块头"脏闸那一条"）。
     dirty: u32,
+    /// §7.2：现在读不了的那些路径 ⇒ 检出时**跳过她们，其余照常**。
+    deferred: Deferred,
+}
+
+/// deferred 名单的检出侧视图。
+///
+/// 为什么一次读成一份名单，而不是每条路径点查一次库：一次 `checkout` 会碰几百条路径，
+/// 而门面每次读都要把全库折一遍（§9.6.1）——点查在这里就是"路径数 × 一次全库折叠"。
+/// 名单本身**通常是空的**，空的那条路一次库都不额外折（`Deferred::reason` 先早退）。
+pub struct Deferred {
+    /// (路径, 失败原因原话)。路径是 `W` 键里那种斜杠形式，与 `path` 参数同一种形状。
+    items: Vec<(String, String)>,
+}
+
+impl Deferred {
+    pub fn load(db: &dyn KvEngine, pid: ProjectId) -> Result<Self> {
+        Ok(Self {
+            items: worktree::list_deferred(db, pid)?
+                .into_iter()
+                .map(|(p, r)| (p, r.reason))
+                .collect(),
+        })
+    }
+
+    /// 这条路径（或她某一层父目录）现在读不了吗？返回失败原因。
+    ///
+    /// 为什么要连父目录一起算：扫描器对一个进不去的目录报的是**目录本身**，里面的项本轮
+    /// 根本没被看过。checkout 若只查叶子路径，就会往一个"我们没能证实"的目录里写文件。
+    pub fn reason(&self, path: &str) -> Option<&str> {
+        if self.items.is_empty() {
+            return None;
+        }
+        self.items
+            .iter()
+            .find(|(p, _)| {
+                path == p
+                    || (path.starts_with(p.as_str()) && path.as_bytes().get(p.len()) == Some(&b'/'))
+            })
+            .map(|(_, r)| r.as_str())
+    }
 }
 
 /// 一趟遍历。`apply = false` 只记账，`true` 边记账边落地。
@@ -269,6 +323,14 @@ impl Job<'_> {
         reference: Option<&object::TreeEntry>,
         worktree: Option<&object::TreeEntry>,
     ) -> Result<()> {
+        // §7.2 的检出闸：**放在所有计数之前**。这一条既不算 create 也不算 delete，
+        // 因为两种动作都不许发生——她要覆盖的是一份我们读不到的本地内容，
+        // 而 FR-10 的分母要是把她算进去，就等于把"跳过"报成"要删"。
+        if let Some(why) = self.ctx.deferred.reason(path) {
+            self.rep.deferred += 1;
+            self.rep.note(format!("= {path}（deferred：{why}）"));
+            return Ok(());
+        }
         match kind {
             // 目标里有、工作树没有 ⇒ 建。内容取参照侧。
             build::ChangeKind::Delete => {

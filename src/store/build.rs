@@ -271,6 +271,10 @@ pub struct Built {
     /// **文件在 scan 之后消失、但内容早已在历史里**的那几条：复用那一版，不重读盘、不重记引用数。
     /// 命令层必须打出来——它是"这一轮的树引用了一份盘上已经没有的东西"的唯一读数。
     pub reused_missing: usize,
+    /// **文件读不了（被占用/权限）而内容早已在历史里**的那几条：保持那一版，并当场补记一行
+    /// deferred（§7.2）。与上面那格分开数，因为盘的形状不一样——一条是"没了"，一条是"在但碰不得"，
+    /// 前者下一次全量扫描就确认删除，后者会一直卡在那儿等人放手。
+    pub kept_locked: usize,
     /// 参照侧目录清单**是怎么读的**（整段装载还是退回点读）。命令层必须把它印出来：
     /// "改成一次前缀扫"这句话只有在能被核对时才不是口头承诺（§11.4d）。
     pub manifests: ManifestLoad,
@@ -1094,35 +1098,67 @@ fn put_blob(
     built: &mut Built,
 ) -> Result<Hash> {
     let abs = work_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    // **先问库里有没有她，再决定要不要碰磁盘**。两个理由，一个是钱、一个是 §7.2：
+    // - 稳态一轮 `commit` 要给 20 215 个文件每人 `File::open` 一次（12 GiB 站点上那 26.4 s 的
+    //   主要构成），而那些字节早就在 CAS 里、早就 fsync 过了（FR-13 的顺序：`B` 行在 ⇒ 块在）。
+    // - 文件被别的进程占着的时候（Windows 上是常态：开着的 VM 磁盘、SQLite 库、杀毒软件正扫），
+    //   老写法让整轮 `commit` 死在第一次 `open` 上 —— **一条读不了的项不许拖垮一轮**（§7.2）。
+    //
+    // 这次点查与 `adopt_blob` 里那一次是同一件事，所以读的次数没变（一个 blob 一次）。
+    let known = {
+        let tx = db.begin();
+        let got = tx.get(&keys::blob_key(pid, &e.blob_hash)).is_some();
+        tx.commit();
+        got
+    };
+    if known {
+        // 尺寸与 mtime 都和扫描记下的那一行对得上 ⇒ 盘上这一条就是历史里那一版，一次 open 都不欠。
+        // 对不上才往下走：那时候要的是**内容级**判决（StaleScan），而它只能靠重读。
+        // `stat` 失败也算"对不上"：文件消失了，让下面那条 NotFound 分支去报她的账。
+        let steady = std::fs::symlink_metadata(&abs)
+            .map(|md| md.len() == e.size && worktree::mtime_of(&md) == e.mtime_ns)
+            .unwrap_or(false);
+        if steady {
+            return Ok(e.blob_hash);
+        }
+    }
     let outcome = match store.put_file(&abs) {
         Ok(o) => o,
-        // **文件在 scan 之后消失了**（用户删了它，或者这一轮是窄扫、它压根没被走过）。
+        // **文件在 scan 之后消失了**（用户删了它，或者这一轮是窄扫、它压根没被走过），
+        // 或者**这一刻读不了**（被占用/权限）。判据不是"读不到就失败"，而是"历史里有没有她"：
+        // `B` 行在 ⇒ 那些字节早就进了 CAS 并且记过引用数（FR-13：先块后行），这一条内容
+        // **不需要**再落一次盘，保持那一版就行。
         //
-        // 这一刻的判据不是"读不到就失败"，而是"历史里有没有它"：`B` 行在 ⇒ 那些字节早就进了
-        // CAS 并且记过引用数（FR-13 的顺序：先块后行），所以这一条内容**不需要**再落一次盘，
-        // 直接复用那一版的 hash 就行。`adopt_blob` 本来就是幂等的（清单已在库里就一字不改），
-        // 复用路径连那次判断都省了。
-        //
-        // 反过来，`B` 行不在 = 这文件是新出现的、又被删了，我们**从来没拿到过它的字节** ⇒
-        // 报错，不许静默造一条引用不存在内容的清单（那正是 §9.3 要防的悬空）。
-        Err(Error::Io(ioe)) if ioe.kind() == std::io::ErrorKind::NotFound => {
-            let key = keys::blob_key(pid, &e.blob_hash);
-            let known = {
-                let tx = db.begin();
-                let got = tx.get(&key).is_some();
-                tx.commit();
-                got
-            };
+        // 反过来，`B` 行不在 = 我们**从来没拿到过她的字节** ⇒ 必须报错，不许静默造一条
+        // 引用不存在内容的清单（那正是 §9.3 要防的悬空）。
+        Err(other) => {
+            let vanished = matches!(&other, Error::Io(ioe) if ioe.kind() == std::io::ErrorKind::NotFound);
+            let why = other.to_string();
             if known {
-                built.reused_missing += 1;
+                if vanished {
+                    built.reused_missing += 1;
+                } else {
+                    // 读不了 ≠ 消失：补记一行 deferred，让 `status` 看得见、让检出层拒绝往她身上写。
+                    // 名单里这一行的戳是**现在**，下一次全量扫描会重新裁决她（§7.2 的收表规则）。
+                    built.kept_locked += 1;
+                    worktree::note_deferred_row(db, pid, path, &why)?;
+                }
                 return Ok(e.blob_hash);
             }
+            // 报错之前先把名单写上：这一轮为什么没提交成，人得能在 `status` 里看到那一条。
+            worktree::note_deferred_row(db, pid, path, &why)?;
+            if vanished {
+                return Err(Error::BadInput(format!(
+                    "{path} 在上一次 scan 之后消失了，而它的内容还没进过任何历史版本 ⇒ 这一轮没法提交它。\
+                     重新 scan 一次（它还活着就会被盖章），或者认了它就让它过去"
+                )));
+            }
             return Err(Error::BadInput(format!(
-                "{path} 在上一次 scan 之后消失了，而它的内容还没进过任何历史版本 ⇒ 这一轮没法提交它。\
-                 重新 scan 一次（它还活着就会被盖章），或者认了它就让它过去"
+                "{path} 这一轮读不了（{why}），而她的内容从没进过任何历史版本 ⇒ 没有可以保持的那一版，\
+                 也不能凭空造一份引用不存在字段的清单。已经在 deferred 名单里记了一行：\
+                 让占用她的进程放手或修好权限，其余路径照常提交（§7.2）"
             )));
         }
-        Err(other) => return Err(other),
     };
     if outcome.blob.hash != e.blob_hash {
         // 扫描之后文件又被人改了：这一条本轮不提交，等下一轮扫描。绝不静默用新内容。

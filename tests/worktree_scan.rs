@@ -1,5 +1,7 @@
 //! 扫描器的两条硬承诺 + 一条不显然的语义（§9.6.1 / §9.6.2 / §8）。
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 
@@ -484,5 +486,170 @@ fn a_scan_charges_the_bucket_and_the_engine_agrees_on_the_byte_count() {
         steady.written(),
         Some(charged),
         "稳态轮一行没算就不扣桶 ⇒ 限速对常驻循环形同虚设"
+    );
+}
+
+// ── deferred 名单（§7.2）───────────────────────────────────────
+
+
+/// 名单的完整生命周期：**读不到 ⇒ 进名单；能读了 ⇒ 下一轮全量自动消失**。
+///
+/// 为什么中间要先改一次内容：粗筛（size+mtime）命中的行根本不会去 `open`，那条路径上
+/// "读不了"这件事压根没发生。只有**内容变过又读不到**才是 §7.2 说的那种项。
+#[test]
+fn a_deferred_path_is_listed_and_clears_itself_next_full_round() {
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    let data = proj.join("data");
+    fs::create_dir_all(&data).unwrap();
+    seed(&data, 5);
+    let tricky = data.join("f0.txt");
+    fs::write(&tricky, b"the first version").unwrap();
+
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+    worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+
+    // 内容变了（粗筛必然 miss）又读不到 ⇒ 这一条进名单
+    fs::write(&tricky, b"a much longer second version").unwrap();
+    let guard = common::lock_out(&tricky);
+    let rep = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+
+    assert_eq!(rep.deferred, 1, "样本 {:?}", rep.deferred_sample);
+    assert_eq!(rep.deferred_sample, vec!["data/f0.txt".to_string()]);
+    let list = worktree::list_deferred(&*db, pid).unwrap();
+    assert_eq!(list.len(), 1, "名单应当就一条：{list:?}");
+    assert_eq!(list[0].0, "data/f0.txt");
+    assert!(
+        !list[0].1.reason.trim().is_empty(),
+        "原因必须是原话，不能只剩一个数"
+    );
+    // `ScanMark.seen` 只数 `W` 行：名单那一行**不许**混进去（那是两个不同的量）。
+    let mark = worktree::last_mark(&*db, pid).expect("全量轮必须盖章");
+    assert_eq!(
+        mark.seen as usize, 6,
+        "data 这一层 + 5 个文件 = 6 行，名单那行不算：{}",
+        mark.seen
+    );
+
+    // 放手 ⇒ 下一轮全量读通了，那行自己消失（不需要谁去 `gc`，也不需要命令行开关）。
+    drop(guard);
+    let next = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    assert_eq!(next.deferred, 0);
+    assert_eq!(
+        next.deferred_swept, 1,
+        "过期行没收掉，说明戳写错了或者根本没扫名单"
+    );
+    assert!(worktree::list_deferred(&*db, pid).unwrap().is_empty());
+
+    // 第三轮：空表也要幂等（不该报"收了 0 条"之外的东西，也不该有行残留）。
+    let third = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    assert_eq!(third.deferred_swept, 0);
+}
+
+/// **窄扫轮不许收名单**。她只走了一个目录，别的目录本轮根本没被看过，
+/// 那些行的戳自然是旧的——拿旧戳当"已恢复"会把整张表清成空的，而那张表正是检出层的依据。
+#[test]
+fn a_narrow_round_never_clears_someone_elses_deferred_row() {
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(proj.join("a")).unwrap();
+    fs::create_dir_all(proj.join("b")).unwrap();
+    fs::write(proj.join("a/x.bin"), b"x").unwrap();
+    fs::write(proj.join("b/y.bin"), b"y").unwrap();
+
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+    worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    fs::write(proj.join("a/x.bin"), b"x changed while nobody could read it").unwrap();
+    let guard = common::lock_out(&proj.join("a/x.bin"));
+    worktree::scan(&*db, pid, &proj, false, 8).unwrap();
+    assert_eq!(worktree::list_deferred(&*db, pid).unwrap().len(), 1);
+
+    // 只走 b/：a/x.bin 这一轮没被看过 ⇒ 名单必须原样留着
+    let narrow = worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Dir("b".to_string()),
+        false,
+        8,
+        &twosync::store::cas::Bucket::default(),
+    )
+    .unwrap();
+    assert_eq!(narrow.deferred_swept, 0, "窄扫收了名单 = 拿半轮的视野做全库的结论");
+    let list = worktree::list_deferred(&*db, pid).unwrap();
+    assert_eq!(list.len(), 1, "窄扫之后名单没了：{list:?}");
+    assert_eq!(list[0].0, "a/x.bin");
+
+    drop(guard);
+}
+
+/// 这张表**每次读花多少引擎调用**必须说得出一个数：`status` 多一格 = 常驻循环每轮多折
+/// 一遍全库（§9.6.1），所以"读法"和"内容"一样是判据。
+///
+/// 钉两件事：① 空表恰好一次前缀扫（不是"先数一遍再逐条点查"），② 表变长**不**加折数
+/// （每行加一次点查是最容易悄悄长出来的形状，而它在 12 GiB 站点上是每条一行 0.5 s 起）。
+#[test]
+fn reading_the_deferred_list_costs_exactly_one_fold() {
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(proj.join("data")).unwrap();
+    seed(&proj.join("data"), 5);
+
+    let meter = twosync::utils::Meter::default();
+    let engine = twosync::utils::counted(
+        open_store(site.path(), EngineKind::LsmTree).unwrap(),
+        &meter,
+        false,
+    );
+    let pid = keys::project_id("p");
+    worktree::scan(&*engine, pid, &proj, false, 8).unwrap();
+
+    let base = meter.snapshot();
+    assert!(worktree::list_deferred(&*engine, pid).unwrap().is_empty());
+    assert_eq!(
+        meter.snapshot().since(base).folds(),
+        1,
+        "空表的读法不该是多次：{}",
+        meter.snapshot().since(base).line()
+    );
+
+    // 手写两行进表（绕过扫描器：这一步要验的是**读法**，不是产生路径）。
+    let write = |rel: &str| {
+        let rec = worktree::DeferredRec {
+            reason: "用例伪造".to_string(),
+            at_ns: 1,
+        };
+        let tx = engine.begin();
+        assert!(tx.set(
+            &keys::deferred_key(pid, rel),
+            keys::wrap(keys::enc(&rec, "deferred 记录").unwrap())
+        ));
+        tx.commit();
+    };
+    write("data/f0.txt");
+    write("data/f3.txt");
+
+    let base = meter.snapshot();
+    let list = worktree::list_deferred(&*engine, pid).unwrap();
+    assert_eq!(list.len(), 2, "两行都该读回来：{list:?}");
+    assert_eq!(
+        meter.snapshot().since(base).folds(),
+        1,
+        "名单每多一条就多折一遍全库：{}",
+        meter.snapshot().since(base).line()
+    );
+
+    // 点查（`restore` 那道闸用的读法）也是恰好一次——不是"读整张表再找"。
+    let base = meter.snapshot();
+    assert!(worktree::is_deferred(&*engine, pid, "data/f0.txt")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        meter.snapshot().since(base).folds(),
+        1,
+        "点查用了一次以上：{}",
+        meter.snapshot().since(base).line()
     );
 }

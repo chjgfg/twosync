@@ -20,6 +20,8 @@
 //! $TS --root /tmp/ts7 checkout --at <v1 的前缀> --to /tmp/ts7/lab/o # 必须被拒（目标在工作树里）
 //! ```
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,7 +30,7 @@ use twosync::error::Error;
 use twosync::store::cas::Cas;
 use twosync::store::checkout::{self, Opts};
 use twosync::store::keys::{self, Hash, ProjectId};
-use twosync::store::{build, object, worktree};
+use twosync::store::{build, object, restore, worktree};
 use twosync::utils::{objects_dir, open_store};
 
 const BLK: u64 = 4096;
@@ -506,4 +508,150 @@ fn export_prefix_checks_the_target_tree_like_checkout_does() {
         "单文件是 restore 的活，这里不许糊过去"
     );
     assert!(!out.exists(), "两次都该在动手之前就被拒");
+}
+
+// ── §7.2：现在读不了的项，检出层怎么处理 ───────────────────────
+
+
+/// §7.2 的两道闸是两个不同的动作：`checkout` **跳过**这一条、其余照常；`restore` 对她**报错**。
+///
+/// 为什么不统一：`checkout` 是批量落地，一条不让动就把整棵树卡住等于惩罚无关的路径；
+/// `restore` 只动一条，静默跳过就变成"命令成功了但什么都没发生"。
+#[test]
+fn a_deferred_path_is_skipped_by_checkout_and_refused_by_restore() {
+    let site = Site::new();
+    site.write("a.txt", "one");
+    site.write("keep.txt", "keep");
+    let v1 = site.commit();
+    site.write("a.txt", "two - the committed version");
+    site.commit();
+
+    // 盘上又变了一次，然后被别的进程占住 ⇒ 本轮读不到她，`W` 里留的还是 v2 那一版。
+    site.write("a.txt", "three - unreadable until its owner lets go");
+    let on_disk = fs::metadata(site.abs("a.txt")).unwrap().len();
+    let guard = common::lock_out(&site.abs("a.txt"));
+    site.scan();
+
+    // ① **不是删除**（§8 第一杀手）：与 HEAD 比，plan 一条都不报——那行被续期了，没被丢掉
+    let p = build::plan(&*site.db, site.pid).unwrap();
+    assert_eq!(p.changes.delete, 0, "deferred 被报成了删除");
+    assert_eq!(p.changes.add, 0);
+    assert_eq!(p.changes.modify, 0, "读不到不等于内容变了");
+
+    // ② `checkout` 到 v1：a.txt 本该被覆盖 ⇒ 跳过她
+    let rep = site
+        .checkout(
+            &v1,
+            None,
+            Opts {
+                apply: true,
+                allow_mass_delete: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(rep.deferred, 1, "闸没生效：{rep:?}");
+    assert_eq!(rep.overwrite, 0, "覆盖了一份读不到的本地内容");
+    assert!(!rep.is_noop(), "全被跳过时不该说成「工作树已经是这个样子」");
+    assert_eq!(
+        fs::metadata(site.abs("a.txt")).unwrap().len(),
+        on_disk,
+        "盘上那一版被盖掉了"
+    );
+
+    // ③ `restore` 同一条件：**报错**，不是跳过
+    let store = Cas::new(&objects_dir(site.tmp.path()), BLK).unwrap();
+    let e = restore::restore(
+        &*site.db,
+        site.pid,
+        &store,
+        &site.proj(),
+        &v1,
+        "a.txt",
+        None,
+        true,
+    )
+    .unwrap_err();
+    assert!(matches!(e, Error::Deferred { .. }), "实际报的是：{e}");
+    assert!(e.to_string().contains("读不了"), "错误里要能看出为什么：{e}");
+
+    // ④ 同一份内容导到**工作树外**不受此限：那一刀盖的不是这份读不到的东西
+    fs::create_dir_all(site.out()).unwrap();
+    let got = restore::restore(
+        &*site.db,
+        site.pid,
+        &store,
+        &site.proj(),
+        &v1,
+        "a.txt",
+        Some(&site.out().join("a.txt")),
+        true,
+    )
+    .unwrap();
+    assert_eq!(got.bytes, 3, "导出的应当是 v1 的 one");
+
+    // ⑤ 解锁 + 提交之后闸就开了：本地那一版进了历史，checkout 照常覆盖
+    drop(guard);
+    let v3 = site.commit();
+    assert_ne!(v3, v1, "台架前提：三轮内容各不相同");
+    assert!(
+        worktree::list_deferred(&*site.db, site.pid)
+            .unwrap()
+            .is_empty(),
+        "读得通了名单还在，说明全量轮的活性戳没收她"
+    );
+    let rep = site
+        .checkout(
+            &v1,
+            None,
+            Opts {
+                apply: true,
+                allow_mass_delete: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(rep.deferred, 0, "闸开了还拦着 = 第二个 bug");
+    assert_eq!(rep.overwrite, 1);
+    assert_eq!(site.read("a.txt"), "one");
+}
+
+/// 名单的**形状**：deferred 的是一个**目录**时，她整棵子树都不许检出。
+///
+/// 这条容易漏：扫描器对一个进不去的目录报的是目录本身，里面的项本轮根本没被看过；
+/// 而检出侧如果只比叶子路径，就会往一个"我们没能证实"的目录里正常写文件。
+#[test]
+fn a_deferred_directory_blocks_its_whole_subtree() {
+    let site = Site::new();
+    site.write("d/a.txt", "one");
+    let v1 = site.commit();
+    site.write("d/a.txt", "two - a longer committed body");
+    let v2 = site.commit();
+
+    // 造一个"目录读不了"的状态：直接写一行 `R|p|d`（`chmod`/句柄锁在 Windows 上管不住目录，
+    // 而这条用例要验的是**检出侧怎么用名单**，不是扫描器怎么产生名单——那半边在 worktree_scan 里）。
+    let rec = worktree::DeferredRec {
+        reason: "用例伪造：进不去的目录".to_string(),
+        at_ns: 1,
+    };
+    let tx = site.db.begin();
+    assert!(tx.set(
+        &keys::deferred_key(site.pid, "d"),
+        keys::wrap(keys::enc(&rec, "deferred 记录").unwrap())
+    ));
+    tx.commit();
+
+    // v1 里 d/a.txt 是 "one" ⇒ 本来要覆盖，但她爹在名单上
+    let rep = site
+        .checkout(
+            &v1,
+            None,
+            Opts {
+                apply: true,
+                allow_mass_delete: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(rep.deferred, 1, "目录级名单没管住子树：{rep:?}");
+    assert_eq!(rep.overwrite, 0);
+    assert_eq!(fs::metadata(site.abs("d/a.txt")).unwrap().len(), 29);
+    let _ = v2;
 }

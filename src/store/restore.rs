@@ -82,6 +82,15 @@ pub fn restore(
         });
     }
     let external = dest.is_some();
+    // §7.2：这一条**现在读不了** ⇒ 不往她身上检出。`--to` 那条路不受此限：目标不在工作树里，
+    // 盖下去的不是这份我们读不到的内容（与 §7.3 那道门同一个口径）。
+    // 顺序上放在"目标已存在"之前：那句问的是"要不要覆盖"，这一句是"覆盖不了，看都看不见"。
+    if !external && let Some(rec) = worktree::is_deferred(db, pid, path)? {
+        return Err(Error::Deferred {
+            path: path.to_string(),
+            reason: rec.reason,
+        });
+    }
     let dest = match dest {
         Some(d) => d.to_path_buf(),
         None => work_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)),
