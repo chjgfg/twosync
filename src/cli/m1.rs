@@ -588,6 +588,19 @@ pub fn gc(
             "本轮        = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
             stats.rows_scanned, stats.versions_removed, stats.xmin
         );
+        // **FR-15 也管 vacuum**（这一条以前漏着：桶只挂在 CAS 上，而 `vacuum` 不碰 CAS）。
+        // 字节数我们看不到——门面只报行数，也不给分片版（§14 Q14），所以这里只能**折算**：
+        // 用 §11.4b 量出来的物化口径 207 B/键 × 扫过的行数。它必然不准（真实写量还含 WAL 框架、
+        // 且只有被重写的文件才产生新字节），但它做的事是对的：**这一趟的账记进同一份预算**，
+        // 于是同一轮里后面的 `push`/`gc unlink` 必须等它把平均速率还回来。
+        // 折算系数写成常量、打印出来，别让它藏在一条注释里。
+        const VACUUM_BYTES_PER_ROW: u64 = 207;
+        let charged = stats.rows_scanned * VACUUM_BYTES_PER_ROW;
+        cli.io_bucket.charge(charged);
+        println!(
+            "过桶        = vacuum 按 {VACUUM_BYTES_PER_ROW} B/行折算扣 {:.2} MiB（门面不报真实写量，也不给分片 vacuum ⇒ 这是记账不是测量）",
+            charged as f64 / 1048576.0
+        );
         if matches!(stats.blob_rewritten, Some(true)) {
             println!("blob 文件   = 已重写（外置 value 被压实过）");
         }

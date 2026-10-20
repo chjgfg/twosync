@@ -234,3 +234,34 @@ fn one_cli_opens_the_store_exactly_once() {
         "要报的是锁，不是别的：{err}"
     );
 }
+
+/// `gc --apply` 的 vacuum 那一趟要记账；dry-run 不仅要"不写库"，还要**一字节都不扣桶**
+/// （FR-15 的桶是"这次操作搬动了多少"的账，dry-run 搬动了 0）。
+#[test]
+fn gc_charges_the_bucket_only_when_it_actually_vacuums() {
+    use twosync::cli::m1;
+    use twosync::store::cas::Bucket;
+
+    let site = Site::new(&[("a.txt", b"body"), ("d/b.txt", b"body2")]);
+    site.scan();
+    m0::commit(&site.cli(), Some("第一次"), false, Import::default()).unwrap();
+    site.scan();
+    m0::commit(&site.cli(), Some("第二次"), false, Import::default()).unwrap();
+
+    // 带桶的 `Cli`（1 GiB/s：账照扣，几乎不睡）。
+    let mut cli = site.cli();
+    cli.io_bucket = Bucket::limited(1 << 30);
+    m1::gc(&cli, None, false, false, 0, 0.0, 0.0).unwrap();
+    assert_eq!(
+        cli.io_bucket.written(),
+        Some(0),
+        "只报账的一趟扣了桶 ⇒ dry-run 不再等于「什么都没动」"
+    );
+
+    m1::gc(&cli, None, false, true, 0, 0.0, 0.0).unwrap();
+    let charged = cli.io_bucket.written().expect("给了限速就该有账");
+    assert!(
+        charged >= 207,
+        "vacuum 过桶是**折算**（207 B/行 × 扫过的行数），至少要有一笔：{charged}"
+    );
+}

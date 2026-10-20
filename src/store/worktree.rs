@@ -121,7 +121,8 @@ pub fn scan(
     force: bool,
     batch: usize,
 ) -> Result<Report> {
-    scan_scoped(db, pid, root, &Scope::Full, force, batch)
+    // 不带桶的那一份：给测试与"我只是扫一下"的调用方。默认桶不限速 ⇒ `charge` 是空操作。
+    scan_scoped(db, pid, root, &Scope::Full, force, batch, &crate::store::cas::Bucket::default())
 }
 
 /// 扫描的范围。**全量与窄扫的区别不是"少走几个目录"这么轻**：它决定这一轮能不能推进活性线。
@@ -163,6 +164,7 @@ pub fn scan_scoped(
     scope: &Scope,
     force: bool,
     batch: usize,
+    bucket: &crate::store::cas::Bucket,
 ) -> Result<Report> {
     // 窄扫时把遍历起点换成那一个目录，但**相对路径仍然按 root 算**（`rel_path(root, …)`）：
     // `W` 的键是项目内的完整路径，按子树算会把 `d/e/f.bin` 记成 `e/f.bin`，那一行就永远对不上。
@@ -192,7 +194,7 @@ pub fn scan_scoped(
         // 攒满一窗就落盘并换事务。放在循环**开头**，三个 push 点就共用这一处；
         // 代价是 pending 最多 batch+1 条，不是 batch 条。
         if pending.len() >= batch {
-            rep.seen += flush(&mut *tx, &mut pending)?;
+            rep.seen += flush(&mut *tx, &mut pending, bucket)?;
             tx.commit();
             drop(tx);
             tx = db.begin(); // 一事务一批，别让它跨整棵树
@@ -263,7 +265,7 @@ pub fn scan_scoped(
         pending.push((key, encode(&value)?));
     }
     if !pending.is_empty() {
-        rep.seen += flush(&mut *tx, &mut pending)?;
+        rep.seen += flush(&mut *tx, &mut pending, bucket)?;
         tx.commit();
     }
 
@@ -677,11 +679,23 @@ fn digest(path: &Path, kind: Kind, buf: &mut [u8]) -> std::io::Result<(Hash, u64
 fn flush(
     tx: &mut dyn storage_engines::KvTxn,
     pending: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    bucket: &crate::store::cas::Bucket,
 ) -> Result<usize> {
+    // **FR-15 的桶也管扫描**（这一条以前漏着：桶只挂在 CAS 上，而扫描一行都不碰 CAS）。
+    // 扣的是"这一批交给引擎的字节"= 键 + 值。为什么用这个数而不是"磁盘上写了多少"：
+    // WAL 的框架字节（版本行、批头、每次提交的记录头）住在引擎里，我们从外面**看不到**；
+    // 但键+值是那次写的**全部有效载荷**，用它记账至少两边（`commit` 落块与 `scan` 写行）
+    // 扣的是同一种东西：自己交出去的字节数。§17 补记里注明这条近似。
+    let bytes: u64 = pending
+        .iter()
+        .map(|(k, v)| (k.len() + v.len()) as u64)
+        .sum();
     let n = pending.len();
     tx.batch_set(pending)
         .map_err(|keys| Error::WriteConflict(format!("{:?}", keys.first())))?;
     pending.clear();
+    // 放在 `batch_set` 之后：没落成的那批不该扣预算（与 CAS 在 `rename` 之后才扣同一条规矩）。
+    bucket.charge(bytes);
     Ok(n)
 }
 

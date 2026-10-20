@@ -924,6 +924,7 @@ fn a_narrow_round_reports_no_deletions_and_the_next_full_round_does() {
         &worktree::Scope::Dir("b".to_string()),
         false,
         500,
+        &twosync::store::cas::Bucket::default(),
     )
     .expect("窄扫");
     let second = site.build(cas::DEFAULT_BLOCK, false);
@@ -967,6 +968,7 @@ fn a_narrow_round_picks_up_a_new_file_in_the_scanned_dir() {
         &worktree::Scope::Dir("b".to_string()),
         false,
         500,
+        &twosync::store::cas::Bucket::default(),
     )
     .expect("窄扫 b/");
     let built = site.build(cas::DEFAULT_BLOCK, false);

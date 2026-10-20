@@ -352,7 +352,7 @@ pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<
         None => worktree::Scope::Full,
         Some(d) => worktree::Scope::Dir(d.to_string()),
     };
-    let rep = worktree::scan_scoped(&*db, pid, &root, &scope, force, batch)?;
+    let rep = worktree::scan_scoped(&*db, pid, &root, &scope, force, batch, &cli.io_bucket)?;
     let peak = wm.peak_growth();
 
     let secs = rep.elapsed_ms as f64 / 1000.0;

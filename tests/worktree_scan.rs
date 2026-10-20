@@ -352,6 +352,7 @@ fn a_narrow_round_does_not_move_the_liveness_line() {
         &worktree::Scope::Dir("b".to_string()),
         false,
         8,
+        &twosync::store::cas::Bucket::default(),
     )
     .unwrap();
     assert_eq!(narrow.walked, 2, "只该看见 b 与 b/y.bin：{}", narrow.walked);
@@ -382,6 +383,7 @@ fn narrow_scan_paths_stay_project_relative() {
         &worktree::Scope::Dir("b".to_string()),
         false,
         8,
+        &twosync::store::cas::Bucket::default(),
     )
     .unwrap();
     // 键必须是 `b`、`b/y.bin` 那两条（各多一个版本行），而不是新造出 `y.bin`。
@@ -410,7 +412,77 @@ fn a_narrow_scan_of_a_missing_directory_is_an_error_not_a_no_op() {
         &worktree::Scope::Dir("nope".to_string()),
         false,
         8,
+        &twosync::store::cas::Bucket::default(),
     )
     .expect_err("不存在的目录该报错");
     assert!(e.to_string().contains("不是一个目录"), "实际：{e}");
+}
+
+/// 扫描也要过 FR-15 的桶（以前只 CAS 那三处在扣，而扫描根本不碰 CAS）。
+///
+/// 判据不用"我自己算的那个数"：跑完之后**从引擎里把 `W` 行读回来**，把键+值的长度加总，
+/// 和桶上累计的字节对账。两条独立路径要是不相等，要么扣错了、要么写进去的行数不对。
+#[test]
+fn a_scan_charges_the_bucket_and_the_engine_agrees_on_the_byte_count() {
+    let site = tempfile::tempdir().unwrap();
+    let proj = site.path().join("p");
+    fs::create_dir_all(&proj).unwrap();
+    seed(&proj, 30);
+    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let pid = keys::project_id("p");
+
+    // 1 GiB/s：账照扣，睡的那点时间可以忽略（用例不掐墙钟，§15.22 的规矩）。
+    let bucket = twosync::store::cas::Bucket::limited(1 << 30);
+    worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Full,
+        false,
+        8,
+        &bucket,
+    )
+    .unwrap();
+    let charged = bucket.written().expect("给了限速就必须有账");
+
+    // 反向核对：库里 W 行的键 + 值一共多少字节。
+    let mut prefix = vec![keys::TAG_WORKTREE];
+    prefix.extend_from_slice(&pid.to_be_bytes());
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let stored: u64 = rows
+        .iter()
+        .map(|r| (r.key.len() + r.value.as_ref().map_or(0, |v| v.len())) as u64)
+        .sum();
+    assert_eq!(
+        charged, stored,
+        "桶上扣的字节与引擎里存的行字节对不上：扣 {charged} / 存 {stored}（{} 行）",
+        rows.len()
+    );
+    assert!(rows.len() >= 30, "30 个文件至少要 30 行：{}", rows.len());
+    // 单价合理性：一行 = 键(5+path) + 值(信封 + postcard) 必然落在几十字节这一档。
+    // 这条是防"扣了个数量级错的数"（比如把 hash 字节当成行字节）。
+    let per_row = charged / rows.len() as u64;
+    assert!((32..400).contains(&per_row), "每行 {per_row} B 不合理（charged {charged}）");
+
+    // 稳态第二轮：一行 hash 都不重算（hashed=0），但**每行都要续期盖章** ⇒ 扣的字节必须还在。
+    // 这一条是"扣的是交出去的行，不是算过的内容"的定义，也是最容易在优化中被改掉的那格。
+    let steady = twosync::store::cas::Bucket::limited(1 << 30);
+    let rep = worktree::scan_scoped(
+        &*db,
+        pid,
+        &proj,
+        &worktree::Scope::Full,
+        false,
+        8,
+        &steady,
+    )
+    .unwrap();
+    assert_eq!(rep.hashed, 0, "台架前提：稳态一轮不该重算任何一行");
+    assert_eq!(
+        steady.written(),
+        Some(charged),
+        "稳态轮一行没算就不扣桶 ⇒ 限速对常驻循环形同虚设"
+    );
 }
