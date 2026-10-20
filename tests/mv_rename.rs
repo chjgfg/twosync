@@ -41,7 +41,7 @@ impl Site {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".twosync")).unwrap();
-        common::pin_engine_in_config(&root);
+        common::pin_engine_in_config(root);
         let mut reg = Registry::default();
         for (rel, body) in files {
             let p = work(root, rel);

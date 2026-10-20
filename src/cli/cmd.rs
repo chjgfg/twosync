@@ -378,10 +378,45 @@ pub enum Cmd {
         cmd: PeerCmd,
     },
 
+    /// M4 第二层的第一条：**给某个 commit 起一个不会自己动的名字**
+    ///
+    /// 为什么先做它而不是 `branch`：机制完全相同（§9.2 的 `H|p|name\0hash`，本项目一个 ref
+    /// 本来就指向一个**集合**），但 tag 的语义更窄——它不跟着 `commit` 走，所以不会与
+    /// "head 集合"那套 union/熔断逻辑抢方向盘。而 §9.3 保留集里那句"显式 `pinned`"
+    /// 靠的就是这个：**`gc` 的保留集从全部 ref 出发**（`build::all_ref_heads(_, None)`），
+    /// 挂上 tag 的那个 commit 即使已经不在 `main` 的可达闭包里，也不许被回收。
+    Tag {
+        #[command(subcommand)]
+        cmd: TagCmd,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 ── pull / sync
-    // ── M4 ── branch / tag / reset / revert / stash / cherry-pick / blame / bisect
+    // ── M4 ── branch / reset / revert / stash / cherry-pick / blame / bisect（tag 已落）
+}
+
+/// `tag` 的三个动作。名字里不许用 `main`/`head`，也不许长得像 commit hash 前缀 ——
+/// 理由见 [`crate::store::history::rev_base`] 的解析顺序。
+#[derive(Subcommand, Clone)]
+pub enum TagCmd {
+    /// 列出全部 tag：名字、指向哪个 commit、那一刻的时间与说明
+    List,
+    /// 打一个 tag。省略 `--at` = 当前项目 `main` 的那一个 head
+    ///
+    /// **多 head 时 `--at` 是必填的**：这时"当前"有两个以上的东西，替人挑一个就是猜。
+    Add {
+        /// tag 名字
+        name: String,
+        /// 打在哪个 rev 上：commit hash 前缀、`HEAD~2`、或另一个 tag
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// 删掉一个 tag。**删掉之后它就不再把那个 commit 从 `gc` 手里保下来**（§9.3）
+    Rm {
+        /// 要删的 tag 名字
+        name: String,
+    },
 }
 
 /// 首次导入的两枚旋钮（§14 Q11）。它们**不改变历史内容**，只改变落盘的等待方式与速率，

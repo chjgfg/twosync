@@ -367,12 +367,20 @@ fn rev_base(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<Hash>> {
     if rev.eq_ignore_ascii_case("head") || rev == build::MAIN {
         return build::ref_heads(db, pid, build::MAIN);
     }
+    // **命名引用（tag/branch）排在 hex 前缀之前**。理由不是好看：一个 8 个字符的 tag 名
+    // 完全可以同时是合法的 hash 前缀，顺序反了就会出现"人写的是名字、系统按前缀猜到了别的
+    // commit"。这种歧义不许靠解析顺序解决，所以 `tag add` 那一侧直接拒绝长得像 hash 前缀的
+    // 名字（`cli::m4::check_tag_name`），两边合起来才是"不猜"。
+    let named = build::ref_heads(db, pid, rev)?;
+    if !named.is_empty() {
+        return Ok(named);
+    }
     let bytes = match hex_prefix(rev) {
         Some(b) => b,
         None => {
             return Err(Error::Codec(format!(
-                "rev {rev:?} 看不懂：既不是 HEAD/{}，也不是十六进制 commit 前缀（可接 `~N`）",
-                build::MAIN
+                "rev {rev:?} 看不懂：既不是 HEAD/{m}，也不是已知的 tag，也不是十六进制 commit 前缀（可接 `~N`）",
+                m = build::MAIN
             )));
         }
     };

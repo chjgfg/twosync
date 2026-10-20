@@ -1486,6 +1486,35 @@ pub fn all_ref_heads(db: &dyn KvEngine, pid: ProjectId, r: Option<&str>) -> Resu
     Ok(out)
 }
 
+/// 每个 **ref 名字**各自指向哪些 commit（`tag list`/`branch list` 用；`main` 也在里面）。
+///
+/// 为什么不复用 `all_ref_heads(None)`：那一条把所有 ref 的 commit 并成一个集合（GC 只要"总共要
+/// 保哪些"），而这里要的恰恰是**谁挂在哪个名字上**——并起来就把"这个 tag 还在不在"这个问题
+/// 答成了"某个 commit 还可达吗"。键的形状同 [`all_ref_heads`]，只多切一次名字。
+pub fn all_named_refs(db: &dyn KvEngine, pid: ProjectId) -> Result<BTreeMap<String, Vec<Hash>>> {
+    let prefix = keys::project_prefix(keys::TAG_HEAD, pid);
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let mut out: BTreeMap<String, Vec<Hash>> = BTreeMap::new();
+    for row in &rows {
+        // 尾巴 = `名|0x00|hash`。名字里不许有 `0x00`（§9.2），所以**从后往前**取：末 32 B 是 hash，
+        // 它前面那一字节必须是分隔符，剩下的才是名字。
+        let tail = &row.key[prefix.len()..];
+        if tail.len() < 34 || tail[tail.len() - 33] != 0x00 {
+            continue;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&tail[tail.len() - 32..]);
+        let name = String::from_utf8_lossy(&tail[..tail.len() - 33]).into_owned();
+        let set = out.entry(name).or_default();
+        if !set.contains(&h) {
+            set.push(h);
+        }
+    }
+    Ok(out)
+}
+
 /// 把 ref 设成给定集合：先删旧行再写新行，同一事务。
 pub fn set_ref(db: &dyn KvEngine, pid: ProjectId, r: &str, to: &[Hash]) -> Result<()> {
     let old = ref_heads(db, pid, r)?;
