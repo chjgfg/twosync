@@ -341,6 +341,71 @@ pub(crate) fn resolve_project(cli: &Cli) -> Result<(String, PathBuf)> {
     Ok((project.name.clone(), root))
 }
 
+/// 按**名字**取项目的注册根目录。
+///
+/// 为什么不复用 `resolve_project`：那一条读的是全局 `--project`（或"当前项目"），
+/// 而会话那两条命令的项目名来自**命令自己的** `--project` 参数 —— 两个来源混用会出现
+/// "`push --project b` 把 a 的改动也提交掉"这种事故。
+pub(crate) fn project_root(cli: &Cli, name: &str) -> Result<PathBuf> {
+    let reg = Registry::load(&cli.root)?;
+    let p = reg
+        .projects
+        .get(name)
+        .ok_or_else(|| Error::Registry(format!("没有项目 {name}")))?;
+    let root = cli.root.join(&p.path);
+    if !root.is_dir() {
+        return Err(Error::Registry(format!(
+            "项目目录不存在：{}",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// §7.2 的第一半：**会话开头先把本地改动定稿**，于是一整场交换的都是进过历史的状态，
+/// "工作树脏不脏"这件事不参与合并判定（那正是 LWW 唯一还能藏身的地方）。
+///
+/// 只做"已扫描、未提交"的那一半，**不在会话开头偷偷 `scan`**：那会给一次 `push` 加上全量扫描
+/// 的代价（12 GiB 站点上 14–68 s），而"现在看一眼盘"应该是人或 `daemon` 明确发起的动作。
+/// 所以这里读的始终是上一次 `scan` 的快照 —— 人要是改了没扫，这一场就照旧不带那些改动，
+/// 这正是"不静默"的意思：`plan` 报出来的那一条才是本场会话的边界。
+///
+/// 自动提交撞上 FR-10 熔断时**让错误往上抛**（会话中止）：那条闸保护的是"别把误删变成合法历史"，
+/// 它不该因为发起方是程序就被绕过去。
+///
+/// # 被拨进来的那一侧（`agent`）为什么不做
+///
+/// `agent` 是**别人 ssh 过来起的进程**，它在会话里只该干"收东西、按闸判"这一件事。让它顺手把
+/// 本站点的本地改动提交成一个版本，等于"远程的一条命令在我机器上写了历史"——那条历史会带我的
+/// peer id 和时间戳，事后没人能解释它为什么存在。所以这里的规矩是：**谁发起会话，谁先把自己定稿**；
+/// 被叫起来的那一侧要定稿就自己 `scan` + `commit`（`daemon` 常驻的那端本来就在做）。
+/// 对端没收干净的风险不靠这个兜：它靠 §9.5.3 的配对与 `HeadsState` 里报出来的 head 集合。
+pub fn autocommit_for_session(
+    cli: &Cli,
+    name: &str,
+    root: &std::path::Path,
+    allow_mass_delete: bool,
+) -> Result<()> {
+    let db = cli.store()?;
+    let p = build::plan(&*db, keys::project_id(name))?;
+    let n = p.changes.add + p.changes.modify + p.changes.delete + p.changes.rename;
+    if n == 0 {
+        return Ok(());
+    }
+    println!(
+        "会话开头  = 本地有 {n} 处已扫描未提交的改动 ⇒ 先自动 commit（§7.2：会话只交换进过历史的状态）"
+    );
+    commit_project(
+        cli,
+        name,
+        root,
+        Some("会话开头自动提交（§7.2）"),
+        allow_mass_delete,
+        Import::default(),
+    )?;
+    Ok(())
+}
+
 pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
@@ -422,8 +487,32 @@ pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<
 /// 提交的是上一次扫描看见的状态。中间文件又变了的话会撞 `StaleScan`，不会静默用新内容。
 pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Import) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
+    commit_project(
+        cli,
+        &name,
+        &root,
+        msg,
+        allow_mass_delete,
+        import,
+    )?;
+    Ok(())
+}
+
+/// `commit` 的**正文**：把上一次 `scan` 的快照固化成版本，并把全套读数打出来。
+///
+/// 为什么要从命令里剥出来：§7.2 要求"会话开头先自动 commit 本地改动"，而那条路的项目名来自
+/// 命令自己的 `--project`（不是全局那一个）。共用这一份 ⇒ 自动提交看到的账与人敲的完全一样，
+/// 不会出现"自动那次少打了一格，出事时没人知道"。返回 `Some(hash)` = 真的产生了一个版本。
+pub fn commit_project(
+    cli: &Cli,
+    name: &str,
+    root: &std::path::Path,
+    msg: Option<&str>,
+    allow_mass_delete: bool,
+    import: Import,
+) -> Result<Option<keys::Hash>> {
     let db = cli.store()?;
-    let pid = keys::project_id(&name);
+    let pid = keys::project_id(name);
     // 块仓是**站点级**的一份（挂在 `--root` 下），不是每项目一份：跨项目去重靠这个。
     let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
         .with_fsync(!import.fast)
@@ -435,7 +524,7 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
         &*db,
         pid,
         &store,
-        &root,
+        root,
         build::Meta {
             peer: PEER_LOCAL,
             msg: msg.unwrap_or("（未填写说明）"),
@@ -444,10 +533,12 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
         },
     )?;
     let peak = wm.peak_growth();
+    // 产生的那个版本（`None` = 无改动）。下面要打印、末尾要交回去，先取出来一次。
+    let made = b.commit;
 
     println!("project     = {name}  (id={pid:#010x})");
     println!("root        = {}", root.display());
-    match b.commit {
+    match made {
         Some(h) => println!("commit      = {}", keys::hex(&h)),
         None => println!("commit      = （无改动：不产生空提交，head 不动）"),
     }
@@ -508,7 +599,7 @@ pub fn commit(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool, import: Imp
     // 与 scan 同一把尺：融合遍历之后内存只跟**单个目录**挂钩，所以这里的峰值应当在
     // 「最大单层目录 × 深度」这一档，与文件总数无关。打印是为了让那次权衡可核对。
     println!("peak heap   = {:.1} MiB", peak as f64 / 1048576.0);
-    Ok(())
+    Ok(made)
 }
 
 /// `log`：从 head 集合出发按时间倒序列出 commit。

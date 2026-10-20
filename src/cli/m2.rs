@@ -234,6 +234,9 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                     max_recv_mib: 0.0,
                     max_mbps,
                     allow_mass_delete,
+                    // 一轮里 `scan` → `commit` 已经走在前面，那就是 §7.2 要的那次定稿；
+                    // 再查一遍 `plan` 是白问（12 GiB 站点上每次 3.9 s / 6 折）。
+                    just_committed: true,
                 },
             ) {
                 Ok(()) => pulled = true,
@@ -258,6 +261,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                     max_send_mib: 0.0,
                     max_mbps,
                     allow_mass_delete,
+                    just_committed: true,
                 },
             ) {
                 Ok(()) => {

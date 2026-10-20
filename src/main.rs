@@ -77,6 +77,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 max_send_mib: *max_send_mib,
                 max_mbps: *max_mbps,
                 allow_mass_delete: *allow_mass_delete,
+                just_committed: false,
             },
         ),
         Cmd::Pull {
@@ -97,6 +98,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 max_recv_mib: *max_recv_mib,
                 max_mbps: *max_mbps,
                 allow_mass_delete: *allow_mass_delete,
+                just_committed: false,
             },
         ),
         Cmd::Daemon {

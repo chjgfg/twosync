@@ -147,6 +147,7 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
         max_send_mib,
         max_mbps,
         allow_mass_delete,
+        just_committed,
     } = *a;
     // 会话耗时从"起 ssh"开始算（FR-16 那一格要的是"上次会话花了多久"，拨号时间也是它的代价）。
     let started = Instant::now();
@@ -166,14 +167,20 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
             bps as f64 / 1048576.0
         );
     }
+    let remote_root = paired_root(cli, &name, remote_root)?;
+    // §7.2：**会话开头先把本地改动定稿**，一整场交换的都是进过历史的状态。
+    // 顺序有两条：放在**配对检查之后**（一条连"送到哪儿"都没问清楚的命令不该先动我们的库），
+    // 放在**读 head 之前**（刚定稿的那一个必须在这场会话里被推出去）。
+    // 被拨进来的那一侧（`agent`）不做这件事，理由写在 `m0::autocommit_for_session` 的文档里。
+    if !just_committed {
+        m0::autocommit_for_session(cli, &name, &m0::project_root(cli, &name)?, allow_mass_delete)?;
+    }
     let heads = build::ref_heads(&*db, pid, build::MAIN)?;
     if heads.is_empty() {
         return Err(Error::BadInput(format!(
             "项目 {name:?} 还没有任何 head：先 scan + commit 再推"
         )));
     }
-
-    let remote_root = paired_root(cli, &name, remote_root)?;
     // 远端命令整体交给对端的 shell 解析，所以路径自己带引号。
     let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
     let child = Command::new("ssh")
@@ -287,6 +294,7 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
         max_recv_mib,
         max_mbps,
         allow_mass_delete,
+        just_committed,
     } = *a;
     let started = Instant::now();
     let (name, _) = match project {
@@ -306,6 +314,12 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
     }
 
     let remote_root = paired_root(cli, &name, remote_root)?;
+    // §7.2 同 `push`（顺序的两条理由也在那边）：拉之前先把自己定稿，否则本地那些
+    // "已扫描未提交"的改动会在 union 之后与新进来的 head 挤在同一个工作树上，
+    // 而 `checkout` 那侧只能整体拒绝多 head。
+    if !just_committed {
+        m0::autocommit_for_session(cli, &name, &m0::project_root(cli, &name)?, allow_mass_delete)?;
+    }
     let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
     let child = Command::new("ssh")
         .arg(peer)

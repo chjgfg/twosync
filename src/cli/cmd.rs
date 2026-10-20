@@ -198,6 +198,10 @@ pub enum Cmd {
     /// 把这个项目推给一个对端（M1）。传输 = `ssh <peer> "<远端 twosync> agent"`：
     /// 不开新端口、复用系统 sshd（§9.5），本端只把它的 stdin/stdout 当一根双向管。
     /// 单向推送：**只让历史过去，不动对端的工作树**（那是 M3 的 `pull`/检出）。
+    ///
+    /// **会先动本地一次**：§7.2 要求会话开头把"已扫描但没提交"的改动定稿，所以这条命令
+    /// 可能自己产生一个 commit（消息写着"会话开头自动提交"）。顺序是配对检查之后、读 head 之前——
+    /// 没配对的那一次一个字节都不写。盘上改了但**没 `scan`** 的东西不会被它偷偷提交。
     Push {
         /// 对端标识，直接交给 ssh：`[user@]host[:port]`（端口要用 `-p` 就写进 `~/.ssh/config`）
         peer: String,
@@ -232,6 +236,9 @@ pub enum Cmd {
     /// 只是本端站到了**收**的那一侧。为什么要有这条：新机器/重装过的站点**还没有任何 head**，
     /// 那时"两边各 push 一次"里有一边根本推不动，而取回历史恰恰是它最需要做的事。
     /// 配额在这里换了声明的人：`--max-recv-mib` 是本端愿意被灌多少，交给对面按它自我了断。
+    ///
+    /// 与 `push` 同一条 §7.2：开头先把本地"已扫描未提交"的改动定稿（理由是要 union 之前
+    /// 两边都只在历史层说话，否则本地那半改动会和新进来的 head 挤在同一个工作树上）。
     Pull {
         /// 对端标识，直接交给 ssh：`[user@]host[:port]`
         peer: String,
@@ -413,6 +420,10 @@ pub struct PushArgs<'a> {
     /// FR-15 的桶，MiB/s；0 = 不限速
     pub max_mbps: f64,
     pub allow_mass_delete: bool,
+    /// §7.2 的"会话开头自动提交"要不要跳过。**只有 `daemon` 给 `true`**：它一轮里本来就是
+    /// `scan` → `commit` → pull → push，那次 commit 就是要定稿的东西，再查一遍 `plan` 是白问
+    /// （12 GiB 站点上 3.9 s / 6 折 × 两次 = 一轮多 13 % 的开销）。命令行那两条一律 `false`。
+    pub just_committed: bool,
 }
 
 /// `m1::pull` 要带的旋钮。形状与 [`PushArgs`] 一对一，只有配额那一格换了方向：
@@ -428,6 +439,8 @@ pub struct PullArgs<'a> {
     pub max_recv_mib: f64,
     pub max_mbps: f64,
     pub allow_mass_delete: bool,
+    /// 与 [`PushArgs::just_committed`] 同一件事，两个方向都得有：`daemon` 已经提交过就不再查。
+    pub just_committed: bool,
 }
 
 /// `m2::daemon` 要带的旋钮。理由与 [`PushArgs`] 同一条，另外这里还有一层：

@@ -265,3 +265,148 @@ fn gc_charges_the_bucket_only_when_it_actually_vacuums() {
         "vacuum 过桶是**折算**（207 B/行 × 扫过的行数），至少要有一笔：{charged}"
     );
 }
+
+// ── §7.2：会话开头先把本地定稿 ────────────────────────────────
+
+/// `head` 集合（命令层那两条会话函数会读它，所以它是"定稿了没有"的读数）。
+fn heads(site: &Site) -> Vec<keys::Hash> {
+    let db = open_store(&site.root(), EngineKind::LsmTree).unwrap();
+    let h = build::ref_heads(&*db, keys::project_id("p"), build::MAIN).unwrap();
+    drop(db);
+    h
+}
+
+/// §7.2 的那一句"会话开头先自动 commit 本地改动（于是工作树必然 clean）"。
+///
+/// 这里调的是 `m0::autocommit_for_session` —— `push`/`pull` 在拨号之前调的就是这一个函数。
+/// 真 `push` 需要 ssh（§14 留到最后那条），所以"什么时候提交"由这一条钉，
+/// "在哪一步之前提交"由代码里那句顺序钉（定稿在 `Command::new("ssh")` 之前，写死在函数体里）。
+#[test]
+fn a_session_starts_by_committing_what_was_scanned_but_never_committed() {
+    let site = Site::new(&[("a.txt", b"one"), ("d/b.txt", b"two")]);
+    site.scan();
+    assert!(heads(&site).is_empty(), "台架前提：扫过但一次都没提交");
+
+    let root = site.root().join("p");
+    let cli = site.cli();
+    m0::autocommit_for_session(&cli, "p", &root, false).unwrap();
+    // `Cli` 缓存着句柄（587d6ce），而库里是**文件锁** ⇒ 想再开一次同一份库必须先把它放下。
+    drop(cli);
+    assert_eq!(
+        heads(&site).len(),
+        1,
+        "会话开头必须把已扫描的改动定稿，否则这场会话推的是上一次的历史"
+    );
+
+    // 第二次：已经没有未提交改动 ⇒ 不许再产生一个空版本（与 `commit` 同一条判据）。
+    let cli = site.cli();
+    m0::autocommit_for_session(&cli, "p", &root, false).unwrap();
+    drop(cli);
+    assert_eq!(heads(&site).len(), 1, "干净的工作树不该被会话开头造出一个空提交");
+}
+
+/// **它不会替你 `scan`**。改了盘上的东西而没扫 ⇒ 这一轮定稿里没有它（`autocommit` 读的是
+/// 上一次扫描的快照），而且这种情况**不打扰**：一行都不许多，也不报错。
+///
+/// 这一条钉的是边界："会话开头自动提交"不是"会话开头自动看一眼盘"。后者要给一次 `push`
+/// 加上全量扫描的代价（12 GiB 站点 14–68 s），而"现在看盘"应该是人或 `daemon` 明确发起的。
+#[test]
+fn the_session_gate_does_not_invent_a_scan() {
+    let site = Site::new(&[("a.txt", b"one")]);
+    site.scan();
+    let root = site.root().join("p");
+    let cli = site.cli();
+    m0::autocommit_for_session(&cli, "p", &root, false).unwrap();
+    drop(cli);
+    let after_first = heads(&site).len();
+
+    // 盘上多了一个文件，但**没有 scan** ⇒ 计划里看不见它 ⇒ 会话开头什么都不做。
+    fs::write(root.join("late.txt"), b"nobody scanned me").unwrap();
+    let cli = site.cli();
+    m0::autocommit_for_session(&cli, "p", &root, false).unwrap();
+    drop(cli);
+    assert_eq!(
+        heads(&site).len(),
+        after_first,
+        "没扫过的改动不该被会话开头偷偷提交"
+    );
+}
+
+/// 熔断不因"发起方是程序"而绕过去：自动提交撞上 FR-10 就**把错误抛回去**（会话中止），
+/// head 一步不动。这条是 §7.2 与 FR-10 的接缝上最容易偷偷放行的一格。
+#[test]
+fn the_session_gate_does_not_bypass_the_mass_delete_fuse() {
+    let many: Vec<(String, Vec<u8>)> = (0..40)
+        .map(|i| (format!("f{i}.txt"), format!("body {i}").into_bytes()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = many
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    let site = Site::new(&refs);
+    site.scan();
+    let root = site.root().join("p");
+    let cli = site.cli();
+    m0::autocommit_for_session(&cli, "p", &root, false).unwrap();
+    drop(cli);
+    let before = heads(&site).len();
+
+    for (p, _) in many.iter().take(30) {
+        fs::remove_file(root.join(p)).unwrap();
+    }
+    site.scan();
+
+    let cli = site.cli();
+    let e = m0::autocommit_for_session(&cli, "p", &root, false)
+        .expect_err("一次删掉 30/40 条必须被 FR-10 挡住，即使发起方是会话开头");
+    drop(cli);
+    assert!(
+        e.to_string().contains("删除熔断"),
+        "要报的是熔断而不是别的：{e}"
+    );
+    assert_eq!(
+        heads(&site).len(),
+        before,
+        "被熔断的那一次不许留下半个版本（`--allow-mass-delete` 是人的决定，不是程序的默认值）"
+    );
+}
+
+/// 顺序的证据：**配对没过的命令不许先动我们的库**。
+///
+/// 定稿最初写在 `push` 的第一行，于是"往一个没配对的项目上 push"也会留下一个提交——
+/// 命令失败了，仓库却变了。§9.5.3 那道闸的意义就是"没确认过就什么都不做"，
+/// 它必须在任何写动作**之前**。这条用例钉的就是那句顺序，而不是那句文档。
+#[test]
+fn a_push_rejected_by_pairing_commits_nothing() {
+    use twosync::cli::cmd::PushArgs;
+    use twosync::cli::m1;
+
+    let site = Site::new(&[("a.txt", b"one"), ("d/b.txt", b"two")]);
+    site.scan();
+    assert!(heads(&site).is_empty(), "台架前提：扫过但没提交");
+
+    let cli = site.cli();
+    let e = m1::push(
+        &cli,
+        &PushArgs {
+            peer: "unpaired-peer",
+            agent_bin: "twosync",
+            remote_root: None,
+            project: Some("p"),
+            max_send_mib: 0.0,
+            max_mbps: 0.0,
+            allow_mass_delete: false,
+            just_committed: false,
+        },
+    )
+    .expect_err("没配对就该拒（也不该走到 ssh 那一步）");
+    drop(cli);
+    assert!(
+        e.to_string().contains("还没配对"),
+        "报的该是配对那一闸：{e}"
+    );
+    assert!(
+        heads(&site).is_empty(),
+        "被拒的 push 不许先把本地改动提交掉：失败要透明，仓库不能已经变了"
+    );
+}
