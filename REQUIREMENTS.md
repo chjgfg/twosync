@@ -88,7 +88,7 @@ Win10 上配好"哪些项目要同步"，Ubuntu 那端接手同一个项目、�
 | FR-5 | **块级增量**：推之前做 `want/have` 块清单协商，只传对端缺失的块；**对象（`B`/`T`）也走差集**——拿亲代当基线，同名同 hash 的子树整块跳过（2026-10-18 补，§17 补记廿三：原来只有块有协商，清单每次全重发）；默认定长 4 MiB，CDC 列为 M4 增强 | 改 10 GB 文件中的 1 MB → 传输量 ≤ 若干 MB，**与 git 的传输量对比写进 README**。实测三臂在 §11.3（同形状修前 7.04 MiB / 修后 4.07 MiB；跨块最坏 8.07 MiB，口径见 §14 Q15） |
 | FR-6 | 海量小文件批量打包（**一条 SSH 连接多路复用 N 个 project + 批帧**），不把 RTT 打爆 | 1 万个 4 KB 文件的初次推送耗时可解释 |
 | FR-7 | `plan` 输出本次会提交什么 + union 判定结果 + 会碰撞的路径，**默认不执行**；`apply` 才执行 | 任何破坏性动作都有 dry-run 前置 |
-| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测 |
+| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测。**落地状态（2026-10-20）**：第一层除 `install`/`sync` 那类尚未定义的以外都在（外加 `daemon`/`peer`/`project`/`mv`/`ls-files`/`version`）；第二层**第一条 `tag` 已落**（`e3e860f`，五条用例 + 命令行实测，它就是 §9.3 那句"显式 `pinned`"的实现），其余七条未动 |
 | FR-9 | **有界历史**：CAS 配额默认 ≤ root 体积 20%（**站点级全局配额**，非每项目），超出时按"最老且不可达优先 / 同 commit 整批淘汰"回收，**不得**删掉仍被保留 head 可达的块。淘汰顺序与保留意图（版本数 N / 天数 D）可配 | §10 不变量 (d) |
 | FR-10 | **删除熔断**：commit 的删除条目数 > max(已知条目的 20%, **20 条**) 或删除字节 > 2 GB → 拒绝该 commit 进 head 集合、退出码非 0，需 `--allow-mass-delete`。理由是防客户端 bug 把误 `rm -rf` 变成合法历史，不是防并发。**绝对下限是本版加的**：纯 20% 在小项目上不可用（2 个文件删 1 个就是 50%，那个仓库从此提不了交），而熔断要拦的是规模不是比例。本地 `commit` 与接收侧**都过这道闸** | 清空本地 root 后 sync，对端不动并报警；100 条里删 30 条 → 本地 commit 也拒 |
 | FR-11 | **多 head 与碰撞处理**（§7）：默认 union；出路 = `--take-local` / `--take-remote` / `--keep-both`（仅无碰撞时结构合并）/ 交给 git | 表格逐行有单测 |
@@ -265,7 +265,7 @@ v0.1 那张 16 行"相对 base 动作为 A/B"的裁决表**整张作废**（它�
 | `K` | `K\|p\|block_hash` | 块元数据：size, chunk_param, refcnt, last_access_ts, pinned | `want/have` 反查、去重统计 |
 | `k` | `k\|p\|refcnt_be\|block_hash` | 空（存在即索引） | **按 refcnt 排序的二级索引**：GC 找 0 是 `prefix_scan(k\|p\|\x00…)`，不是全表扫。**实现偏差见 §9.3**（dry-run 要报"将要归零几个"，所以 `gc` 改扫全部 `K` 行；索引照常维护） |
 | `W` | `W\|p\|path`（**目录行的 `path` 尾带一个 `/`**） | worktree 状态：kind, blob_hash, size, mtime_hint_ns, mode, symlink_target, scanned_at | 脏判定；大小写唯一性检查；**`scanned_at` 兼任"本轮看见过"的存活性标记**（见 §8 与 §17 补记）。目录为什么要多一个斜杠：**`W` 的键序就是字节序，而 `'/'`(0x2F) 夹在 `.`(0x2E) 与 `0`(0x30) 之间** ⇒ 目录行若叫 `src`，它会被兄弟 `src.rs` 与子项 `src/main.rs` 隔开，流式建树的栈就必须在"这一层还没走完"时提前结算 ⇒ 同一个目录两条条目（§17 补记十五的真 bug）。键成 `src/` 之后"目录自己 + 它全部子项"共享前缀 ⇒ 天然连续。读出来时由 `LiveRows` 剥掉那个斜杠，**路径形状对下游一字不变** |
-| `H` | `H\|p\|ref_name\|commit_hash` | 空（存在即 head）。**原设计的 `is_head` 标记已废弃**：head 身份已经在键里，值再存一份就是两个真值 | head 集合 = `prefix_scan(H\|p\|main\|\x00)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因） |
+| `H` | `H\|p\|ref_name\|commit_hash` | 空（存在即 head）。**原设计的 `is_head` 标记已废弃**：head 身份已经在键里，值再存一份就是两个真值 | head 集合 = `prefix_scan(H\|p\|main\|\x00)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因）。**2026-10-20 起别的名字也活了**：`tag` 往同一张表写 `H|p|<tag名>\0hash`（§9.3 的 pin 就是这个），`history::rev_base` 解析时**命名引用排在 hash 前缀之前** ⇒ `tag add` 那一侧必须拒绝长得像 hash 前缀的名字（`^[0-9a-f]{7,}$`）与保留名 `main`/`head`，否则"谁先查谁赢"就成了人看不见的裁决 |
 | `A` | `A\|p\|path_folded` | canonical path | **不落地（2026-10-17 决定）**：它本来是 §8 大小写唯一映射的索引，但写一行 `A` = 每行多一次引擎调用，而 0.4.0 上**每次调用都要折一遍全库**（§9.6.1）⇒ 比"检出前按层预检"贵一个数量级，后者一次只握着一层的清单（本来就在手里）。折叠比较改在 `checkout`/导出 前跑（`checkout::check_case_collisions` + `history::walk_levels`）；`TAG_FOLDED`/`folded_key` 作为格式位保留，`keys::fold_path` 是**唯一一份**折叠规则 |
 | `S` | `S\|p\|session_id_be` | 会话统计（**2026-10-20 落地**，`store::sessions::SessionRecord`）：方向、块/字节、跳过、耗时、两边的 head 集合、验收的那个 commit。会话 id = 开始时刻的**纳秒**，所以键序就是时间序 | `status`。**为什么必须存而不是当场算**：那三格（耗时、传输字节、当时的对端 head）是**历史事实**不是当前状态 —— 头两样只有发起方知道，第三样会话一结束就取不到了。读侧对坏账是**跳过而不是报错**（`status` 是"看一眼"的命令，不该被一行坏账卡死） |
 | `P` | `P\|peer_id`（无 project 前缀，站点级） | TOFU 指纹 + 拨号偏好 | §9.5 |
@@ -279,6 +279,15 @@ v0.1 那张 16 行"相对 base 动作为 A/B"的裁决表**整张作废**（它�
 ### 9.3 GC 与保留（配额的可实现路径）
 
 保留集 = **所有 head commit 的可达闭包** ∪ 按 FR-9 策略选出的更老 commit（天数 D / 版本数 N）∪ 显式 `pinned`。淘汰 = 删除整批 commit 的清单行 → `refcnt--`（**用 `KvTxn::decr`，不许 read-modify-write**，那是两个事务、中间崩了就漏减）→ 从 `k` 索引取 `refcnt==0` → 落 pending-delete 列表 → 异步 `unlink`（**不许在 decrement 现场内联删除**，否则 kill 在中间会让清单引用已消失的块）。删除动作全程挂 FR-15 令牌桶。共享 CAS 意味着 refcnt 跨 project：`project remove` 只能 decrement，不能假设块属于它。
+
+> **`pinned` 这一项的实现（2026-10-20，`e3e860f`）**：就是**一个挂着的 ref**。`gc` 的保留集从来都从
+> `build::all_ref_heads(db, pid, None)` 出发（不是只看 `main`），所以 `twosync tag add <名字> --at <rev>`
+> 之后，那个 commit 即使已经不在任何 head 的可达闭包里，也不许被回收；`tag rm` 之后它才可能被当垃圾。
+> 用例 `a_tagged_commit_survives_gc_after_main_moves_to_an_unrelated_version` 钉的就是这两步——
+> **台架必须把 `main` 挪到一个与它没有亲代关系的新根**，否则那位老 commit 还在 head 的闭包里，
+> `commits_kept` 再大也证明不了 tag 起过作用（我第一版就错在这里）。
+> `K` 元数据里那个 `pinned` 位是**块级**的另一件事（"这一块不许因为配额被淘汰"），与 ref 级 pin
+> 不是同一个开关，将来实现配额淘汰（FR-9 剩下那半）时别混用。
 
 **落地状态（2026-10-18，`store::gc` + `gc --sweep [--apply] [--unlink-max-files N] [--max-mbps X] [--quota-mib M]`，§17 补记十九、廿一）**：
 - 保留集取的是**全部 ref**（`build::all_ref_heads(db, pid, None)`），不是只看 `main`——M4 有 branch/tag 之后
@@ -535,8 +544,8 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    >
    > | 跑法 | 结果 |
    > |---|---|
-   > | `cargo test`（默认 `lsm_tree`） | **219 passed / 0 failed** |
-   > | `TWOSYNC_TEST_ENGINE=bplus_tree cargo test` | **219 passed / 0 failed** |
+   > | `cargo test`（默认 `lsm_tree`） | **219 passed / 0 failed**（加上 `tag` 那批之后现在是 224） |
+   > | `TWOSYNC_TEST_ENGINE=bplus_tree cargo test` | **219 passed / 0 failed**（同上，224） |
    > | `TWOSYNC_TEST_ENGINE=bitcask / memory` | 各站点在 FR-21 那句"未通过启动自检，缺口：…"上就红了（**这是预期**） |
    >
    > 三个文件**故意不接这个开关**：`engine_smoke.rs` / `engine_envelope.rs` / `utils_metrics.rs` ——
@@ -564,7 +573,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    > **O(目录数)**。同时"一折 ≈ 1.4 s"的单价也标错过（那是 `health()` 的元数据遍），
    > 同一次会话两读给出 **release ≈ 0.5 s/折、debug ≈ 4 s/折**。计数读数已经做出来了，本节就是它的第一张表。（而不是继续拿 ±2× 的墙钟猜），再决定批量装载谁** |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证）。**现状（2026-10-20）**：§7 表**前四行都有单测**了（"我该拉/该推/已同步/多 head 是正常态"走 `pull`+`push` 用例，`pull_then_pull_converges_two_independently_committed_sites` 就是 union 那一行）；**第五行 collision 的检测与报账已落**（`6ee9e3e`，判据写在 §7.1）——"必须停而非猜"的程序侧是 `one_commit` 那道闸。**还欠**：`--take-local/--take-remote` 的旗标糖（实质等价于 `checkout --at <head>`，已有）、`--keep-both` 的多亲合并（整个没做，属 M4）、~~§7.2 的 deferred 列表在 `status` 里的可见性~~（**`d0df7c3` 已做**，四个动作逐条见 §7.2 落地状态）、以及跨机器真 SSH 下的多 head 实测 |
-| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**219 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。CDC/第二层命令/稀疏重建/批传输调优全部未动 |
+| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**224 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。**第二层命令的第一条已落**：`tag`（`e3e860f`）——§9.3 那句"显式 `pinned`"第一次有地方落，机制就是"一个挂着的 ref"，实现与台架陷阱见 §9.3 落地块。CDC/稀疏重建/批传输调优，以及 branch/reset/revert/stash/cherry-pick/blame/bisect 未动 |
 | **M5 多端（暂不承诺）** | 真 3+ peer：部分连通路由、NAT 穿透或自建中继、commit 签名 | 需先重开范围评审；**不在 v1 交付路径上** |
 
 M0–M1 **不需要**回答 §14 任何问题就能开工。
@@ -2440,6 +2449,42 @@ ref 可达，删它的块就违反不变量 (d)；GC 是全站唯一一个"写�
 **顺手记一条对己不利的**：首建库那一格 **git 赢**（`.git` 83.2 MiB vs 我们 561.1 MiB），因为它 zlib 压了
 6.7 倍而我们按设计不压。表里原样留着，不藏——它同时解释了为什么"增量 17.9 倍"那个数还是**下界**：
 连偏袒对手的语料形状下我们都赢，满熵那一把（压缩比 1.00）里 git 的增量 = 整个文件。
+
+### v0.4 补记三十八（2026-10-20，`tag`：一条"绿得没有区分度"的断言，和两次老坑的第三次）
+
+`e3e860f`。M4 第二层开了第一条，收获主要在**怎么证明它有用**上。
+
+**① 第一版的 pin 用例是绿的，但那一格没有任何区分度。** 我想证"tag 保住了 v1"，写的是
+"提交 v1 → 提交 v2 → 把 `main` 设成 v2 → sweep ⇒ `commits_kept == 2`"。
+可 **v2 本来就是 v1 的孩子**，v1 在 head 的可达闭包里，**一条 tag 都没参与也能保住它**。
+正确的台架是：把 head 挪到一个与 v1 **没有亲代关系的新根**（先 `set_ref(main, &[])` 再提交一次 ⇒
+那个新 commit 没有亲代），这时闭包里只剩它自己，v1 能不能活就只由 tag 决定。
+⇒ 一般化的判据：**要证 X 起作用，断言那一格必须落在"没有 X 就不成立"的一侧**。
+写用例时顺手问一句"把 X 摘掉，这条会红吗"——不会红就说明它什么都没说。
+（这条与补记三十三②、三十四②是同一族的坑，第三次。）
+
+**② 命名引用排在 hash 前缀之前，于是解析顺序本身变成了裁决 ⇒ 只能在上游把歧义禁掉。**
+`history::rev_base` 现在先查 ref 名、再按 hash 前缀查。这个顺序必须有，否则一个 8 个字符的 tag 名
+会被当成 hash 前缀去解，"人写的是名字、系统猜到了别的 commit"。而顺序一旦决定结果，
+就不是"写清楚注释"能救的 ⇒ `tag add` 那一侧直接拒绝 `^[0-9a-f]{7,}$` 这种名字，也拒绝保留名
+`main`/`head`。**把裁决显式化**这件事在本项目已经是第三次同一形状（§8 大小写门、FR-10 熔断、
+这次的歧义名）：凡是"两种解释都可能对"的输入，宁可拒了，不许挑。
+
+**③ `WouldBlock` 第三次咬测试台架，这次给的是定式而不是就地 `drop`。** 用例的 `Site` 自己持着句柄，
+`tag()` 走命令层 ⇒ `Cli::store()` 去开第二个句柄 ⇒ 库级文件锁挡下。
+定式：**`Site.db` 用 `Arc<dyn KvEngine>`，并且 `Cli` 建好之后把同一个 Arc 预填进 `store_slot`**。
+`Cli::store()` 命中缓存就一次库都不开——这本来就是 `587d6ce` 那个缓存的设计意图，
+测试里用它比绕开它诚实。
+
+**④ 两个"故意不做"：** 多 head 时省略 `--at` **必须报错**（§7 第四行说多 head 是正常状态，
+"正常"就意味着这里没有默认的那一个）；`tag add` 同名换位置**不做 `--force`**
+——pin 的全部意义就是"不会被人一敲就松开"，要挪就得 `tag rm` + `tag add` 两步，留下两个动作的痕迹。
+
+命令行实测（debug 构建、临时站点）：`tag add first-release --at 9bc0523a` → `tag list` 列出它 →
+`checkout --at first-release --apply` 打印 `目标 = 9bc0523a… (first-release)` 并把 `a.txt` 落回 `one` →
+`tag add first-release --at c3ab8357` 被拒（`已经指着别的东西`）。
+
+测试 **224 passed / 0 failed**（本轮 +5，两引擎都跑过），`cargo clippy --all-targets` 干净。
 
 ### v0.4 补记三十七（2026-10-20，把开关装进台架：10 条红里 9 条是我的假设，外加一次 fmt 越界）
 
