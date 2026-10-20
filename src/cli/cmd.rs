@@ -390,6 +390,27 @@ pub enum Cmd {
         cmd: TagCmd,
     },
 
+    /// M4 第二层的第二条：把 head 集合**挪**到一个 commit，`--apply` 时顺手把工作树落成那个样子
+    ///
+    /// 与 `checkout --at` 的分别是唯一的一条：那个不动 head，这一个专动 head。
+    /// §7.1"人选一边"那条出路缺的就是它 —— `checkout` 只能选检出目标，多 head 照样留着，
+    /// 于是下一次 `commit` 还是得在两个 head 之间挑。
+    ///
+    /// **危险那一格必须自己说出来**：被挪走的 head 如果没有别的 ref（`tag`）挂着，
+    /// `gc --sweep` 就把那段历史当垃圾收走（不可达 = 可删，§9.3）。所以命令会列出被丢的 hash
+    /// 并提示先 `tag add <名字> --at <hash>`。顺序也是为此：**head 集合是最后一步**（FR-13），
+    /// 检出先做完，再把 ref 挪过去。
+    Reset {
+        /// 挪到哪个 rev：commit hash 前缀、一个 tag、或 `HEAD~2` 那种写法
+        rev: String,
+        /// 真的执行。省略时只打印要做什么（FR-7：不带 `--apply` 只许读）
+        #[arg(long)]
+        apply: bool,
+        /// 本端越过 FR-10 删除熔断（工作树要删很多东西时由人明确表态）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 ── pull / sync

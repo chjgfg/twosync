@@ -765,7 +765,7 @@ fn print_entry(e: &object::TreeEntry) {
 /// 多 head 在这里**报错而不是取第一个**：取第一个 = 静默挑一个版本给用户看/写回工作树，
 /// 而 union 与 collision 判定是 M3 的活。宁可在 M3 之前拒绝服务，也不做一个"看起来成功、
 /// 内容却是随机一条链"的恢复。
-fn one_commit(heads: Vec<Hash>, rev: &str) -> Result<Hash> {
+pub(crate) fn one_commit(heads: Vec<Hash>, rev: &str) -> Result<Hash> {
     match heads.as_slice() {
         [one] => Ok(*one),
         [] => Err(Error::MissingObject {

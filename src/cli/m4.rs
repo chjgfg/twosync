@@ -16,7 +16,8 @@ use std::format;
 use crate::cli::cmd::TagCmd;
 use crate::cli::{m0, Cli};
 use crate::error::{Error, Result};
-use crate::store::{build, history, keys, object};
+use crate::store::{build, cas, checkout, history, keys, object};
+use crate::utils::objects_dir;
 
 pub fn tag(cli: &Cli, cmd: &TagCmd) -> Result<()> {
     let (name, _) = m0::resolve_project(cli)?;
@@ -27,6 +28,94 @@ pub fn tag(cli: &Cli, cmd: &TagCmd) -> Result<()> {
         TagCmd::Add { name: t, at } => add(&*db, pid, &name, t, at.as_deref()),
         TagCmd::Rm { name: t } => rm(&*db, pid, &name, t),
     }
+}
+
+/// `reset`：把 head 集合挪到一个 commit，`--apply` 时把工作树落成那个样子。
+///
+/// **顺序是这条命令的全部设计**：先做检出、最后才挪 ref。FR-13 写的就是
+/// "head 集合更新是最后一步"——反过来做，检出被 FR-10 熔断挡下的那一次就会留下
+/// "head 已经挪了、工作树还是旧的、而报出来像失败"的中间态；现在这个顺序下失败意味着
+/// **什么都没动**，人可以直接改参数重跑。
+pub fn reset(cli: &Cli, rev: &str, apply: bool, allow_mass_delete: bool) -> Result<()> {
+    let (project, root) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    // 与 `checkout`/`restore` 同一道闸：多解就报错，不许挑第一个。
+    let target = m0::one_commit(history::resolve_rev(&*db, pid, rev)?, rev)?;
+    // 证它真在库里。挪一个指不到的 commit = 把整个项目的历史起点弄丢。
+    let commit = object::read_commit(&*db, pid, &target)?;
+    let old = build::ref_heads(&*db, pid, build::MAIN)?;
+    let lost: Vec<String> = old
+        .iter()
+        .filter(|h| **h != target)
+        .map(|h| keys::short(h).to_string())
+        .collect();
+
+    println!("project   = {project}  (id={pid:#010x})");
+    println!("工作树    = {}", root.display());
+    println!(
+        "现在      = {} 个 head：{}",
+        old.len(),
+        if old.is_empty() {
+            "（一个都没有）".to_string()
+        } else {
+            old.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+        }
+    );
+    println!(
+        "挪到      = {}  ({})  {}  {}",
+        keys::hex(&target),
+        rev,
+        history::fmt_ts(commit.ts),
+        commit.msg
+    );
+    if !lost.is_empty() {
+        println!("被丢的 head = {} 个：{}", lost.len(), lost.join(" "));
+        println!(
+            "危险      = 它们要是没有别的 ref 挂着，下一次 `gc --sweep --apply` 就可以把那段历史\
+             当垃圾收走（§9.3：不可达 = 可删）。要保住就先 `tag add <名字> --at <hash>`。"
+        );
+    }
+    if !apply {
+        println!("模式      = 只报（FR-7）。加 --apply 才会动 head 与工作树，这一趟一个字没改");
+        return Ok(());
+    }
+
+    // 先落地（含 §7.3 逐文件门与 FR-10 熔断），成功后才挪 ref。
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let rep = checkout::checkout(
+        &*db,
+        pid,
+        &store,
+        &root,
+        &target,
+        None,
+        checkout::Opts {
+            apply: true,
+            allow_mass_delete,
+        },
+    )?;
+    build::set_ref(&*db, pid, build::MAIN, &[target])?;
+    println!(
+        "动作      = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}{}",
+        rep.create,
+        rep.mkdir,
+        rep.overwrite,
+        rep.delete,
+        rep.rmdir,
+        rep.skipped,
+        if rep.deferred > 0 {
+            format!(" / deferred 不动 {}", rep.deferred)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "head      = 已挪到 {}（现在 {} 个 head）",
+        keys::short(&target),
+        build::ref_heads(&*db, pid, build::MAIN)?.len()
+    );
+    Ok(())
 }
 
 /// `tag list`：每个名字一行，带它指向的 commit、那一刻的时间与说明。

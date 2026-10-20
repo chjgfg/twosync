@@ -144,6 +144,11 @@ fn dispatch(cli: &Cli) -> Result<()> {
         ),
         Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
+        Cmd::Reset {
+            rev,
+            apply,
+            allow_mass_delete,
+        } => m4::reset(cli, rev, *apply, *allow_mass_delete),
         Cmd::Log { max_count } => m0::log(cli, *max_count),
         Cmd::Show { rev, path } => m0::show(cli, rev, path.as_deref()),
         Cmd::Restore {
