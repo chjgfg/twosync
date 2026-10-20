@@ -24,9 +24,11 @@
 //! 跑法：`cargo test --test plan_mem_prop -- --test-threads=1`（两个用例都要量堆，
 //! 并行会互相抬峰值——锁已经加了，`--test-threads=1` 只是双保险）。
 
+mod common;
+
 use std::fs;
 
-use storage_engines::{EngineKind, KvEngine};
+use storage_engines::KvEngine;
 use twosync::allocstats;
 use twosync::store::build;
 use twosync::store::cas::Cas;
@@ -59,7 +61,7 @@ struct Site {
 impl Site {
     fn new() -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        let db = open_store(tmp.path(), common::engine()).expect("open_store");
         Site {
             db,
             pid: keys::project_id("p"),

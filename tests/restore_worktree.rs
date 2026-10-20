@@ -17,10 +17,12 @@
 //! cat /tmp/back.txt                                      # 必须是 v1
 //! ```
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage_engines::{EngineKind, KvEngine};
+use storage_engines::KvEngine;
 use twosync::error::Error;
 use twosync::store::cas::Cas;
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
@@ -40,7 +42,7 @@ struct Site {
 impl Site {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let db = open_store(tmp.path(), EngineKind::LsmTree).unwrap();
+        let db = open_store(tmp.path(), common::engine()).unwrap();
         let pid = keys::project_id("p");
         Self { db, pid, tmp }
     }

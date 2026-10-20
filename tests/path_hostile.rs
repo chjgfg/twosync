@@ -16,10 +16,11 @@
 //! $TS --root /tmp/tsf checkout --at HEAD --to /tmp/tsf/lab/inside   # 该拒：目标在工作树里
 //! ```
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage_engines::EngineKind;
 use twosync::error::Error;
 use twosync::store::build::{self, Meta};
 use twosync::store::cas::{self, Cas};
@@ -78,7 +79,7 @@ struct Site {
 impl Site {
     fn new(files: &[(&str, &[u8])]) -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let db = open_store(tmp.path(), EngineKind::LsmTree).unwrap();
+        let db = open_store(tmp.path(), common::engine()).unwrap();
         let pid = keys::project_id("p");
         for (rel, body) in files {
             let p = Self::at(tmp.path(), rel);

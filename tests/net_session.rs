@@ -12,6 +12,8 @@
 //! 3. **大删除的 commit 被对端拒**，并且拒绝的是那一个 commit（M1 验收格）；
 //! 4. 缺一个块就不许动 head（不变量 (b)：head 指向取不回来的版本 = 假历史）。
 
+mod common;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -19,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use storage_engines::EngineKind;
 use twosync::cli::m1;
 use twosync::error::{Error, Result as TsResult};
 use twosync::net::frame::{self, Proto, PROTO_VER};
@@ -103,7 +104,8 @@ struct Site {
 impl Site {
     fn open() -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        common::pin_engine_in_config(tmp.path());
+        let db = open_store(tmp.path(), common::engine()).expect("open_store");
         Site {
             db,
             pid: keys::project_id(PROJECT),
@@ -118,7 +120,7 @@ impl Site {
     /// `fn counts()`（那等于为了让一把尺子去污染四个引擎的实现）。
     fn metered(meter: &twosync::utils::Meter) -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let inner = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        let inner = open_store(tmp.path(), common::engine()).expect("open_store");
         Site {
             db: twosync::utils::counted(inner, meter, false),
             pid: keys::project_id(PROJECT),
@@ -714,6 +716,7 @@ fn push_over_a_real_child_process_and_pipes() {
     assert!(sent >= 3, "3 个文件至少 3 个块：{sent}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
+    common::pin_engine_in_config(b_tmp.path());
     register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
     let mut io = agent_child(EXE, b_tmp.path(), PROJECT);
 
@@ -725,7 +728,7 @@ fn push_over_a_real_child_process_and_pipes() {
     assert_eq!(rep.accepted, vec![head], "发起方拿到的 head 就是推过去的那个");
 
     // 子进程已经退出 ⇒ 现在才允许自己开对端那份库
-    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("开对端的库");
+    let b_db = open_store(b_tmp.path(), common::engine()).expect("开对端的库");
     let pid = keys::project_id(PROJECT);
     assert_eq!(
         build::ref_heads(&*b_db, pid, MAIN).expect("对端 head"),
@@ -780,6 +783,7 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
     assert_eq!(blocks.len(), 3, "3 个文件各 1 块：{blocks:?}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
+    common::pin_engine_in_config(b_tmp.path());
     register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
     // 这一条**不能用 `agent_child`**：它要自己捏着子进程的 stdin/stdout 手工驱动协议，
     // 好在"只写完两块"的那一刻把进程杀掉。
@@ -858,7 +862,7 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
     drop(r);
 
     let pid = keys::project_id(PROJECT);
-    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("对端的库必须还开得起来");
+    let b_db = open_store(b_tmp.path(), common::engine()).expect("对端的库必须还开得起来");
     assert!(
         build::ref_heads(&*b_db, pid, MAIN)
             .expect("读 head")
@@ -910,7 +914,11 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
         "重开一个崩过的站点必须起得来，stderr = {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(rep.contains("engine      = lsm_tree"), "读数缺行：{rep}");
+    // 这一格里必须是**这一批实际选中的引擎**。以前它写死 `lsm_tree`，于是
+    // `TWOSYNC_TEST_ENGINE=bplus_tree` 那一跑红在这里：doctor 报得完全正确（报的就是
+    // `bplus_tree`），红的是台架自己的假设——崩后恢复那三条在 bplus 上都是过的。
+    let want_engine = format!("engine      = {}", common::engine());
+    assert!(rep.contains(&want_engine), "读数缺行（要的是 {want_engine}）：{rep}");
     // `active_txns` 是**新句柄**的账，本来就归 0 ⇒ 这一格证明的是"WAL 恢复之后库能干净重开"，
     // 不是"崩掉的那个进程没留残留事务"（后者在同进程里根本观测不到，别把它读成已验证）。
     assert!(rep.contains("active_txns = 0"), "重开之后不该看得见活跃事务：{rep}");
@@ -942,7 +950,7 @@ fn a_peer_killed_mid_session_leaves_no_half_applied_history() {
         rep.blocks_skipped
     );
 
-    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("再开一次对端的库");
+    let b_db = open_store(b_tmp.path(), common::engine()).expect("再开一次对端的库");
     assert_eq!(
         build::ref_heads(&*b_db, pid, MAIN).expect("读 head"),
         vec![head],
@@ -1015,6 +1023,7 @@ fn objects_that_land_without_verify_are_gc_garbage() {
     assert_eq!(blocks.len(), 3, "一份清单一块：{blocks:?}");
 
     let b_tmp = tempfile::tempdir().expect("对端站点");
+    common::pin_engine_in_config(b_tmp.path());
     register(EXE, b_tmp.path(), PROJECT, "D:/peer-site-root");
     let mut child = Command::new(EXE)
         .args([
@@ -1113,7 +1122,7 @@ fn objects_that_land_without_verify_are_gc_garbage() {
     );
 
     let pid = keys::project_id(PROJECT);
-    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("崩过的库要能重开");
+    let b_db = open_store(b_tmp.path(), common::engine()).expect("崩过的库要能重开");
     let cas = Cas::new(&objects_dir(b_tmp.path()), cas::DEFAULT_BLOCK).expect("对端 CAS");
     assert!(
         build::ref_heads(&*b_db, pid, MAIN)
@@ -1163,7 +1172,7 @@ fn objects_that_land_without_verify_are_gc_garbage() {
     let rep = session::push(&mut io, a_db, &a.cas(), &opts(PROJECT)).expect("GC 之后的一次完整 push");
     io.finish().expect("agent 该正常收尾");
     assert_eq!(rep.blocks_sent, 3, "块被 GC 删掉了 ⇒ 这次得重发：{rep:?}");
-    let b_db = open_store(b_tmp.path(), EngineKind::LsmTree).expect("再开一次");
+    let b_db = open_store(b_tmp.path(), common::engine()).expect("再开一次");
     assert_eq!(
         build::ref_heads(&*b_db, pid, MAIN).expect("读 head"),
         vec![head],
@@ -1192,6 +1201,7 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
     a.commit(&refs, 1);
 
     let b1 = tempfile::tempdir().expect("对端站点一");
+    common::pin_engine_in_config(b1.path());
     register(EXE, b1.path(), PROJECT, "D:/peer-site-root");
     let o = PushOpts {
         peer_name: b"peer-b",
@@ -1221,6 +1231,7 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
 
     // ③ **换个站点、同一个对端名字** ⇒ 拒。这就是 TOFU 与"信任一切"的差别。
     let b2 = tempfile::tempdir().expect("对端站点二");
+    common::pin_engine_in_config(b2.path());
     register(EXE, b2.path(), PROJECT, "D:/peer-site-root");
     let mut io = agent_child(EXE, b2.path(), PROJECT);
     let err = session::push(&mut io, &*a.db, &a.cas(), &o)
@@ -1229,7 +1240,7 @@ fn tofu_records_the_first_peer_and_refuses_a_changed_identity() {
     io.finish().expect("拒了也要把子进程收干净");
 
     // 拒的那一侧一个字都没落：会话在 `BeginSession` 之前就断了
-    let b2_db = open_store(b2.path(), EngineKind::LsmTree).expect("开 b2");
+    let b2_db = open_store(b2.path(), common::engine()).expect("开 b2");
     assert!(
         build::ref_heads(&*b2_db, keys::project_id(PROJECT), MAIN)
             .expect("读 head")
@@ -1275,7 +1286,7 @@ fn transfer_bytes_for_the_table() {
     // 正斜杠：Windows 的路径 API 认它，而写在字符串里不用转义（反斜杠在 Rust 源码里得写两遍）。
     let a = PathBuf::from(std::env::var("TS_DT_A").unwrap_or_else(|_| "D:/ts10g/dt/a".into()));
     let b = PathBuf::from(std::env::var("TS_DT_B").unwrap_or_else(|_| "D:/ts10g/dt/b".into()));
-    let db = open_store(&a, EngineKind::LsmTree).expect("开 a 的库");
+    let db = open_store(&a, common::engine()).expect("开 a 的库");
     let pid = keys::project_id(PROJECT_DT);
     let cas_a = Cas::new(&objects_dir(&a), cas::DEFAULT_BLOCK).expect("a 的 CAS");
 
@@ -1354,6 +1365,7 @@ fn the_agent_refuses_a_registered_but_unpaired_project() {
     a.commit(&refs, 1);
 
     let b = tempfile::tempdir().expect("对端站点");
+    common::pin_engine_in_config(b.path());
     add_project(EXE, b.path(), PROJECT); // 只注册，不 pair
     let mut io = agent_child(EXE, b.path(), PROJECT);
     let err = session::push(&mut io, &*a.db, &a.cas(), &opts(PROJECT))
@@ -1371,7 +1383,7 @@ fn the_agent_refuses_a_registered_but_unpaired_project() {
         "项目级拒绝要让发起端看见非零收尾：{done:?}"
     );
 
-    let b_db = open_store(b.path(), EngineKind::LsmTree).expect("开对端的库");
+    let b_db = open_store(b.path(), common::engine()).expect("开对端的库");
     assert!(
         build::ref_heads(&*b_db, keys::project_id(PROJECT), MAIN)
             .expect("读 head")
@@ -1403,7 +1415,7 @@ fn the_agent_refuses_a_registered_but_unpaired_project() {
         .expect("配对之后同一份历史就该收下");
     io.finish().expect("agent 收尾");
     assert!(rep.bytes_sent > 0, "这一把是真的传了东西");
-    let b_db = open_store(b.path(), EngineKind::LsmTree).expect("再开对端的库");
+    let b_db = open_store(b.path(), common::engine()).expect("再开对端的库");
     assert_eq!(
         build::all_ref_heads(&*b_db, keys::project_id(PROJECT), None).expect("读 head"),
         a.heads(),
@@ -1494,7 +1506,7 @@ fn incremental_transfer_at_ten_gib() {
 
     let pid = keys::project_id(&name);
     let t_start = std::time::Instant::now();
-    let db = open_store(&a, EngineKind::LsmTree).expect("开本端的库");
+    let db = open_store(&a, common::engine()).expect("开本端的库");
     let cas_a = Cas::new(&objects_dir(&a), cas::DEFAULT_BLOCK).expect("本端 CAS");
     let a_heads = build::all_ref_heads(&*db, pid, None).expect("本端 head");
     assert!(!a_heads.is_empty(), "本端没有 head ⇒ 这一格没得测");
@@ -1503,7 +1515,7 @@ fn incremental_transfer_at_ten_gib() {
     let t_heads = t_start.elapsed().as_secs_f64();
     let blocks_before = count_blocks(&objects_dir(&b));
     let t_count0 = t_start.elapsed().as_secs_f64();
-    let b_db0 = open_store(&b, EngineKind::LsmTree).expect("开对端的库");
+    let b_db0 = open_store(&b, common::engine()).expect("开对端的库");
     let b_heads_before = build::all_ref_heads(&*b_db0, pid, None).expect("对端 head");
     drop(b_db0);
     let t_setup = t_start.elapsed().as_secs_f64();
@@ -1579,7 +1591,7 @@ fn incremental_transfer_at_ten_gib() {
         blocks_before + rep.blocks_sent,
         "对端的块数应该正好长出这么多"
     );
-    let b_db = open_store(&b, EngineKind::LsmTree).expect("推完再开对端的库");
+    let b_db = open_store(&b, common::engine()).expect("推完再开对端的库");
     let b_heads = build::all_ref_heads(&*b_db, pid, None).expect("对端 head");
     assert_ne!(b_heads, b_heads_before, "对端 head 必须前移");
     assert_eq!(b_heads, a_heads, "两边 head 应该追平");
@@ -1977,6 +1989,7 @@ fn pulling_from_a_site_with_nothing_to_send_is_refused_with_a_reason() {
 #[test]
 fn pull_over_a_real_child_process_and_pipes() {
     let peer_tmp = tempfile::tempdir().expect("对面站点");
+    common::pin_engine_in_config(peer_tmp.path());
     register(EXE, peer_tmp.path(), PROJECT, "D:/peer-site-root");
     // 对面的内容用**真命令**造（scan + commit）：这份历史不是我们手搓的对象，
     // 才是"从一个装了 twosync 的站点把历史拉回来"。
@@ -2035,7 +2048,7 @@ fn pull_over_a_real_child_process_and_pipes() {
 
     // 对面（服务端）那侧的会话账必须也落下来：它是"这一侧看到的那一面"的唯一记录点，
     // 而记账走的是 `m1::agent` 里那一行 —— 只有跨进程才验得到（内存管子里没有 agent 进程）。
-    let p_db = open_store(peer_tmp.path(), EngineKind::LsmTree).expect("再开一次对面的库");
+    let p_db = open_store(peer_tmp.path(), common::engine()).expect("再开一次对面的库");
     let logged = twosync::store::sessions::last(&*p_db, keys::project_id(PROJECT))
         .expect("读会话账")
         .expect("agent 那侧必须写下一条 S 行");

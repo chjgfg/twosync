@@ -5,7 +5,6 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use storage_engines::EngineKind;
 use twosync::allocstats;
 use twosync::store::keys;
 use twosync::store::worktree;
@@ -24,7 +23,7 @@ fn scan_hashes_then_skips_unchanged() {
     fs::create_dir_all(&proj).unwrap();
     seed(&proj, 30);
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
 
     let first = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
@@ -48,7 +47,7 @@ fn scan_peak_heap_stays_constant_regardless_of_file_size() {
     fs::write(proj.join("big.bin"), vec![7u8; 32 << 20]).unwrap();
     seed(&proj, 200);
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let wm = allocstats::watermark();
     let rep = worktree::scan(&*db, keys::project_id("p"), &proj, false, 50).unwrap();
     let peak = wm.peak_growth();
@@ -71,7 +70,7 @@ fn steady_state_scan_rehashes_nothing() {
     fs::create_dir_all(&many).unwrap();
     seed(&many, 1500);
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     let first = worktree::scan(&*db, pid, &proj, false, 500).unwrap();
     assert!(first.hashed > 1500);
@@ -95,7 +94,7 @@ fn scan_never_records_forced_excludes() {
     fs::write(proj.join(".twosync/index"), b"junk").unwrap();
     fs::write(proj.join("keep.txt"), b"real").unwrap();
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     let rep = worktree::scan(&*db, pid, &proj, false, 10).unwrap();
     assert_eq!(rep.walked, 1, "只有 keep.txt 该被走");
@@ -310,7 +309,7 @@ fn suspect_list_is_capped_and_says_so() {
 fn no_scan_mark_means_no_reconciliation() {
     let (_t, proj) = site();
     fs::write(proj.join("a.txt"), "a").unwrap();
-    let db = open_store(proj.parent().unwrap(), EngineKind::LsmTree).unwrap();
+    let db = open_store(proj.parent().unwrap(), common::engine()).unwrap();
     let pid = keys::project_id("never");
     assert!(
         worktree::last_mark(&*db, pid).is_none(),
@@ -338,7 +337,7 @@ fn a_narrow_round_does_not_move_the_liveness_line() {
     let proj = site.path().join("p");
     fs::create_dir_all(&proj).unwrap();
     seed_two_dirs(&proj);
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
 
     let full = worktree::scan(&*db, pid, &proj, false, 8).unwrap();
@@ -373,7 +372,7 @@ fn narrow_scan_paths_stay_project_relative() {
     let proj = site.path().join("p");
     fs::create_dir_all(&proj).unwrap();
     seed_two_dirs(&proj);
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     worktree::scan(&*db, pid, &proj, false, 8).unwrap();
     let before = db.health().total_rows;
@@ -405,7 +404,7 @@ fn a_narrow_scan_of_a_missing_directory_is_an_error_not_a_no_op() {
     let proj = site.path().join("p");
     fs::create_dir_all(&proj).unwrap();
     seed_two_dirs(&proj);
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     let e = worktree::scan_scoped(
         &*db,
@@ -430,7 +429,7 @@ fn a_scan_charges_the_bucket_and_the_engine_agrees_on_the_byte_count() {
     let proj = site.path().join("p");
     fs::create_dir_all(&proj).unwrap();
     seed(&proj, 30);
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
 
     // 1 GiB/s：账照扣，睡的那点时间可以忽略（用例不掐墙钟，§15.22 的规矩）。
@@ -506,7 +505,7 @@ fn a_deferred_path_is_listed_and_clears_itself_next_full_round() {
     let tricky = data.join("f0.txt");
     fs::write(&tricky, b"the first version").unwrap();
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     worktree::scan(&*db, pid, &proj, false, 8).unwrap();
 
@@ -558,7 +557,7 @@ fn a_narrow_round_never_clears_someone_elses_deferred_row() {
     fs::write(proj.join("a/x.bin"), b"x").unwrap();
     fs::write(proj.join("b/y.bin"), b"y").unwrap();
 
-    let db = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let db = open_store(site.path(), common::engine()).unwrap();
     let pid = keys::project_id("p");
     worktree::scan(&*db, pid, &proj, false, 8).unwrap();
     fs::write(proj.join("a/x.bin"), b"x changed while nobody could read it").unwrap();
@@ -599,7 +598,7 @@ fn reading_the_deferred_list_costs_exactly_one_fold() {
 
     let meter = twosync::utils::Meter::default();
     let engine = twosync::utils::counted(
-        open_store(site.path(), EngineKind::LsmTree).unwrap(),
+        open_store(site.path(), common::engine()).unwrap(),
         &meter,
         false,
     );

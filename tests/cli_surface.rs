@@ -5,10 +5,11 @@
 //! 2. `apply` 与 `commit` 是同一份实现，不是第二套提交流水；
 //! 3. `version` 报的是**生效值 + 来源**——"没写"与"写了默认值"只看文件分不出来。
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 
-use storage_engines::EngineKind;
 use twosync::cli::{Cli, Import};
 use twosync::cli::m0;
 use twosync::store::build;
@@ -24,6 +25,7 @@ impl Site {
     fn new(files: &[(&str, &[u8])]) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join(".twosync")).unwrap();
+        common::pin_engine_in_config(tmp.path());
         for (rel, body) in files {
             let p = tmp
                 .path()
@@ -55,7 +57,7 @@ impl Site {
     }
 
     fn scan(&self) {
-        let db = open_store(&self.root(), EngineKind::LsmTree).unwrap();
+        let db = open_store(&self.root(), common::engine()).unwrap();
         worktree::scan(
             &*db,
             keys::project_id("p"),
@@ -67,7 +69,7 @@ impl Site {
     }
 
     fn rows(&self) -> u64 {
-        let db = open_store(&self.root(), EngineKind::LsmTree).unwrap();
+        let db = open_store(&self.root(), common::engine()).unwrap();
         db.health().total_rows
     }
 }
@@ -88,7 +90,7 @@ fn plan_reads_everything_and_writes_nothing() {
         after > before,
         "apply 之后库里必须多出行：{before} → {after}"
     );
-    let db = open_store(&site.root(), EngineKind::LsmTree).unwrap();
+    let db = open_store(&site.root(), common::engine()).unwrap();
     assert_eq!(
         build::ref_heads(&*db, keys::project_id("p"), build::MAIN)
             .unwrap()
@@ -118,7 +120,7 @@ fn version_reports_effective_values_with_their_source() {
     let site = Site::new(&[("a.txt", b"x")]);
     // 没写过配置文件 ⇒ 来源必须是"内置默认"，而不是空白 —— 那正是 `config get` 同款判据。
     m0::version(&site.cli()).expect("version 不许去开引擎（NFR-8：它得便宜）");
-    let db = open_store(&site.root(), EngineKind::LsmTree).unwrap();
+    let db = open_store(&site.root(), common::engine()).unwrap();
     assert_eq!(db.health().total_rows, 0, "version 不该碰库");
 }
 
@@ -174,7 +176,7 @@ fn gc_without_apply_writes_nothing() {
     m0::commit(&site.cli(), Some("第二次"), false, Import::default()).unwrap();
 
     let before = site.rows();
-    let h = open_store(&site.root(), EngineKind::LsmTree)
+    let h = open_store(&site.root(), common::engine())
         .unwrap()
         .health();
     assert!(
@@ -270,7 +272,7 @@ fn gc_charges_the_bucket_only_when_it_actually_vacuums() {
 
 /// `head` 集合（命令层那两条会话函数会读它，所以它是"定稿了没有"的读数）。
 fn heads(site: &Site) -> Vec<keys::Hash> {
-    let db = open_store(&site.root(), EngineKind::LsmTree).unwrap();
+    let db = open_store(&site.root(), common::engine()).unwrap();
     let h = build::ref_heads(&*db, keys::project_id("p"), build::MAIN).unwrap();
     drop(db);
     h

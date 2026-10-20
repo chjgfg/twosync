@@ -4,7 +4,8 @@
 //! 哪天有人改了字段顺序、排序规则或编码库，老库里的 tree hash 会全体对不上，
 //! 而所有单元测试仍然会绿（两边一起变）——只有这个钉子会红。
 
-use storage_engines::EngineKind;
+mod common;
+
 use twosync::error::Error;
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
 use twosync::store::object::{
@@ -27,7 +28,7 @@ fn entry(name: &str, kind: Kind, seed: u8, size: u64, mode: u32) -> TreeEntry {
 
 fn db() -> (tempfile::TempDir, Box<dyn storage_engines::KvEngine>) {
     let site = tempfile::tempdir().unwrap();
-    let engine = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let engine = open_store(site.path(), common::engine()).unwrap();
     (site, engine)
 }
 

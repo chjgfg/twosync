@@ -23,10 +23,11 @@
 //! 文件 A = P（一块），文件 B = P ++ Q（两块，第一块与 A 相同）⇒ `K` 行里 P 的 refcnt = 2。
 //! 默认 4 MiB 的块要造这个得写 8 MiB 语料，用例不该那么贵。
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage_engines::EngineKind;
 use twosync::store::build::{self, Meta};
 use twosync::store::cas::Cas;
 use twosync::store::gc;
@@ -48,7 +49,7 @@ struct Site {
 impl Site {
     fn open() -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        let db = open_store(tmp.path(), common::engine()).expect("open_store");
         Site {
             db,
             pid: keys::project_id(PROJECT),
@@ -489,7 +490,7 @@ fn the_pending_table_survives_a_reopen() {
 
     // 上一条命令退出（释放库锁），下一条命令起来：表必须还认。
     let tmp = Site::release(site);
-    let db2 = open_store(tmp.path(), EngineKind::LsmTree).expect("重开库");
+    let db2 = open_store(tmp.path(), common::engine()).expect("重开库");
     assert_eq!(
         gc::pending_total(&*db2, pid).expect("新句柄读表").0,
         1,

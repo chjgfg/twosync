@@ -3,7 +3,9 @@
 //! 这批用例只测**账本本身**（写入/取回/坏账容忍/差集口径）。真会话怎么产生这些数，
 //! 在 `tests/net_session.rs` 那边（`push`/`pull` 各写一条），这里不重复起管道。
 
-use storage_engines::{EngineKind, KvEngine};
+mod common;
+
+use storage_engines::KvEngine;
 use twosync::store::keys::{self, Hash, ProjectId};
 use twosync::store::object::{self, Commit, Stats};
 use twosync::store::sessions::{self, Dir, SessionRecord};
@@ -13,7 +15,7 @@ const PID: ProjectId = 21;
 
 fn db() -> (tempfile::TempDir, Box<dyn KvEngine>) {
     let site = tempfile::tempdir().unwrap();
-    let engine = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let engine = open_store(site.path(), common::engine()).unwrap();
     (site, engine)
 }
 

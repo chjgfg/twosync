@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use storage_engines::{EngineKind, KvEngine};
+use storage_engines::KvEngine;
 use twosync::error::Error;
 use twosync::store::build::{self, BlockMeta};
 use twosync::store::cas::{self, Cas};
@@ -34,7 +34,7 @@ struct Site {
 impl Site {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let db = open_store(tmp.path(), EngineKind::LsmTree).unwrap();
+        let db = open_store(tmp.path(), common::engine()).unwrap();
         let pid = keys::project_id("p");
         Self { db, pid, tmp }
     }
@@ -826,7 +826,7 @@ fn plan_at_two_scales(dirs: usize) -> (twosync::utils::CallCounts, build::Manife
     }
     let meter = twosync::utils::Meter::default();
     let db = twosync::utils::counted(
-        open_store(tmp.path(), EngineKind::LsmTree).unwrap(),
+        open_store(tmp.path(), common::engine()).unwrap(),
         &meter,
         false,
     );

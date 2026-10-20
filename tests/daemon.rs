@@ -8,10 +8,11 @@
 //!
 //! 跑法：`cargo test --test daemon`
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage_engines::EngineKind;
 use twosync::cli::cmd::DaemonArgs;
 use twosync::cli::{m2, Cli};
 use twosync::store::{build, cas::Bucket, keys};
@@ -25,6 +26,7 @@ impl Site {
     fn new(files: &[(&str, &[u8])]) -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(tmp.path().join(".twosync")).expect("mkdir .twosync");
+        common::pin_engine_in_config(tmp.path());
         for (rel, body) in files {
             let p = tmp
                 .path()
@@ -53,7 +55,7 @@ impl Site {
         Cli {
             root: self.root(),
             project: Some("p".to_string()),
-            engine: Some(EngineKind::LsmTree),
+            engine: Some(common::engine()),
             io_bucket: bucket,
             store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
@@ -63,7 +65,7 @@ impl Site {
     /// 引擎健康度。开一次、读一次、马上放掉句柄 —— 同一份库的第二个句柄会被库级文件锁挡住
     /// （`Cli` 缓存句柄之后这条更要注意，见 `587d6ce`）。
     fn health(&self) -> storage_engines::MvccHealth {
-        let db = open_store(&self.root(), EngineKind::LsmTree).expect("开库");
+        let db = open_store(&self.root(), common::engine()).expect("开库");
         let h = db.health();
         drop(db);
         h
@@ -82,13 +84,13 @@ impl Site {
     }
 
     fn heads(&self) -> Vec<keys::Hash> {
-        let db = open_store(&self.root(), EngineKind::LsmTree).expect("open");
+        let db = open_store(&self.root(), common::engine()).expect("open");
         build::ref_heads(&*db, keys::project_id("p"), build::MAIN).expect("ref_heads")
     }
 
     /// 从 head 往下走亲代闭包 ⇒ "这个站点一共几个 commit"。
     fn commits(&self) -> usize {
-        let db = open_store(&self.root(), EngineKind::LsmTree).expect("open");
+        let db = open_store(&self.root(), common::engine()).expect("open");
         let pid = keys::project_id("p");
         let heads = build::ref_heads(&*db, pid, build::MAIN).expect("ref_heads");
         twosync::store::history::reachable_strict(&*db, pid, &heads, &[])
@@ -97,7 +99,7 @@ impl Site {
     }
 
     fn parents_of(&self, h: &keys::Hash) -> Vec<keys::Hash> {
-        let db = open_store(&self.root(), EngineKind::LsmTree).expect("open");
+        let db = open_store(&self.root(), common::engine()).expect("open");
         twosync::store::object::parents_of(&*db, keys::project_id("p"), h).expect("parents_of")
     }
 }
@@ -250,7 +252,7 @@ fn zero_intervals_are_clamped_to_one_second() {
         let site_cli = Cli {
             root: root.to_path_buf(),
             project: Some("p".to_string()),
-            engine: Some(EngineKind::LsmTree),
+            engine: Some(common::engine()),
             io_bucket: Bucket::default(),
             store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
@@ -304,7 +306,7 @@ fn a_daemon_round_trims_the_version_chain_that_scans_keep_adding() {
     // 而历史一格没少：三个 commit、head 仍然是单条。
     let pid = keys::project_id("p");
     let heads = {
-        let db = open_store(&site.root(), EngineKind::LsmTree).expect("开库");
+        let db = open_store(&site.root(), common::engine()).expect("开库");
         build::ref_heads(&*db, pid, build::MAIN).expect("head")
     };
     assert_eq!(heads.len(), 1, "回收不许把 head 弄成多条：{heads:?}");

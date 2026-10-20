@@ -6,7 +6,9 @@
 //!
 //! `fmt_ts` 的日历换算放在 `src/store/history.rs` 的单元测试里（那是纯函数，不必起引擎）。
 
-use storage_engines::{EngineKind, KvEngine};
+mod common;
+
+use storage_engines::KvEngine;
 use twosync::error::Error;
 use twosync::store::build;
 use twosync::store::history;
@@ -18,7 +20,7 @@ const PID: ProjectId = 11;
 
 fn db() -> (tempfile::TempDir, Box<dyn KvEngine>) {
     let site = tempfile::tempdir().unwrap();
-    let engine = open_store(site.path(), EngineKind::LsmTree).unwrap();
+    let engine = open_store(site.path(), common::engine()).unwrap();
     (site, engine)
 }
 
@@ -423,7 +425,7 @@ fn ten_gib_manifest_load_cost_is_counted_before_the_batch_loader_ships() {
     }
     let meter = Meter::default();
     let db = counted(
-        open_store(root, EngineKind::LsmTree).expect("open_store"),
+        open_store(root, common::engine()).expect("open_store"),
         &meter,
         false,
     );
@@ -591,7 +593,7 @@ fn a_single_head_costs_the_engine_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let meter = twosync::utils::Meter::default();
     let engine = twosync::utils::counted(
-        open_store(tmp.path(), EngineKind::LsmTree).unwrap(),
+        open_store(tmp.path(), common::engine()).unwrap(),
         &meter,
         false,
     );

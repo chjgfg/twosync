@@ -16,13 +16,14 @@
 //! 跑法：`cargo test --test invariants_proptest`（约 20 s）。用例数在 `Config` 里收到 24：
 //! 每轮都要真建目录、真落块、真开引擎，默认 256 轮会把这组用例变成分钟级。
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
-use storage_engines::EngineKind;
 use twosync::store::build::{self, BlockMeta, MAIN};
 use twosync::store::cas::{Blob, Cas};
 use twosync::store::keys::{self, Hash, Kind, ProjectId};
@@ -237,7 +238,7 @@ struct Site {
 impl Site {
     fn new() -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        let db = open_store(tmp.path(), common::engine()).expect("open_store");
         Site {
             db,
             pid: keys::project_id("p"),

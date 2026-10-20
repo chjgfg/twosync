@@ -18,10 +18,11 @@
 //! $TS --root /tmp/tsm scan && $TS --root /tmp/tsm commit -m 改名
 //! ```
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use storage_engines::EngineKind;
 use twosync::cli::registry::Registry;
 use twosync::cli::{Cli, Cmd};
 use twosync::error::Error;
@@ -40,6 +41,7 @@ impl Site {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".twosync")).unwrap();
+        common::pin_engine_in_config(&root);
         let mut reg = Registry::default();
         for (rel, body) in files {
             let p = work(root, rel);
@@ -79,7 +81,7 @@ impl Site {
     /// 与 `commit()` 同一条路，但**不给** `--allow-mass-delete`：用来测 FR-10 会不会误拦。
     fn commit_gated(&self) -> twosync::error::Result<build::Built> {
         let root = self.root();
-        let db = open_store(&root, EngineKind::LsmTree).unwrap();
+        let db = open_store(&root, common::engine()).unwrap();
         let pid = keys::project_id("p");
         let proj = root.join("p");
         worktree::scan(&*db, pid, &proj, false, 100).unwrap();
@@ -101,7 +103,7 @@ impl Site {
     /// 扫 + 提，返回这次提交的账。
     fn commit(&self) -> build::Built {
         let root = self.root();
-        let db = open_store(&root, EngineKind::LsmTree).unwrap();
+        let db = open_store(&root, common::engine()).unwrap();
         let pid = keys::project_id("p");
         let proj = root.join("p");
         worktree::scan(&*db, pid, &proj, false, 100).unwrap();

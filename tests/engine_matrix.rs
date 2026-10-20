@@ -23,10 +23,12 @@
 //! ```
 //! 后两个应当停在 FR-21 那句"未通过启动自检，缺口：…"上。
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 
-use storage_engines::{EngineKind, KvEngine};
+use storage_engines::KvEngine;
 use twosync::error::Error;
 use twosync::store::build::{self, MAIN};
 use twosync::store::cas::Cas;
@@ -35,18 +37,13 @@ use twosync::store::keys::{self, Hash, ProjectId};
 use twosync::store::{gc, history, object, worktree};
 use twosync::utils::{check_durability_gate, db_dir, dir_size, objects_dir, open_store};
 
-/// 四个引擎一个不漏。名字与 `--engine` 的取值同源，所以将来加引擎时这里漏得看得见。
-const ALL: [&str; 4] = ["lsm_tree", "bplus_tree", "bitcask", "memory"];
 const BLOCK: u64 = 4096;
 
-fn parse(name: &str) -> EngineKind {
-    EngineKind::parse(name).unwrap_or_else(|| panic!("引擎名字不认识：{name}"))
-}
 
 /// 画像不合格的那两种在这里不是失败，是**预期**：先探一次，探不过就整段跳过。
 /// 除此之外的错误（打不开、路径不对）一律照红，不许借"这个引擎不支持"蒙过去。
 fn open_if_admitted(root: &Path, engine: &str) -> Option<Box<dyn KvEngine>> {
-    match open_store(root, parse(engine)) {
+    match open_store(root, common::by_name(engine)) {
         Ok(db) => Some(db),
         Err(e @ Error::DurabilityGate { .. }) => {
             println!("{engine} 过不了 FR-21 那道闸 ⇒ 场景层跳过：{e}");
@@ -68,11 +65,11 @@ fn open_if_admitted(root: &Path, engine: &str) -> Option<Box<dyn KvEngine>> {
 fn only_the_engines_with_a_full_durability_profile_can_be_opened() {
     let mut passed: Vec<String> = Vec::new();
     let mut refused: Vec<(String, String)> = Vec::new();
-    for name in ALL {
+    for name in common::ALL_ENGINES {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir_all(tmp.path().join(".twosync")).unwrap();
         let db = storage_engines::StorageConfig {
-            kind: parse(name),
+            kind: common::by_name(name),
             data_dir: db_dir(tmp.path()),
             engine: storage_engines::EngineConfig::default(),
         }
@@ -120,7 +117,7 @@ fn only_the_engines_with_a_full_durability_profile_can_be_opened() {
 #[test]
 fn one_local_flow_produces_identical_counts_on_every_openable_engine() {
     let mut per_engine: Vec<(String, Counts)> = Vec::new();
-    for name in ALL {
+    for name in common::ALL_ENGINES {
         let Some(c) = flow(name) else { continue };
         println!("场景层 {name} = {c:?}");
         per_engine.push((name.to_string(), c));
