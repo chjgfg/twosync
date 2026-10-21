@@ -448,10 +448,44 @@ pub enum Cmd {
         allow_mass_delete: bool,
     },
 
+    /// M4 第二层第四条：**撤掉一个 commit 带来的改动**（路径级，不是内容级）
+    ///
+    /// 实现上它是一次**结构三方合并**：ours = 当前 head 的树，theirs = 那个 commit 的**亲代**那一版，
+    /// base = 那个 commit 自己的树。于是"撤销"这条语义不需要第二套合并器（判据见 `cli::m4::reapply`）。
+    ///
+    /// 三条闸是从 §7.1 与 FR-13 搬来的，不是新发明的：多 head 时**落点不唯一 ⇒ 拒**；
+    /// 撤销一个合并 commit 要先说撤哪一边 ⇒ **不给 `-m` 这个旋钮，拒**；两边各改过同一个文件 ⇒
+    /// **报冲突、一个字不写**。带 `--apply` 才产生 commit，且顺序是"先检出、最后挪 ref"。
+    Revert {
+        /// 撤哪一个 rev：commit hash 前缀、tag、分支、或 `HEAD~2` 那种写法
+        rev: String,
+        /// 真的执行。省略时只报（FR-7：那一趟连清单行都不写）
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断（撤掉一个"加了两万文件"的 commit 就是两万条删除）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
+    /// M4 第二层第五条：**把另一个 commit 的改动摘到当前 head 上**（与 `revert` 同一把尺，参数换位）
+    ///
+    /// ours = 当前 head，theirs = 那个 commit 的树，base = 它的**亲代**。
+    /// 内容与 `revert` 同：只做路径级结构搬运，同一个文件两边各改 ⇒ 报冲突拒绝。
+    CherryPick {
+        /// 摘哪一个 rev
+        rev: String,
+        /// 真的执行。省略时只报
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 剩下的 ── 跨机器真 SSH 的多 head 实测（三条出路的命令面已落 `merge`）
-    // ── M4 ── revert / stash / cherry-pick / blame / bisect（tag/reset/branch 已落）
+    // ── M4 ── stash / blame / bisect（tag/reset/branch/merge/revert/cherry-pick 已落）
 }
 
 /// `tag` 的三个动作。名字规矩在 `cli::m4::check_ref_name`（与分支共用一道闸：`main`/`head` 是保留名、

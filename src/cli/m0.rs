@@ -960,12 +960,7 @@ pub fn checkout(
             String::new()
         }
     );
-    if r.dirty > 0 {
-        println!(
-            "提醒      = 工作树相对 HEAD 另有 {n} 处未提交改动（`status` 能列出来）。这次只碰上面列出的路径，其余原样留下。",
-            n = r.dirty
-        );
-    }
+    note_checkout_dirty(&r);
     for line in &r.sample {
         println!("  {line}");
     }
@@ -983,6 +978,27 @@ pub fn checkout(
     }
     println!("elapsed   = {:.3} s", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+/// 落盘类命令（`checkout`/`reset`/`revert`/`cherry-pick`）**共用这一句提醒**，所以只有一份实现。
+///
+/// 两件事都在里面，而且第二件是真会被踩到的：检出那侧判断"现在磁盘上有什么"用的是**最近一次
+/// `scan` 的快照**（`W` 表），不是当场 stat 每条路径 —— 那是 O(文件数) 次 `open` 的老账（§11.4e）。
+/// 于是在工具外面删了文件而没 `scan` 时，命令会认为那条路径已经在位，**不会**把她取回来。
+/// 后果不是坏数据，是"以为落到位了而其实没落"，所以这句话必须由命令自己说，不能只写在文档里。
+pub(crate) fn note_checkout_dirty(r: &checkout::Report) {
+    if r.dirty == 0 {
+        return;
+    }
+    println!(
+        "提醒      = 工作树相对 HEAD 另有 {} 处未提交改动（`status` 能列出来）。这次只碰上面列出的路径，\
+         其余原样留下。",
+        r.dirty
+    );
+    println!(
+        "          = 而且\"磁盘上现在有什么\"是按**最近一次 `scan`** 判的：在外面删过/改过的文件要先 `scan` \
+         才会被认出来（否则这条命令看不到她不见了，也就不会重建她）"
+    );
 }
 
 fn kind_word(k: Kind) -> &'static str {

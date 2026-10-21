@@ -145,6 +145,16 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
         Cmd::Branch { cmd } => m4::branch(cli, cmd),
+        Cmd::Revert {
+            rev,
+            apply,
+            allow_mass_delete,
+        } => m4::revert(cli, rev, *apply, *allow_mass_delete),
+        Cmd::CherryPick {
+            rev,
+            apply,
+            allow_mass_delete,
+        } => m4::cherry_pick(cli, rev, *apply, *allow_mass_delete),
         Cmd::Merge {
             keep_both,
             take_local,

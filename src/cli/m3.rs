@@ -129,7 +129,20 @@ pub fn merge(
             )
         }
     );
-    let merged = history::merge_trees(&*db, pid, &c0.tree, &c1.tree, &bases)?;
+    // 只报那一趟连**清单行**都不写（`Emit::Report` 只算 hash）：这句话命令自己当着人说过，
+    // 所以它得有实现而不只是注释（FR-7）。
+    let merged = history::merge_trees(
+        &*db,
+        pid,
+        &c0.tree,
+        &c1.tree,
+        &bases,
+        if apply {
+            history::Emit::Store
+        } else {
+            history::Emit::Report
+        },
+    )?;
     let tree = match merged {
         history::Merge::Conflict { paths } => {
             println!(

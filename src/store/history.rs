@@ -634,6 +634,19 @@ pub fn merge_base_trees(
         .collect()
 }
 
+/// 合并结果要不要**落盘**。
+///
+/// **用枚举不用 `bool`**（同 [`build::Sink`] 那条老规矩）：布尔会一路传到调用链上去，
+/// 谁传反了谁就静默产出"只报那一趟其实写了盘"——而 `merge`/`revert` 命令自己当着人说过
+/// "不带 `--apply` 一个字节都不写"（FR-7）。两个实现各自只有一条路：`Report` 只算 hash
+/// （[`object::tree_hash`] 与落盘用的是同一套规范字节，见 `object_store.rs` 的 `tree_hash_is_canonical`），
+/// `Store` 才 `put_tree`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emit {
+    Report,
+    Store,
+}
+
 /// **结构合并**两棵树的同一层（§1："只做两侧改动路径无交集时的结构合并，不做内容级三方合并"）。
 ///
 /// 逐条五分类，判据与 [`changed_paths`] 用的是同一把尺（"与**任一**共同祖先一模一样"= 没动过）：
@@ -651,6 +664,7 @@ pub fn merge_trees(
     a: &Hash,
     b: &Hash,
     bases: &[Hash],
+    emit: Emit,
 ) -> Result<Merge> {
     let index = object::TreeIndex::load(db, pid)?;
     let mut m = Merger {
@@ -658,6 +672,7 @@ pub fn merge_trees(
         pid,
         index: &index,
         conflicts: Vec::new(),
+        emit,
     };
     let tree = m.level(bases, a, b, "")?;
     if !m.conflicts.is_empty() {
@@ -680,6 +695,7 @@ struct Merger<'a> {
     pid: ProjectId,
     index: &'a object::TreeIndex,
     conflicts: Vec<String>,
+    emit: Emit,
 }
 
 impl Merger<'_> {
@@ -788,7 +804,13 @@ impl Merger<'_> {
         if out.is_empty() {
             return Ok(None);
         }
-        Ok(Some(object::put_tree(self.db, self.pid, &out)?))
+        // `Report` 那一支只算 hash：`tree_hash` 与 `put_tree` 用的是同一套规范字节，
+        // 所以两种模式给出的 hash 必然一致（`revert` 就靠这条一致性先算账、后落盘）。
+        let tree = match self.emit {
+            Emit::Store => object::put_tree(self.db, self.pid, &out)?,
+            Emit::Report => object::tree_hash(&out),
+        };
+        Ok(Some(tree))
     }
 }
 

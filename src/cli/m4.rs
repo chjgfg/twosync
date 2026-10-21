@@ -30,7 +30,7 @@ use crate::cli::cmd::{BranchCmd, TagCmd};
 use crate::cli::{m0, Cli};
 use crate::error::{Error, Result};
 use crate::store::keys::Hash;
-use crate::store::{build, cas, checkout, history, keys, object};
+use crate::store::{build, cas, checkout, history, keys, object, worktree};
 use crate::utils::objects_dir;
 
 pub fn tag(cli: &Cli, cmd: &TagCmd) -> Result<()> {
@@ -138,6 +138,7 @@ pub fn reset(cli: &Cli, rev: &str, apply: bool, allow_mass_delete: bool) -> Resu
             String::new()
         }
     );
+    m0::note_checkout_dirty(&rep);
     println!(
         "head      = 已挪到 {}（现在 {} 个 head）",
         keys::short(&target),
@@ -621,4 +622,270 @@ fn branch_rename(
     println!("注意      = 老名字从此查不到 ⇒ 脚本/别名里写 `{from}` 的地方要跟着改（revspec 是按名字查的）");
     Ok(())
 }
+
+// ════════════════════════ revert / cherry-pick ════════════════════════
+
+/// 两条命令的差别只有"哪一版当另一侧"，所以做成枚举而不是 `bool`：传反一个布尔就静默产出
+/// 另一种历史，而这两种历史在账面上长得一模一样（都是单亲 commit）。
+enum Which {
+    Revert,
+    CherryPick,
+}
+
+impl Which {
+    fn name(&self) -> &'static str {
+        match self {
+            Which::Revert => "revert",
+            Which::CherryPick => "cherry-pick",
+        }
+    }
+}
+
+pub fn revert(cli: &Cli, rev: &str, apply: bool, allow_mass_delete: bool) -> Result<()> {
+    reapply(cli, rev, Which::Revert, apply, allow_mass_delete)
+}
+
+pub fn cherry_pick(cli: &Cli, rev: &str, apply: bool, allow_mass_delete: bool) -> Result<()> {
+    reapply(cli, rev, Which::CherryPick, apply, allow_mass_delete)
+}
+
+/// `revert` / `cherry-pick` 的共用实现：**同一把结构三方尺，只是参数摆位不同**。
+///
+/// | 命令 | ours（我们这一侧） | theirs（另一侧） | base（共同祖先） |
+/// |---|---|---|---|
+/// | `revert c` | `main` 那一版的树 | `c` 的**亲代**那一版 | `c` 的树 |
+/// | `cherry-pick c` | `main` 那一版的树 | `c` 的树 | `c` 的**亲代**那一版 |
+///
+/// 为什么这不是"再写一个合并器"：撤销 = "把亲代那一版当另一侧再合一次"，摘取 = "把 c 那一版当
+/// 另一侧再合一次"。冲突判据、目录递归、"有冲突就不落盘"全都复用 §7.1 那一份 —— **"报账"与"动手"
+/// 必须共用一把尺**（`branch` 那批同一条规矩）。差别只在三个参数各站哪个位置。
+///
+/// 与 `merge --keep-both` 同一条边界：**只做路径级结构合并，不做内容三方合并**（§1、§16.2 第三层）
+/// ⇒ 同一个文件被两边各改成不同东西就报冲突、拒绝、一个字不写。
+///
+/// 顺序仍是 FR-13：**先算账（`Emit::Report`，连清单行都不写）→ 只报那一趟到此为止 → `--apply` 才
+/// 落盘（`Emit::Store`，两次的树 hash 必须一致）→ 检出 → 最后挪 ref**。
+/// 代价：整棵树的遍历做两遍。这是稀有命令，用一遍遍历换"只报真的一字不写"值。
+fn reapply(
+    cli: &Cli,
+    rev: &str,
+    which: Which,
+    apply: bool,
+    allow_mass_delete: bool,
+) -> Result<()> {
+    let (project, root) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    // 落点必须唯一：两个 head 时"撤销到哪一个上面"没有定义，而挑一个就是猜（§7.1）。
+    if heads.len() != 1 {
+        return Err(Error::BadInput(format!(
+            "{} 要往唯一一个 head 上落，而现在有 {} 个 ⇒ 先 `merge --keep-both` 或 `reset <hash>` 把场面收成一个",
+            which.name(),
+            heads.len()
+        )));
+    }
+    let onto = heads[0];
+    let head_commit = object::read_commit(&*db, pid, &onto)?;
+    // 与 `checkout`/`reset` 同一道闸：一个 rev 写到达两个 commit 就报错，不许挑第一个。
+    let target = m0::one_commit(history::resolve_rev(&*db, pid, rev)?, rev)?;
+    let commit = object::read_commit(&*db, pid, &target)?;
+    if commit.parents.len() > 1 {
+        return Err(Error::BadInput(format!(
+            "{rev:?} 是 {} 个亲代的合并 commit ⇒ {what}它之前要先说撤哪一边，那是裁决不是默认值\
+             （git 要 `-m N`，本项目不给这个旋钮）。想丢掉那一支就 `reset <hash>` 点名",
+            commit.parents.len(),
+            what = which.name()
+        )));
+    }
+    // 无亲代 = 与**空树**比：`revert` 一个根就是把它引入的一切撤掉 —— 那会正撞 FR-10，也正是它该撞的地方。
+    let parent_tree = match commit.parents.first() {
+        Some(p) => object::read_commit(&*db, pid, p)?.tree,
+        None => object::empty_tree(),
+    };
+    let ours = head_commit.tree;
+    let (theirs, base, msg) = match which {
+        Which::Revert => (
+            parent_tree,
+            commit.tree,
+            format!("revert {}: {}", keys::short(&target), commit.msg),
+        ),
+        Which::CherryPick => (
+            commit.tree,
+            parent_tree,
+            format!("cherry-pick {}: {}", keys::short(&target), commit.msg),
+        ),
+    };
+
+    println!("project   = {project}  (id={pid:#010x})");
+    println!("工作树    = {}", root.display());
+    println!("动作      = {} {rev}", which.name());
+    println!("落点      = {}（当前唯一 head）", keys::short(&onto));
+    println!(
+        "作用对象  = {}  {}  {}",
+        keys::short(&target),
+        history::fmt_ts(commit.ts),
+        commit.msg
+    );
+    println!(
+        "基        = {}",
+        match commit.parents.first() {
+            Some(p) => format!("亲代 {}", keys::short(p)),
+            None => "没有亲代 ⇒ 与空树比".to_string(),
+        }
+    );
+
+    // 一眼就能判的空：另一侧与落点是同一棵树 ⇒ 五规则一条都不会改（`add +0` 那种空提交不许产生，
+    // 碎 commit 会把引擎版本链白白撑大，§9.6.2）。
+    if theirs == ours {
+        println!("结果      = 什么都没带来（那一版与落点是同一棵树）⇒ 不产生空提交，head 不动");
+        return Ok(());
+    }
+
+    let new_tree = match history::merge_trees(
+        &*db,
+        pid,
+        &ours,
+        &theirs,
+        &[base],
+        history::Emit::Report,
+    )? {
+        history::Merge::Conflict { paths } => {
+            println!(
+                "合不了    = {} 条路径两边各改成不同东西（§7.1：有交集只能人选）",
+                paths.len()
+            );
+            for p in paths.iter().take(10) {
+                println!("          - {p}");
+            }
+            return Err(Error::BadInput(format!(
+                "{} 被 {} 条同路径冲突挡住 ⇒ 这几条要人裁决（`checkout --at` 选一边，或交给真 git）",
+                which.name(),
+                paths.len()
+            )));
+        }
+        history::Merge::Done { tree } => tree,
+    };
+    let mut cs = build::diff(&*db, pid, Some(&ours), &new_tree)?;
+    cs.fold_renames();
+    if cs.is_empty() {
+        println!("结果      = 什么都没带来（每一条要么已经一样、要么那一边没动过）⇒ 不产生空提交");
+        return Ok(());
+    }
+    // FR-10 在**写任何东西之前**过一遍：撤掉一个"加了两万文件"的 commit 就是撤两万条删除。
+    let known = count_paths(&*db, pid, &ours)?;
+    build::check_mass_delete(cs.delete, cs.deleted_bytes, known, allow_mass_delete)?;
+    println!(
+        "改动      = +{} ~{} -{} 改名 {}  入 {:.1} MiB / 删 {:.1} MiB（分母 = 落点的 {known} 条）",
+        cs.add,
+        cs.modify,
+        cs.delete,
+        cs.rename,
+        cs.bytes as f64 / 1_048_576.0,
+        cs.deleted_bytes as f64 / 1_048_576.0
+    );
+    println!(
+        "将生成    = 一笔单亲 commit：parents = [{}]，tree = {}",
+        keys::short(&onto),
+        keys::short(&new_tree)
+    );
+    println!("          = head 从 {} 挪过去，工作树跟着落地", keys::short(&onto));
+    if !apply {
+        println!("模式      = 只报（FR-7）。这一趟连清单行都没写：上面那棵树是**算**出来的（`Emit::Report`）");
+        return Ok(());
+    }
+
+    // 真落盘那一次走同一套遍历，只是这次把中间清单写进库。
+    let stored = match history::merge_trees(
+        &*db,
+        pid,
+        &ours,
+        &theirs,
+        &[base],
+        history::Emit::Store,
+    )? {
+        history::Merge::Done { tree } => tree,
+        history::Merge::Conflict { paths } => {
+            return Err(Error::BadInput(format!(
+                "第二次遍历报出 {} 条冲突，而第一次说能合 ⇒ 站点在两次遍历之间被动过 ⇒ 这一趟拒绝，\
+                 先查是不是有 `daemon` 或另一个 `commit` 在写同一个库",
+                paths.len()
+            )));
+        }
+    };
+    if stored != new_tree {
+        return Err(Error::BadInput(
+            "两次遍历出来的树不是同一棵 ⇒ 同上，库在动 ⇒ 拒绝".to_string(),
+        ));
+    }
+    let made = object::put_commit(
+        &*db,
+        pid,
+        &object::Commit {
+            parents: vec![onto],
+            tree: stored,
+            peer: m0::PEER_LOCAL.to_string(),
+            ts: worktree::now_ns(),
+            msg,
+            stats: object::Stats {
+                add: cs.add,
+                modify: cs.modify,
+                delete: cs.delete,
+                rename: cs.rename,
+                bytes: cs.bytes,
+            },
+        },
+    )?;
+    println!("生成      = {}  tree {}", keys::hex(&made), keys::short(&stored));
+
+    // 先落地、最后挪 ref（FR-13，与 `reset` 同一个顺序）：被 §7.3 逐文件门或 FR-10 挡下的那一次，
+    // head 一个字都没动，人可以直接改参数重跑。
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let rep = checkout::checkout(
+        &*db,
+        pid,
+        &store,
+        &root,
+        &made,
+        None,
+        checkout::Opts {
+            apply: true,
+            allow_mass_delete,
+        },
+    )?;
+    build::set_ref(&*db, pid, build::MAIN, &[made])?;
+    println!(
+        "动作      = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}{}",
+        rep.create,
+        rep.mkdir,
+        rep.overwrite,
+        rep.delete,
+        rep.rmdir,
+        rep.skipped,
+        if rep.deferred > 0 {
+            format!(" / deferred 不动 {}", rep.deferred)
+        } else {
+            String::new()
+        }
+    );
+    m0::note_checkout_dirty(&rep);
+    println!("head      = 已挪到 {}（原来的 {} 留在库里，还是别的 commit 的亲代）", keys::short(&made), keys::short(&onto));
+    Ok(())
+}
+
+/// 树里有多少条路径 —— FR-10 那句"已知条目"的分母。
+///
+/// `commit` 那侧用的是"本轮扫到的行数"，这里用**落点那一版**的条目数：两者说的是同一件事
+/// （"你现在有多少东西"），不是"这次动了多少"。流式走完不物化（[`history::walk_tree`] 的回调形状），
+/// 否则这条只报的命令自己要占 O(文件数) 的内存。
+fn count_paths(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, tree: &Hash) -> Result<u32> {
+    let mut n = 0u32;
+    let mut visit = |_p: &str, _e: &object::TreeEntry| {
+        n += 1;
+        Ok(())
+    };
+    history::walk_tree(db, pid, tree, &mut visit)?;
+    Ok(n)
+}
+
 

@@ -171,6 +171,34 @@ fn a_plain_merge_only_reports_and_writes_nothing() {
     assert_eq!(site.heads(), pair(l, r));
 }
 
+/// `--keep-both` **不带 `--apply`** 那一趟也不许写。
+///
+/// 这条是补上的：命令自己打印了"不带 `--apply` 一个字节都不写"，而第一版实现里 `merge_trees`
+/// 一路在 `put_tree` —— 只报那一趟其实把中间清单写进了库（不可达、下次 `gc` 会收，但那句话就成了谎）。
+/// 现在 `Emit::Report` 只算 hash，用例拿**总行数**钉住它。
+#[test]
+fn keep_both_without_apply_writes_not_even_tree_rows() {
+    let site = Site::new();
+    site.write("a.txt", "base");
+    let base = site.commit("base");
+    let (l, r) = site.fork(&base, "left.txt", "right.txt");
+    let rows = site.rows();
+
+    site.merge(true, false, false, false).unwrap();
+
+    assert_eq!(
+        site.rows(),
+        rows,
+        "--keep-both 的只报那一趟连清单行都不许多一行（FR-7）"
+    );
+    assert_eq!(site.heads(), pair(l, r), "只报不许动 head");
+
+    // 加 `--apply` 就该真写了 —— 不写的话上面那条"行数没变"就只是台架坏了
+    site.merge(true, false, false, true).unwrap();
+    assert!(site.rows() > rows, "落盘那一趟要多出 commit/清单行");
+    assert_eq!(site.heads().len(), 1, "合并把两个 head 收成一个");
+}
+
 #[test]
 fn keep_both_merges_disjoint_paths_into_one_two_parent_commit() {
     let site = Site::new();
