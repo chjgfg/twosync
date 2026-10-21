@@ -510,10 +510,27 @@ pub enum Cmd {
         good: String,
     },
 
+    /// M4 第二层最后一条：**把"已扫描、未提交"的那份改动定稿成一笔 commit，挂在 `refs/stash` 上**，
+    /// 带 `--apply` 时再把工作树清回 head
+    ///
+    /// 为什么不是一句"你先 `commit` 一下"：`commit` 会移 head，那份半成品就此进了历史、还会被下一次
+    /// `push` 送出去。这里要的是"落库但别成为 head"，所以库层本轮开了 [`crate::store::build::build_detached`]
+    /// 这个出口。挂在 `refs/stash` 这个名字上另外换来两件事：她被 `gc` 保下来（§9.3 保留集 = 全部 ref），
+    /// 同时**不参与同步**（会话只读 `main`）。
+    ///
+    /// **只有一格，不是一个栈**：第二条存在时直接拒绝（不悄悄挤掉第一条 —— 被挤掉的那条只剩这一个名字，
+    /// 名字一没她就不可达，`gc` 连块一起收走，那是丢用户的改动）。
+    /// 子命令 `apply` 与旗标 `--apply` 是两件事：前者是"把 stash 应用到工作树"，后者是"真的写"；
+    /// `stash apply` 不带 `--apply` 就是预演（FR-7）。
+    Stash {
+        #[command(subcommand)]
+        cmd: StashCmd,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 剩下的 ── 跨机器真 SSH 的多 head 实测（三条出路的命令面已落 `merge`）
-    // ── M4 ── stash（第二层只剩这一条；它要先有"提交但不移 head"那个出口）
+    // ── M4 剩下的 ── CDC 变长分块 / 稀疏重建 / 批传输调优 / §10.8 那张 RSS·CPU·p99 表 / README·发布
 }
 
 /// `tag` 的三个动作。名字规矩在 `cli::m4::check_ref_name`（与分支共用一道闸：`main`/`head` 是保留名、
@@ -575,6 +592,48 @@ pub enum BranchCmd {
         /// 新名字
         to: String,
     },
+}
+
+/// `stash` 的五个动作。`push`/`apply`/`pop` 都会动工作树 ⇒ 都带 `--apply`（FR-7 那一条闸的口径：
+/// **动工作树的才要 `--apply`**，只动名字的 `tag`/`branch` 不要）。`list`/`drop` 是纯读/纯删名字。
+#[derive(Subcommand, Clone)]
+pub enum StashCmd {
+    /// 存：把已扫描未提交的那份改动定稿成一笔 commit，挂到 `refs/stash`，再把工作树清回 head
+    ///
+    /// 与 `commit` 同一口径：**吃的是最近一次 `scan` 的快照**，不替你 scan。
+    Push {
+        /// 说明文字。省略时写"stash 未提交改动"
+        #[arg(long, short)]
+        msg: Option<String>,
+        /// 真的执行。省略时只报（这一趟连 commit 都不建）
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断（存进去的改动里删了很多东西时由人明确表态）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+    /// 看：有没有一条 stash、她替你扛着多少改动
+    List,
+    /// 取回：把那一版落回工作树，**留着**她（名字不删，可以反复 apply）
+    Apply {
+        /// 真的执行。省略时只报
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+    /// 取回并且丢掉名字。顺序是**先落地成功、后删名字**（反过来若落地被挡下，名字没了就真的取不回了）
+    Pop {
+        /// 真的执行。省略时只报
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+    /// 丢掉名字，**工作树一个字不动**。松开的 stash 从此没有 ref 挂着 ⇒ `gc` 会收（§9.3），命令会报条数
+    Drop,
 }
 
 /// 首次导入的两枚旋钮（§14 Q11）。它们**不改变历史内容**，只改变落盘的等待方式与速率，

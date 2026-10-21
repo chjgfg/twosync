@@ -70,6 +70,11 @@ pub const MAX_DIR_ENTRIES: usize = 200_000;
 pub const PAGE: usize = 20_000;
 /// v1 唯一参与同步的 ref。
 pub const MAIN: &str = "main";
+/// `stash` 那一笔挂在哪个名字上。**内部名字，不是给人起的**：它带 `refs/` 前缀，
+/// 而 `check_ref_name` 拒绝任何用户名字以 `refs/` 开头 ⇒ 用户造不出与她撞车的名字。
+/// 挂在名字上（而不是"记住在内存里"）有两个后果，都是要的：她**被 `gc` 保下来**（§9.3 全部 ref），
+/// 而她**不进同步**（`net::session` 三处读的都是 `MAIN`）。
+pub const STASH: &str = "refs/stash";
 /// `status`/`diff` 一次最多列多少条路径。再多就只给计数，不给内存。
 pub const SAMPLE_MAX: usize = 30;
 /// FR-10 的字节闸：一次删除超过 2 GB 就得有人签字。
@@ -467,8 +472,31 @@ fn note_change(
     cs.note_pairable(kind, &h, path, size);
 }
 
-/// 构建并落库一个 commit。无改动时返回 `commit: None`，**不产生空提交也不移 head**。
+/// 构建并落库一个 commit，**并把 head 移过去**（FR-4 的正常出口）。无改动时 `commit: None`，**不产生空提交也不移 head**。
+///
+/// 它就是 [`build_detached`] + 最后那一步 `set_ref`：拆开的唯一理由是要有一个"commit 进了库、head 一字不动"
+/// 的出口（`stash` 需要，§16.2 第二层那条）。FR-13 说"head 集合更新是最后一步"，所以这一步能单独留在外面。
 pub fn build(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    store: &cas::Cas,
+    work_root: &Path,
+    meta: Meta<'_>,
+) -> Result<Built> {
+    let built = build_detached(db, pid, store, work_root, meta)?;
+    if let Some(commit) = built.commit {
+        set_ref(db, pid, MAIN, &[commit])?;
+    }
+    Ok(built)
+}
+
+/// 同上，但**不移 head**：对象与那笔 commit 照常落库，`main` 一个字都不动。
+///
+/// 谁需要她：`stash push` —— 那一笔是"未提交改动的临时定稿"，她该挂在 `refs/stash` 那个名字上
+/// （挂在名字上 = 同时被 `gc` 保下来，§9.3），而不是变成 head。
+/// **代价说清楚**：调用方如果就这样忘了她，那笔 commit 没有任何 ref 挂着 ⇒ 下一次 `gc --sweep --apply`
+/// 会把她当垃圾收走（不可达 = 可删）。所以只有"紧接着就 `set_ref` 到别处"的这一类调用方才许用这一支。
+pub fn build_detached(
     db: &dyn KvEngine,
     pid: ProjectId,
     store: &cas::Cas,
@@ -533,7 +561,6 @@ pub fn build(
         },
     };
     let commit = object::put_commit(db, pid, &c)?;
-    set_ref(db, pid, MAIN, &[commit])?;
     built.commit = Some(commit);
     Ok(built)
 }

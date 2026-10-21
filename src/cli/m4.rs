@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::format;
 
-use crate::cli::cmd::{BranchCmd, TagCmd};
+use crate::cli::cmd::{BranchCmd, StashCmd, TagCmd};
 use crate::cli::{m0, Cli};
 use crate::error::{Error, Result};
 use crate::store::keys::Hash;
@@ -157,7 +157,10 @@ fn list(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, project: &str)
     println!("project   = {project}  (id={pid:#010x})");
     let mut n = 0usize;
     for (name, heads) in build::all_named_refs(db, pid)? {
-        if name == build::MAIN || name.starts_with(build::BRANCH_PREFIX) {
+        if name == build::MAIN
+            || name.starts_with(build::BRANCH_PREFIX)
+            || name == build::STASH
+        {
             continue;
         }
         n += 1;
@@ -1040,4 +1043,322 @@ pub fn bisect(cli: &Cli, bad: &str, good: &str) -> Result<()> {
 fn head_line(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, h: &Hash) -> Result<String> {
     let c = object::read_commit(db, pid, h)?;
     Ok(format!("{}  {:<8}  {}", history::fmt_ts(c.ts), c.peer, c.msg))
+}
+
+// ════════════════════════ stash ════════════════════════
+
+/// `stash`：把"已扫描、未提交"的那份改动定稿成一笔 commit，挂在 `refs/stash` 那个名字上，
+/// 然后（带 `--apply` 时）把工作树清回 head。
+///
+/// 她为什么值得单独一条命令，而不是"你先 `commit` 一下"：`commit` 会**移 head**，那份半成品就此
+/// 成了历史的一部分，还会被下一次 `push` 送出去。`stash` 要的是"落库但别成为 head"——那个出口
+/// 本轮刚开出来（[`build::build_detached`]）。挂在名字上另外换来两件事：她被 `gc` 保下来
+/// （§9.3 的保留集是全部 ref），同时**不参与同步**（`net::session` 三处读的都是 `main`）。
+///
+/// **只有一格**（`refs/stash` 是一个名字，不是一个栈）：git 那个 stash 栈要的是"多条的排序与找回"，
+/// 那是另一个子系统。第二条存在时直接**拒绝**，不悄悄把第一条挤掉——被挤掉的那条只剩这一个名字挂着，
+/// 名字一没她就不可达，下一次 `gc` 连块一起收走，那是丢用户的改动，不是丢缓存。
+pub fn stash(cli: &Cli, cmd: &StashCmd) -> Result<()> {
+    let (project, root) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    println!("project   = {project}  (id={pid:#010x})");
+    println!("工作树    = {}", root.display());
+    let ctx = StashCtx {
+        db: &*db,
+        pid,
+        bucket: &cli.io_bucket,
+        store: &store,
+        root: &root,
+    };
+    // 三条会动工作树的子命令在**落地那一步之后各自补一次全量 `scan`**（理由见
+    // [`rescan_after_landing`]）。补扫点放在落地点里面而不是这里：`push` 发现"没有可存的改动"时
+    // 根本没落地，在外面判断 `apply` 旗标会白扫一遍。
+    match cmd {
+        StashCmd::Push { msg, apply, allow_mass_delete } => {
+            ctx.push(msg.as_deref(), *apply, *allow_mass_delete)
+        }
+        StashCmd::List => ctx.list(),
+        StashCmd::Apply { apply, allow_mass_delete } => ctx.back(*apply, *allow_mass_delete, false),
+        StashCmd::Pop { apply, allow_mass_delete } => ctx.back(*apply, *allow_mass_delete, true),
+        StashCmd::Drop => ctx.drop(),
+    }
+}
+
+/// `stash` 四条子命令共用的**现场**。收成结构而不是给每个函数塞八个参数：
+/// 这五样是同一次操作的坐标（同一份库、同一个限速桶、同一个 CAS、同一个工作树根），
+/// 不是调用方可选的旋钮——`clippy` 的 7 参上限报的就是那个形状（与 `Merger`/`PushArgs` 同一处理）。
+struct StashCtx<'a> {
+    db: &'a dyn storage_engines::KvEngine,
+    pid: keys::ProjectId,
+    bucket: &'a cas::Bucket,
+    store: &'a cas::Cas,
+    root: &'a std::path::Path,
+}
+
+impl StashCtx<'_> {
+    /// 把工作树的现状重新落进 `W`。**为什么是 `stash` 的责任而不是 `checkout` 的**：
+    /// 全量命令（`checkout`/`reset`）的口径本来就是"工作树变了而 `W` 还是旧的 ⇒ 下一步 `scan`"，
+    /// 但 stash 的定义就是"把同一份改动搬进搬出"——搬出去之后紧接着要搬回来，中间没有让人 scan 的那一步。
+    /// 少了这一次扫，`stash apply` 会按**旧快照**判"她已经在工作树上了"，于是落地打成 `建 0 / 覆盖 0`
+    /// 而盘上一个字节没变（这条不是推理：`apply_keeps_the_stash_and_pop_removes_it_only_after_landing`
+    /// 第一次跑就撞上）。搬回来的那一次也要扫：`pop` 之后紧接着就是 `commit`，而 `commit` 吃的正是 `W`。
+    ///
+    /// 代价照实说：一次全量 `scan`（12 GiB 站点 ≈ 68 s 量级，§11.4b）。不做窄扫是有理由的：
+    /// 窄扫那一轮**不推进活性线**，因此一个删除都不报（§11.4b 的修订），而 stash 搬进搬出最常碰的就是删除。
+    fn rescan_after_landing(&self) -> Result<()> {
+        let (db, pid, root) = (self.db, self.pid, self.root);
+        let rep = worktree::scan_scoped(
+            db,
+            pid,
+            root,
+            &worktree::Scope::Full,
+            false,
+            2000,
+            self.bucket,
+        )?;
+        println!(
+            "补扫      = 重新认了一遍工作树（{} 条活着 / 走过 {} 条）⇒ 只报的 `plan`/`status` 与接下来的 `commit` 吃的都是这一份快照",
+            rep.walked, rep.hashed
+        );
+        Ok(())
+    }
+
+    /// 那条 stash 替你扛着的是**哪一份改动**：她自己相对她亲代（= push 那一刻的 head）的差。
+    ///
+    /// 不拿"当前 head"当基线：push 之后 head 可能又动了，那时"相对 head"里会混进别人的改动，
+    /// 报出来就像 stash 里多/少东西了。她的亲代才是她真正装着的那一份，这个数不会随时间漂。
+    fn carries(&self, commit: &keys::Hash) -> Result<build::ChangeSet> {
+        let (db, pid) = (self.db, self.pid);
+        let c = object::read_commit(db, pid, commit)?;
+        let base = match c.parents.first() {
+            Some(p) => Some(object::read_commit(db, pid, p)?.tree),
+            None => None,
+        };
+        let mut cs = build::diff(db, pid, base.as_ref(), &c.tree)?;
+        cs.fold_renames();
+        Ok(cs)
+    }
+
+    fn push(
+        &self,
+        msg: Option<&str>,
+        apply: bool,
+        allow_mass_delete: bool,
+    ) -> Result<()> {
+        let (db, pid, store, root) = (self.db, self.pid, self.store, self.root);
+        // 先看账：`plan` 吃的是最近一次 `scan` 的快照（不替你 scan，与 `commit` 同一口径）。
+        let p = build::plan(db, pid)?;
+        if p.changes.is_empty() {
+            println!("存不了    = 没有已扫描未提交的改动（工作树相对 head 干净，或者还没 `scan`）");
+            return Ok(());
+        }
+        if !build::ref_heads(db, pid, build::STASH)?.is_empty() {
+            return Err(Error::BadInput(
+                "已经有一条 stash 了 ⇒ 先 `stash pop`（取回并删掉她）或 `stash drop`（丢掉她）。 \
+                 这里不许覆盖：被挤掉的那条只剩 `refs/stash` 一个名字挂着，名字一没她就不可达，\
+                 下一次 `gc --sweep --apply` 会连块一起收走——那是丢用户的改动，不是丢缓存"
+                    .to_string(),
+            ));
+        }
+        println!(
+            "要存      = +{} ~{} -{} 改名 {}  入 {:.1} MiB（分母 = 站上的 {} 条）",
+            p.changes.add,
+            p.changes.modify,
+            p.changes.delete,
+            p.changes.rename,
+            p.changes.bytes as f64 / 1_048_576.0,
+            p.known
+        );
+        if !apply {
+            println!("模式      = 只报（FR-7：动工作树的才要 --apply）。这一趟连 commit 都没建");
+            return Ok(());
+        }
+        let heads = build::ref_heads(db, pid, build::MAIN)?;
+        if heads.len() != 1 {
+            return Err(Error::BadInput(format!(
+                "stash 要落在唯一一个 head 上（她的亲代就是那一个），而现在有 {} 个 ⇒ 先 `merge` 或 `reset` 收成一个",
+                heads.len()
+            )));
+        }
+        let built = build::build_detached(
+            db,
+            pid,
+            store,
+            root,
+            build::Meta {
+                peer: m0::PEER_LOCAL,
+                msg: msg.unwrap_or("stash 未提交改动"),
+                ts: worktree::now_ns(),
+                allow_mass_delete,
+            },
+        )?;
+        let Some(commit) = built.commit else {
+            // 上面 `plan` 说有改动、这里没建出 commit ⇒ 两次读之间有人动了库（另一个 `commit`/`daemon`）。
+            return Err(Error::BadInput(
+                "扫描快照与落库那一趟对不上（说有的改动没建出 commit）⇒ 这一趟什么都没写，先看 `status`"
+                    .to_string(),
+            ));
+        };
+        // 顺序是**先建 → 挂名字 → 再清工作树**。反过来（先清再建）会让中间任何一步失败都等于
+        // 把那份改动唯一的存在形式（工作树）先擦掉了。
+        build::set_ref(db, pid, build::STASH, &[commit])?;
+        println!("stash     = {}  tree {}", keys::hex(&commit), keys::short(&built.tree));
+        println!(
+            "挂在      = {:?}（她因此被 gc 保下来 §9.3；不参与同步，会话只读 `{}`）",
+            build::STASH,
+            build::MAIN
+        );
+        let rep = checkout::checkout(
+            db,
+            pid,
+            store,
+            root,
+            &heads[0],
+            None,
+            checkout::Opts {
+                apply: true,
+                allow_mass_delete,
+            },
+        )?;
+        m0::note_checkout_dirty(&rep);
+        println!(
+            "工作树    = 已清回 head：建 {} / 覆盖 {} / 删 {} / 跳过 {}{}",
+            rep.create,
+            rep.overwrite,
+            rep.delete,
+            rep.skipped,
+            if rep.deferred > 0 {
+                format!(" / deferred 不动 {}", rep.deferred)
+            } else {
+                String::new()
+            }
+        );
+        self.rescan_after_landing()?;
+        println!("取回      = `stash apply --apply`（留着她）或 `stash pop --apply`（取回并且删掉她）");
+        Ok(())
+    }
+
+    fn list(&self) -> Result<()> {
+        let (db, pid) = (self.db, self.pid);
+        let Some(commit) = build::ref_heads(db, pid, build::STASH)?.pop() else {
+            println!("stash     = 没有（存一份：`twosync stash push --apply`）");
+            return Ok(());
+        };
+        let c = object::read_commit(db, pid, &commit)?;
+        println!(
+            "stash     = {}  {}  {:<8}  {}",
+            keys::short(&commit),
+            history::fmt_ts(c.ts),
+            c.peer,
+            c.msg
+        );
+        let cs = self.carries(&commit)?;
+        println!(
+            "她扛着    = +{} ~{} -{} 改名 {}（这是 push 那一刻的账，不随 head 再动而漂）",
+            cs.add, cs.modify, cs.delete, cs.rename
+        );
+        println!("取回      = `stash apply --apply` 或者 `stash pop --apply`（后者连名字一起删）");
+        Ok(())
+    }
+
+    /// `stash apply` / `stash pop`：把那一版落回工作树。`pop` 在落地**成功之后**才删名字。
+    fn back(
+        &self,
+        apply: bool,
+        allow_mass_delete: bool,
+        pop: bool,
+    ) -> Result<()> {
+        let (db, pid, store, root) = (self.db, self.pid, self.store, self.root);
+        let Some(commit) = build::ref_heads(db, pid, build::STASH)?.pop() else {
+            return Err(Error::BadInput(
+                "没有 stash（`stash list` 看有什么）".to_string(),
+            ));
+        };
+        let cs = self.carries(&commit)?;
+        println!(
+            "stash     = {}（她扛着 +{} ~{} -{}）",
+            keys::short(&commit),
+            cs.add,
+            cs.modify,
+            cs.delete
+        );
+        if !apply {
+            println!(
+                "模式      = 只报（FR-7）。加 --apply 才会动工作树{}",
+                if pop { "，并且删掉那条 stash" } else { "" }
+            );
+            return Ok(());
+        }
+        let rep = checkout::checkout(
+            db,
+            pid,
+            store,
+            root,
+            &commit,
+            None,
+            checkout::Opts {
+                apply: true,
+                allow_mass_delete,
+            },
+        )?;
+        m0::note_checkout_dirty(&rep);
+        println!(
+            "工作树    = 落地：建 {} / 建目录 {} / 覆盖 {} / 删 {} / 跳过 {}{}",
+            rep.create,
+            rep.mkdir,
+            rep.overwrite,
+            rep.delete,
+            rep.skipped,
+            if rep.deferred > 0 {
+                format!(" / deferred 不动 {}", rep.deferred)
+            } else {
+                String::new()
+            }
+        );
+        // 补扫放在**删名字之前**：`pop` 的下一步通常是 `commit`，而 `commit` 吃的是 `W`；
+        // 少了这一扫，`commit` 看到的就是搬回来**之前**的那份快照（会把刚取回的改动当成"没变化"）。
+        self.rescan_after_landing()?;
+        if pop {
+            // 顺序：**先落地、后删名字**。反过来若 checkout 被 §7.3 逐文件门或 FR-10 挡下，
+            // 名字已经没了 ⇒ 那份改动就真的不可达了。
+            build::set_ref(db, pid, build::STASH, &[])?;
+            println!(
+                "stash     = 已删（pop 的语义就是取回并且丢掉名字）。她从此没有 ref 挂着 ⇒ \
+                 **尽快 `scan` + `commit`**：否则下一次 `gc --sweep --apply` 会把那一版连块一起收走（§9.3）"
+            );
+        } else {
+            println!("stash     = 仍然挂着（apply 不动名字；不要了再 `stash drop`）");
+        }
+        Ok(())
+    }
+
+    fn drop(&self) -> Result<()> {
+        let (db, pid) = (self.db, self.pid);
+        let old = build::ref_heads(db, pid, build::STASH)?;
+        if old.is_empty() {
+            return Err(Error::BadInput(
+                "没有 stash 可丢（`stash list` 看有什么）".to_string(),
+            ));
+        }
+        let refs = build::all_named_refs(db, pid)?;
+        let index = object::parent_index(db, pid)?;
+        let lost = history::unheld_by_other_refs(&refs, &index, build::STASH, &old);
+        build::set_ref(db, pid, build::STASH, &[])?;
+        println!(
+            "丢掉 stash = {}（工作树一个字没动）",
+            old.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+        );
+        if lost.is_empty() {
+            println!("效果      = 什么都没松开：那一版还有别的 ref 挂着，gc 本来也收不到");
+        } else {
+            println!(
+                "效果      = 松开 {} 条 commit（它们不再被任何 ref 挂着）⇒ 下一次 `gc --sweep --apply` \
+                 会把那一版连块一起收走（§9.3）。改动本身还在工作树里，要留就 `scan` + `commit`",
+                lost.len()
+            );
+        }
+        Ok(())
+    }
 }

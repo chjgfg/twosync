@@ -146,6 +146,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
         Cmd::Branch { cmd } => m4::branch(cli, cmd),
         Cmd::Blame { path, max } => m4::blame(cli, path, *max),
+        Cmd::Stash { cmd } => m4::stash(cli, cmd),
         Cmd::Bisect { bad, good } => m4::bisect(cli, bad, good),
         Cmd::Revert {
             rev,
