@@ -30,7 +30,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput};
 use storage_engines::EngineKind;
 use twosync::store::build::{self, Meta};
 use twosync::store::cas::{self, Cas};
@@ -50,9 +50,19 @@ struct Site {
 }
 
 impl Site {
+    /// 引擎按 `TWOSYNC_BENCH_ENGINE` 选（默认 `lsm_tree`），与测试台架那条 `TWOSYNC_TEST_ENGINE`
+    /// 同一个形状 —— 这样 §10.6 的基准与 §10.8 的矩阵能用同一套"换引擎再跑一遍"的口径，
+    /// 而不是"基准只在默认引擎上跑过，矩阵在两个引擎上绿过"两句各自成立却对不上。
+    /// 名字解析走引擎自己的 `EngineKind::parse`（一份实现）；认不出就直接红，不悄悄退回默认。
     fn open() -> Site {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = open_store(tmp.path(), EngineKind::LsmTree).expect("open_store");
+        let engine = match std::env::var("TWOSYNC_BENCH_ENGINE") {
+            Ok(s) if !s.is_empty() => {
+                EngineKind::parse(&s).unwrap_or_else(|| panic!("不认识 TWOSYNC_BENCH_ENGINE={s:?}"))
+            }
+            _ => EngineKind::LsmTree,
+        };
+        let db = open_store(tmp.path(), engine).expect("open_store");
         Site {
             db,
             pid: keys::project_id("bench"),
@@ -229,5 +239,29 @@ fn log_walk(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, scan_steady_vs_forced, hash_throughput, plan_only, commit_incremental, log_walk);
-criterion_main!(benches);
+/// 自己写 main 而不用 `criterion_group!` + `criterion_main!`：为了一个开关 ——
+/// **`TWOSYNC_BENCH_QUICK=1` 走缩样档**（`criterion_group!` 生成的函数自己 `configure_from_args()`，
+/// 从外面塞不进任何配置）。
+///
+/// 为什么要有这一档：跨引擎比基准要跑两遍，而 bplus 在只读密集上贵 5–13 倍（§10.8 第三层实测），
+/// 全档两遍不可控。缩样档只回答"哪家贵、贵几倍"，**尾延迟读不出来**。
+/// ⚠️ 两种档的数不许混进同一张表：§10.6 那张是全档，跨引擎这张是缩样档，各自标自己。
+/// （顺带一条踩过的坑：`cargo bench -- --mode quick` 不管用 —— criterion 0.5 不认 libtest 这个参数，
+/// 报 `Unrecognized option: 'mode'`。这句是实测不是推测。）
+fn main() {
+    let mut crit = Criterion::default();
+    if std::env::var_os("TWOSYNC_BENCH_QUICK").is_some() {
+        crit = crit
+            .sample_size(10)
+            .warm_up_time(std::time::Duration::from_millis(500))
+            .measurement_time(std::time::Duration::from_millis(1_500));
+        println!("采样档 = 缩样(10 样本 / 0.5 s 预热 / 1.5 s 测量)：读倍数，不读尾延迟");
+    }
+    let mut crit = crit.configure_from_args();
+    scan_steady_vs_forced(&mut crit);
+    hash_throughput(&mut crit);
+    plan_only(&mut crit);
+    commit_incremental(&mut crit);
+    log_walk(&mut crit);
+    crit.final_summary();
+}
