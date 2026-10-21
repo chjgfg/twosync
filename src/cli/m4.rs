@@ -888,4 +888,156 @@ fn count_paths(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, tree: &
     Ok(n)
 }
 
+// ════════════════════════ blame / bisect ════════════════════════
+//
+// 这两条都是**只读**命令 ⇒ 不带 `--apply`（闸的口径与 `branch` 那批同一句：动工作树的才要）。
+// 判据住在 `store::history`（`blame_path` / `bisect_step`），这一层只负责措辞 ——
+// 枚举能被用例钉住，`format!` 出来的那句话钉不住。
 
+/// `blame <path>`：这条路径被哪些 commit 动过（**路径级**，不是行级；理由见 [`history::blame_path`]）。
+pub fn blame(cli: &Cli, path: &str, max: usize) -> Result<()> {
+    let (project, _) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    if heads.is_empty() {
+        return Err(Error::BadInput(
+            "head 集合是空的：这个项目还没有历史".to_string(),
+        ));
+    }
+    let h = history::blame_path(&*db, pid, &heads, path, max)?;
+    println!("project   = {project}  (id={pid:#010x})");
+    println!("路径      = {path}");
+    println!(
+        "窗口      = 走了 {} 本 commit（{}）",
+        h.scanned,
+        if max == 0 {
+            "--max 0 = 全部，内存 O(历史长度)"
+        } else {
+            "--max 上限"
+        }
+    );
+    println!("动过她    = {} 本", h.hits.len());
+    for hit in &h.hits {
+        println!(
+            "  {}  {}  {:<8}  {}",
+            keys::short(&hit.node.hash),
+            history::fmt_ts(hit.node.commit.ts),
+            hit.node.commit.peer,
+            change_word(&hit.change)
+        );
+    }
+    println!(
+        "现在      = {}",
+        match &h.now {
+            Some(e) => format!(
+                "{}，{} B，mode {}，内容 {}",
+                kind_word(e),
+                e.size,
+                e.mode,
+                keys::short(&e.hash)
+            ),
+            None => "这一版里**没有**这条路径".to_string(),
+        }
+    );
+    // 三条"命令自己要说"的边界：窗口截断、行级不提供、以及下一步该敲什么。
+    if h.truncated {
+        println!(
+            "注意      = 窗口截断在第 {} 本 ⇒ 最老那一行**不代表**她第一次出现，往前还有（--max 0 走全史）",
+            max
+        );
+    }
+    println!(
+        "行级归属  = 不提供。4 MiB 块 + 二进制语料里\"行\"不是任何一层的身份（`B` 清单只有块号/hash/大小），做出来的是看起来像 `git blame` 而语义是猜的东西"
+    );
+    println!("看整文件  = `show <rev> <path>`；取回她 = `restore --at <rev> <path>`");
+    Ok(())
+}
+
+/// 归属那一行的措辞。判据在 [`history::PathChange`]，这里只有话术。
+fn change_word(c: &history::PathChange) -> String {
+    use history::PathChange as P;
+    match c {
+        P::Appeared => "出现（新增）".to_string(),
+        P::Disappeared => "消失（删除）".to_string(),
+        P::Content { to } => format!("内容换成 {}", keys::short(to)),
+        P::Mode { to } => format!("只改权限 mode → {to:o}"),
+        P::KindSwap => "类型互换（文件↔目录↔符号链接）".to_string(),
+    }
+}
+
+fn kind_word(e: &object::TreeEntry) -> &'static str {
+    match e.kind {
+        keys::Kind::Dir => "目录",
+        keys::Kind::Symlink => "符号链接",
+        keys::Kind::File => "文件",
+    }
+}
+
+/// `bisect --bad <rev> --good <rev>`：无状态的二分定位（取舍的理由见 [`history::bisect_step`]）。
+pub fn bisect(cli: &Cli, bad: &str, good: &str) -> Result<()> {
+    let (project, _) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    let bad_c = m0::one_commit(history::resolve_rev(&*db, pid, bad)?, bad)?;
+    let good_c = m0::one_commit(history::resolve_rev(&*db, pid, good)?, good)?;
+    println!("project   = {project}  (id={pid:#010x})");
+    println!(
+        "坏的那一本  = {}  {}",
+        keys::short(&bad_c),
+        head_line(&*db, pid, &bad_c)?
+    );
+    println!(
+        "好的那一本  = {}  {}",
+        keys::short(&good_c),
+        head_line(&*db, pid, &good_c)?
+    );
+    let step = match history::bisect_step(&*db, pid, &bad_c, &good_c)? {
+        history::BisectVerdict::Step(s) => s,
+        history::BisectVerdict::GoodNotAncestor => {
+            return Err(Error::BadInput(format!(
+                "`{good}` 不是 `{bad}` 的祖先 ⇒ 两端不在同一条线上，\"之间\"没有定义。先确认哪个真的更坏（这里不替你猜，也不给第三种写法）"
+            )));
+        }
+        history::BisectVerdict::Reversed => {
+            return Err(Error::BadInput(format!(
+                "`{bad}` 反而是 `{good}` 的祖先 ⇒ 你说坏的那一本更**老**，两端写反了？"
+            )));
+        }
+    };
+    println!(
+        "区间      = 怀疑 {} 本（坏的闭包 {} 本 − 好的闭包 {} 本）",
+        step.suspects, step.bad_closure, step.good_closure
+    );
+    println!(
+        "候选      = {}  {}",
+        keys::hex(&step.candidate),
+        head_line(&*db, pid, &step.candidate)?
+    );
+    if step.suspects == 1 {
+        // 区间收到只剩一本 ⇒ 她就是结论。这时候再给"下一步怎么问"是多余的，而且会让人以为
+        // 还要再跑一次才能定（用例 `bisect_range_shrinks_every_step_until_one_suspect_is_left`
+        // 钉的就是这一格：唯一的候选会被重复问一次，那是收敛的最后一步，不是死循环）。
+        println!(
+            "结论      = 区间只剩这一本 ⇒ 元凶就是 {}（上面那一条候选）",
+            keys::short(&step.candidate)
+        );
+    } else {
+        println!(
+            "下一步    = `checkout --at {} --apply` 去测这一本，测完再跑一次：还是坏 → `bisect --bad {} --good {good}`；变好了 → `bisect --bad {bad} --good {}`",
+            keys::short(&step.candidate),
+            keys::short(&step.candidate),
+            keys::short(&step.candidate),
+        );
+        println!(
+            "保证      = 候选属于怀疑集 ⇒ 每问一次区间**严格变小**。历史里有合并时**不保证**正好缩一半（时间序不等于拓扑序）。这一步**不落游标** ⇒ 没有\"bisect 卡住要先 reset\"那种坏账"
+        );
+    }
+    Ok(())
+}
+
+/// 一行 commit 摘要（时间 + 来源 + 说明）。
+fn head_line(db: &dyn storage_engines::KvEngine, pid: keys::ProjectId, h: &Hash) -> Result<String> {
+    let c = object::read_commit(db, pid, h)?;
+    Ok(format!("{}  {:<8}  {}", history::fmt_ts(c.ts), c.peer, c.msg))
+}

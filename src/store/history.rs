@@ -107,6 +107,31 @@ pub fn resolve(
     root: &Hash,
     path: &str,
 ) -> Result<Option<object::TreeEntry>> {
+    entry_at(root, path, &|h| object::read_tree(db, pid, h))
+}
+
+/// 与 [`resolve`] **同一个走法**，只是每一层的清单来自已经装载好的 [`object::TreeIndex`]。
+///
+/// 为什么要两份入口而不是一份：单条路径的查询（`show`/`restore`）不该为了一次点读把整库清单
+/// 装进内存（§11.4d 那条预算），而 `blame` 这种"同一片目录要读几十遍"的必须装一次 ——
+/// 后者把 `O(版本数 × 层数)` 次门面读换成**一次前缀扫**（每次门面读都折一遍全库，§9.6.1）。
+/// 走法只有一份（[`entry_at`]），所以两边不可能一个认 `..` 一个不认。
+pub fn resolve_cached(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    trees: &object::TreeIndex,
+    root: &Hash,
+    path: &str,
+) -> Result<Option<object::TreeEntry>> {
+    entry_at(root, path, &|h| trees.list(db, pid, h))
+}
+
+/// 逐层走到那条条目。**这里是唯一一份走法**，两种清单来源（点读 / 装载索引）都走它。
+fn entry_at(
+    root: &Hash,
+    path: &str,
+    list: &dyn Fn(&Hash) -> Result<Vec<object::TreeEntry>>,
+) -> Result<Option<object::TreeEntry>> {
     let mut cur = *root;
     // 先收集成 Vec：`Filter` 迭代器没有 `peek`，而"还有没有下游"必须能问第二次。
     // 段数就那么多，这点内存换掉一层 Peekable 的噪音是划算的。
@@ -115,7 +140,7 @@ pub fn resolve(
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
     for (depth, name) in parts.iter().enumerate() {
-        let entries = object::read_tree(db, pid, &cur)?;
+        let entries = list(&cur)?;
         let Some(e) = entries.into_iter().find(|e| e.name == *name) else {
             return Ok(None);
         };
@@ -609,6 +634,164 @@ fn merge_bases(index: &std::collections::BTreeMap<Hash, Vec<Hash>>, a: &Hash, b:
         })
         .cloned()
         .collect()
+}
+
+/// 落盘类命令共用的"这一本对她做了什么"（`blame` 用）。
+///
+/// **判据在这层、措辞在命令层**：枚举能被用例钉住，而 `format!` 出来的那句话钉不住。
+/// 判据是**条目本身**（`kind`+`hash`+`mode`）：与更老的那一本不同就算"动过"。
+/// `mode` 单独一支是有真内容的：`mode` 进树的 hash 但不进 blob 的 hash（§8 那条），
+/// 所以 `chmod` 之后"内容没变而这一本确实动过她"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathChange {
+    /// 更老的那一本里没有她
+    Appeared,
+    /// 这一本里没有她了
+    Disappeared,
+    /// 同一种类型，内容（blob/子树）换了
+    Content { to: Hash },
+    /// 内容一样、只有权限位变了
+    Mode { to: u32 },
+    /// 文件与目录/符号链接互换（形状变了，光看 hash 说不清）
+    KindSwap,
+}
+
+/// 一次动过：哪一本 + 对她做了什么。
+#[derive(Debug, Clone)]
+pub struct PathHit {
+    pub node: Node,
+    pub change: PathChange,
+}
+
+/// [`blame_path`] 的产物。**`truncated` 必须带回来**：窗口截断时最老那一行不代表"她第一次出现"，
+/// 命令不说这一句就是在撒谎。
+#[derive(Debug)]
+pub struct PathHistory {
+    pub hits: Vec<PathHit>,
+    /// 窗口里走了多少本
+    pub scanned: usize,
+    pub truncated: bool,
+    /// 最新那一本里她的样子（`None` = 现在没有这条路径）
+    pub now: Option<object::TreeEntry>,
+}
+
+/// **路径级归属**：按从老到新返回"动过这条路径的那些 commit"。
+///
+/// 为什么不是行级（这是产品边界，不是偷懒）：本工具的语料是 2–10 GB 的大二进制，切块单位 4 MiB，
+/// 而"行"不是任何一层的身份 —— `B` 清单里只有 `(块号, hash, 大小)`。硬做行级 blame 得到的是
+/// 看起来像 `git blame`、语义是猜的东西。
+///
+/// 代价：**一次 `T|p` 前缀扫 + 每本一次内存里逐层查**（[`resolve_cached`]）。
+/// 换成逐本点读就是 `O(版本数 × 层数)` 次门面读，而每次门面读折一遍全库（§9.6.1）。
+/// `max = 0` 是全部 ⇒ 内存 `O(历史长度)`，与 [`walk`] 同一条警告。
+pub fn blame_path(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    heads: &[Hash],
+    path: &str,
+    max: usize,
+) -> Result<PathHistory> {
+    let trees = object::TreeIndex::load(db, pid)?;
+    let nodes = walk(db, pid, heads, max)?;
+    let mut hits: Vec<PathHit> = Vec::new();
+    let mut older: Option<object::TreeEntry> = None;
+    // 从**老到新**走：这样"第一次出现"与"消失"两种情形读起来是顺的。
+    for node in nodes.iter().rev() {
+        let here = resolve_cached(db, pid, &trees, &node.commit.tree, path)?;
+        let change = match (&older, &here) {
+            (Some(a), Some(b)) if a == b => None,
+            (Some(a), Some(b)) => Some(if a.kind != b.kind {
+                PathChange::KindSwap
+            } else if a.hash != b.hash {
+                PathChange::Content { to: b.hash }
+            } else {
+                PathChange::Mode { to: b.mode }
+            }),
+            (None, Some(_)) => Some(PathChange::Appeared),
+            (Some(_), None) => Some(PathChange::Disappeared),
+            (None, None) => None,
+        };
+        if let Some(change) = change {
+            hits.push(PathHit {
+                node: node.clone(),
+                change,
+            });
+        }
+        older = here;
+    }
+    let now = match nodes.first() {
+        Some(n) => resolve_cached(db, pid, &trees, &n.commit.tree, path)?,
+        None => None,
+    };
+    Ok(PathHistory {
+        hits,
+        scanned: nodes.len(),
+        truncated: max > 0 && nodes.len() >= max,
+        now,
+    })
+}
+
+/// 无状态二分的一步（[`bisect_step`] 的产物）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BisectStep {
+    pub candidate: Hash,
+    pub suspects: usize,
+    pub bad_closure: usize,
+    pub good_closure: usize,
+}
+
+/// [`bisect_step`] 那**两种**退化形状（正常的那一支走 `Step`）。**逼进类型而不是拿魔法返回值当哨兵**：
+/// 每一条的措辞都不同，而且都必须在命令层说出来（吞掉一条就等于给用户一个错的中点）。
+///
+/// 反过来，"两端之间一条都没有"那一支**不写**，而且能证它不存在：`bad` 永远在自己的闭包里，
+/// 所以只要 `bad` 不在 `good` 的闭包中（`Reversed` 那一条已经查过），怀疑集就至少还剩 `bad` 自己。
+/// 写一个到不了的分支 = 让下一个人去测一条永远绿的路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BisectVerdict {
+    Step(BisectStep),
+    /// `--good` 不在 `--bad` 的祖先里 ⇒ 两端不在同一条线上，"之间"没有定义
+    GoodNotAncestor,
+    /// `--bad` 反而是 `--good` 的祖先 ⇒ 两端写反了
+    Reversed,
+}
+
+/// **无状态**二分的一步：从 `bad` 的闭包减掉 `good` 的闭包，取时间最靠中间的那一本。
+///
+/// 不落游标（git 那套 `BISECT_LOG`）是取舍不是省事：状态要么写库要么写文件，就有了"bisect 卡住
+/// 要先 reset"这类坏账。这里每次重算，代价是把上一条的答案抄回命令行。
+///
+/// 保证只有一条，而且是能证的那条：**候选属于怀疑集** ⇒ 每问一次区间严格变小。历史里有合并时
+/// 时间序不等于拓扑序，所以**不保证**正好缩一半 —— 这句话要命令自己说。
+pub fn bisect_step(db: &dyn KvEngine, pid: ProjectId, bad: &Hash, good: &Hash) -> Result<BisectVerdict> {
+    let index = object::parent_index(db, pid)?;
+    let bad_set = reachable_from(&index, &[*bad], &[]);
+    let good_set = reachable_from(&index, &[*good], &[]);
+    // **先判"反了"，再判"不在一条线上"**：两端写反时 `good` 的闭包确实包含 `bad`，而 `bad` 的闭包
+    // 不含 `good` —— 顺序反过来就只会报"不在同一条线上"，而那句是给不了人下一步的
+    //（正确提示是"两端换个位置"）。这是用例 `bisect_refuses_endpoints_that_are_not_on_one_line`
+    // 第一版就抓到的：判据对，措辞的可达性错了。
+    if good_set.contains(bad) {
+        return Ok(BisectVerdict::Reversed);
+    }
+    if !bad_set.contains(good) {
+        return Ok(BisectVerdict::GoodNotAncestor);
+    }
+    let suspects: BTreeSet<Hash> = bad_set.difference(&good_set).copied().collect();
+    // 时间序：`walk` 是堆序（时间倒序），窗口给"怀疑集 + good 那一支"那么大 —— 这**不少于** `bad`
+    // 的闭包（闭包 = 怀疑集 ⊔ 与 good 重合的那部分），所以一次都能收回来，不用退回别的序。
+    let ordered = walk(db, pid, &[*bad], suspects.len() + good_set.len())?;
+    let line: Vec<Hash> = ordered
+        .iter()
+        .filter(|n| suspects.contains(&n.hash))
+        .map(|n| n.hash)
+        .collect();
+    let mid = line.len() / 2;
+    Ok(BisectVerdict::Step(BisectStep {
+        candidate: line[mid],
+        suspects: suspects.len(),
+        bad_closure: bad_set.len(),
+        good_closure: good_set.len(),
+    }))
 }
 
 /// 合并出来的两种结果。`Conflict` 带的是**冲突路径**，不是错误：§7.1 要的是"报出来给人选"，

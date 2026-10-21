@@ -482,10 +482,38 @@ pub enum Cmd {
         allow_mass_delete: bool,
     },
 
+    /// M4 第二层第六条：**这条路径被哪些 commit 动过**（路径级归属，不是行级）
+    ///
+    /// 说清楚为什么不是行级：本工具的语料是 2–10 GB 的大二进制，切块单位 4 MiB，而**"行"不是
+    /// 任何一层的身份**（`B` 清单里只有块号/hash/大小）。硬做行级 blame 得到的是看起来像
+    /// `git blame`、语义却是猜的东西 ⇒ 不提供，改成"哪一版动过她、动成了什么"。
+    /// 只读命令，所以不带 `--apply`（FR-7 那句"动工作树的才要 `--apply`"）。
+    Blame {
+        /// 要问的路径（文件或目录都行；目录那一层的子树 hash 变了也算"动过"）
+        path: String,
+        /// 往回看多少本 commit。0 = 全部（那是 O(历史长度) 内存，与 `log --max-count 0` 同一条警告）
+        #[arg(long, default_value_t = 0)]
+        max: usize,
+    },
+
+    /// M4 第二层第七条：**无状态**的二分定位 —— 每次给两个端点，它算一个候选出来
+    ///
+    /// 不落游标（git 的 `BISECT_LOG` 那一套）是取舍：状态要么写库要么写文件，就有了
+    /// "bisect 卡住要先 reset"这类坏账，而这台 1 核机上常驻的不止 twosync。无状态每次重算两个闭包
+    /// （一次前缀扫 + 纯内存闭包），代价是把上一条的答案抄回命令行，换来的是**没有东西会卡住**。
+    Bisect {
+        /// 坏的那一本（rev）
+        #[arg(long)]
+        bad: String,
+        /// 好的那一本（rev，必须是 `--bad` 的祖先）
+        #[arg(long)]
+        good: String,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 剩下的 ── 跨机器真 SSH 的多 head 实测（三条出路的命令面已落 `merge`）
-    // ── M4 ── stash / blame / bisect（tag/reset/branch/merge/revert/cherry-pick 已落）
+    // ── M4 ── stash（第二层只剩这一条；它要先有"提交但不移 head"那个出口）
 }
 
 /// `tag` 的三个动作。名字规矩在 `cli::m4::check_ref_name`（与分支共用一道闸：`main`/`head` 是保留名、

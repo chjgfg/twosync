@@ -145,6 +145,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
         Cmd::Branch { cmd } => m4::branch(cli, cmd),
+        Cmd::Blame { path, max } => m4::blame(cli, path, *max),
+        Cmd::Bisect { bad, good } => m4::bisect(cli, bad, good),
         Cmd::Revert {
             rev,
             apply,
