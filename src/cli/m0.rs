@@ -21,7 +21,7 @@ use crate::utils::{self, db_dir, journal_dir, log_dir, objects_dir, projects_fil
 
 /// `Commit.peer` 的占位值。真正的 peer id 要等 M1 的 `peer add|trust`；现在填什么都一样——
 /// 它**只是元数据，不参与任何裁决**（§9.5.2 / §15.7），所以不值得为它提前做一套身份。
-const PEER_LOCAL: &str = "local";
+pub(crate) const PEER_LOCAL: &str = "local";
 
 /// 建站点目录布局。幂等：`create_dir_all` 对已存在的目录直接返回 Ok，
 /// 所以不需要"先 exists 再建"（那样反而是 TOCTOU）。

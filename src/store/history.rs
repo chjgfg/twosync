@@ -580,6 +580,188 @@ fn merge_bases(index: &std::collections::BTreeMap<Hash, Vec<Hash>>, a: &Hash, b:
         .collect()
 }
 
+/// 合并出来的两种结果。`Conflict` 带的是**冲突路径**，不是错误：§7.1 要的是"报出来给人选"，
+/// 而"报错"与"给人看"在命令层是两件事（报错的出口非零退出，这里应当只让人看见清单）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merge {
+    Done { tree: Hash },
+    Conflict { paths: Vec<String> },
+}
+
+/// 两个 commit 的共同祖先的 **tree** 哈希（不是 commit 哈希——这个换算是 `6ee9e3e` 那轮
+/// 我自己踩过一次的坑：拿 commit 哈希去查 `T` 会报成 `MissingObject`）。
+pub fn merge_base_trees(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    index: &std::collections::BTreeMap<Hash, Vec<Hash>>,
+    a: &Hash,
+    b: &Hash,
+) -> Result<Vec<Hash>> {
+    merge_bases(index, a, b)
+        .iter()
+        .map(|c| object::read_commit(db, pid, c).map(|cc| cc.tree))
+        .collect()
+}
+
+/// **结构合并**两棵树的同一层（§1："只做两侧改动路径无交集时的结构合并，不做内容级三方合并"）。
+///
+/// 逐条五分类，判据与 [`changed_paths`] 用的是同一把尺（"与**任一**共同祖先一模一样"= 没动过）：
+/// 1. 两边同名条**完全相同**（`hash`+`mode`）⇒ 取它（目录走 hash 短路：整棵子树不必下去）；
+/// 2. 两边都是目录且不一样 ⇒ **递归下去**（子项各算各的，父层自己不算一条冲突——与碰撞判定同一条规矩）；
+/// 3. 有一边相对祖先**没动** ⇒ 取动了的那一边的结果（包括它把这条删掉 ⇒ 删除生效）；
+/// 4. 只有一边有这一条、而祖先也没有 ⇒ 那是**新增**，取存在的那一边；
+/// 5. 剩下就是"两边各改成不同的东西"（或一边改一边删）⇒ 记进冲突路径，**这一层一个字都不写**。
+///
+/// 冲突是**收集完再返回**的，不是遇到就停：只报第一条冲突等于让人猜还有几条。
+/// 内存：一次只握着一层的清单（`TreeIndex` 命中时零引擎调用），与 `walk_tree` 同一形状。
+pub fn merge_trees(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    a: &Hash,
+    b: &Hash,
+    bases: &[Hash],
+) -> Result<Merge> {
+    let index = object::TreeIndex::load(db, pid)?;
+    let mut m = Merger {
+        db,
+        pid,
+        index: &index,
+        conflicts: Vec::new(),
+    };
+    let tree = m.level(bases, a, b, "")?;
+    if !m.conflicts.is_empty() {
+        return Ok(Merge::Conflict {
+            paths: std::mem::take(&mut m.conflicts),
+        });
+    }
+    Ok(Merge::Done {
+        // 根这一层不会合空（两边都是 commit 的 tree，空目录有 `empty_tree` 特判），
+        // 这里兜的是"两边都指向同一棵空树"那种退化形状。
+        tree: tree.unwrap_or_else(object::empty_tree),
+    })
+}
+
+/// 逐层合并的执行者。**收成结构而不是给函数塞八个参数**：`db`/`pid`/清单索引/冲突收集器
+/// 是每一层都要带的四样，它们是同一次合并的"现场"，不是调用方可选的旋钮
+/// （clippy 的 7 参上限报的就是那形状 —— 参照 `PushArgs` 那条同样的处理，不加 `#[allow]`）。
+struct Merger<'a> {
+    db: &'a dyn KvEngine,
+    pid: ProjectId,
+    index: &'a object::TreeIndex,
+    conflicts: Vec<String>,
+}
+
+impl Merger<'_> {
+    /// 合并一层。返回 `None` = 这一层合完是**空的**（该目录两边都被删 ⇒ 父层因此不放这一条）。
+    fn level(&mut self, bases: &[Hash], a: &Hash, b: &Hash, prefix: &str) -> Result<Option<Hash>> {
+        let la = self.index.list(self.db, self.pid, a)?;
+        let lb = self.index.list(self.db, self.pid, b)?;
+        // 祖先可能有几个（criss-cross）。"没动过"是**对任意一个祖先**成立就算。
+        let base_lists: Vec<Vec<object::TreeEntry>> = bases
+            .iter()
+            .map(|h| self.index.list(self.db, self.pid, h))
+            .collect::<Result<_>>()?;
+
+        // 并集的名字：三份清单（两边 + 各祖先）去重后排序 ⇒ 合并结果与遍历顺序无关。
+        let mut names: Vec<&str> = Vec::new();
+        for l in [&la, &lb] {
+            for e in l {
+                if !names.contains(&e.name.as_str()) {
+                    names.push(&e.name);
+                }
+            }
+        }
+        for l in &base_lists {
+            for e in l {
+                if !names.contains(&e.name.as_str()) {
+                    names.push(&e.name);
+                }
+            }
+        }
+        names.sort_unstable();
+
+        let mut out: Vec<object::TreeEntry> = Vec::new();
+        for name in names {
+            let ea = la.iter().find(|x| x.name == name);
+            let eb = lb.iter().find(|x| x.name == name);
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            // ① 两边完全一样（含"两边都没有"= 都删了）⇒ 直接取，连递归都省。
+            if ea == eb {
+                if let Some(x) = ea {
+                    out.push((*x).clone());
+                }
+                continue;
+            }
+            // ② 两边都是目录且不一样 ⇒ 递归。放在"没动过"之前：目录 hash 不同**不代表**子项冲突。
+            if ea.is_some_and(|x| x.kind == Kind::Dir) && eb.is_some_and(|x| x.kind == Kind::Dir) {
+                let sub_bases: Vec<Hash> = base_lists
+                    .iter()
+                    .filter_map(|l| l.iter().find(|x| x.name == name))
+                    .filter(|x| x.kind == Kind::Dir)
+                    .map(|x| x.hash)
+                    .collect();
+                let merged =
+                    self.level(&sub_bases, &ea.unwrap().hash, &eb.unwrap().hash, &path)?;
+                if let Some(h) = merged {
+                    let mut e = ea.unwrap().clone();
+                    e.hash = h;
+                    // size 恒 0（定义在 `worktree::logical_size`）。mode 取 a 侧：目录本身两边不同
+                    // 而内容能合，是"权限各自改"那种，v1 不裁决，取第一个 head 那一侧。
+                    out.push(e);
+                }
+                // 子树合空了 ⇒ 这个目录两边都没了，父层不放这条。
+                continue;
+            }
+            // ③ 有一边相对祖先没动 ⇒ 取动了的那一边（包括它把这条删掉）。
+            let a_untouched = base_lists
+                .iter()
+                .any(|l| l.iter().find(|x| x.name == name).is_some_and(|x| Some(x) == ea));
+            let b_untouched = base_lists
+                .iter()
+                .any(|l| l.iter().find(|x| x.name == name).is_some_and(|x| Some(x) == eb));
+            if a_untouched {
+                if let Some(x) = eb {
+                    out.push((*x).clone());
+                }
+                continue;
+            }
+            if b_untouched {
+                if let Some(x) = ea {
+                    out.push((*x).clone());
+                }
+                continue;
+            }
+            // ④ 祖先里都没有 ⇒ 有一边纯粹是新增，取存在的那一边
+            //    （与 `collisions` 同一条判据：只有"两边都有且不一样"才算冲突）。
+            if ea.is_none() || eb.is_none() {
+                out.push(ea.or(eb).unwrap().clone());
+                continue;
+            }
+            // ⑤ 两边各改成不同东西 ⇒ 记下来，这一层不写盘。
+            self.conflicts.push(path);
+        }
+
+        if self
+            .conflicts
+            .iter()
+            .any(|p| p.starts_with(prefix) && p.len() > prefix.len())
+        {
+            // 这一层（或它的子层）里有冲突 ⇒ 别再 put_tree，否则父层会拿到一个 hash 去引用
+            // 一份"其实没合上"的清单。上层靠 conflicts 非空来收场。
+            return Ok(None);
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(object::put_tree(self.db, self.pid, &out)?))
+    }
+}
+
+
 /// 一棵树相对**若干基的清单**（`bases` 是 tree 哈希，不是 commit 哈希）的变更集：路径 → 那条路径上的 `(hash, mode)`（新增时基里没有 ⇒ 也算变更）。
 ///
 /// `bases` 为空 = 没有共同祖先 ⇒ 与空树比，两边所有路径都算"自己动的"。

@@ -411,6 +411,28 @@ pub enum Cmd {
         allow_mass_delete: bool,
     },
 
+    /// M3 的裁决面：多 head 之后怎么办（§7.1 三条出路，三选一）
+    ///
+    /// 不带旗标 = 只报现场（几个 head、几条碰撞、能不能结构合并）。这一步**什么都不写**，
+    /// 与 `plan`/`checkout` 同一套规矩（FR-7：不带 `--apply` 只许读）。
+    Merge {
+        /// 路径无交集时生成一个两亲的合并 commit（§1：不做内容级三方合并）
+        #[arg(long)]
+        keep_both: bool,
+        /// 取"本站自己写的"那一个 head：落地 + 挪 head 两步（走 `reset`）
+        #[arg(long)]
+        take_local: bool,
+        /// 取"那场会话收进来的"那一个 head：同上
+        #[arg(long)]
+        take_remote: bool,
+        /// 真的执行。省略时只报
+        #[arg(long)]
+        apply: bool,
+        /// 越过 FR-10 删除熔断（选边之后工作树要删很多时由人明确表态）
+        #[arg(long)]
+        allow_mass_delete: bool,
+    },
+
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
     // ── M3 ── pull / sync

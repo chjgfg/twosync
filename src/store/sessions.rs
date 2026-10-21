@@ -137,6 +137,27 @@ pub fn recent(db: &dyn KvEngine, pid: ProjectId, n: usize) -> Result<Vec<Session
     Ok(out)
 }
 
+/// **本站自己收进来、并落到自己 head 上的那些 commit**（`merge --take-remote` 用来认"哪一个是对方来的"）。
+///
+/// 只看本端在**收**的那两向（`Pull`、`agent 收`）：`Push` 那一条记的 `accepted` 是**对面**验收的
+/// commit，把它算进来就会得出"我推出去的东西是对面来的"这种反话。
+///
+/// 这是一条**会随历史变旧**的判据（§14 Q18 记着：要把来源变成永久事实，得往 `H` 的值里写）。
+/// 所以现在这样用是安全的：它只用来在"两个 head 里认出一个对方来的"，
+/// **认不出或认出多个时调用方必须拒绝**（`merge` 就是这么做死的），不许挑一个。
+pub fn accepted_here(db: &dyn KvEngine, pid: ProjectId) -> Result<std::collections::BTreeSet<Hash>> {
+    let mut out = std::collections::BTreeSet::new();
+    for r in recent(db, pid, usize::MAX)? {
+        if r.dir.is_send() {
+            continue;
+        }
+        if let Some(h) = r.accepted {
+            out.insert(h);
+        }
+    }
+    Ok(out)
+}
+
 /// `ahead`/`behind`：本端 head 与"上次会话时看到的对端 head"之间各差几个 commit。
 ///
 /// 用的是**可达闭包的差**，不是 head 个数的差：head 集合里一个 commit 可能带着整条链，

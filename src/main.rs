@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use twosync::cli::cmd::{DaemonArgs, PullArgs, PushArgs};
-use twosync::cli::{m0, m1, m2, m4};
+use twosync::cli::{m0, m1, m2, m3, m4};
 use twosync::cli::{Cli, Cmd, Import};
 use twosync::error::Result;
 
@@ -144,6 +144,20 @@ fn dispatch(cli: &Cli) -> Result<()> {
         ),
         Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
+        Cmd::Merge {
+            keep_both,
+            take_local,
+            take_remote,
+            apply,
+            allow_mass_delete,
+        } => m3::merge(
+            cli,
+            *keep_both,
+            *take_local,
+            *take_remote,
+            *apply,
+            *allow_mass_delete,
+        ),
         Cmd::Reset {
             rev,
             apply,
