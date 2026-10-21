@@ -58,7 +58,7 @@ Win10 上配好"哪些项目要同步"，Ubuntu 那端接手同一个项目、�
 | tree | 一个目录清单：`name → (kind, blob_hash, mode, size)`，按目录切分 |
 | commit | `(parents[], tree, peer, ts, msg, stats)`，不可变；parents 是 0..N 个 |
 | head | "最前沿"的 commit；一个 project 在一个 peer 上**同时可有多个 head** |
-| ref | 命名的 head 集合。同步只看 `main`；`branch`/`tag` 是本地命名，**v1 不参与同步**（§16.2） |
+| ref | 命名的 head 集合。同步只看 `main`；`branch`/`tag` 是本地命名，**v1 不参与同步**（§16.2）。**落地状态（2026-10-21）**：`tag`（钉子）与 `branch`（活口）都在，两者共用 §9.2 那一格。"**不参与同步**"这句现在是**事实而不是承诺**：`net::session` 与 `push`/`pull` 三处取 head 用的都是 `ref_heads(_, MAIN)`，全库没有任何一条同步路径读别的 ref。分支在这里兑现的两件事：① 那段历史被 ref 担保 ⇒ `gc` 收不到（§9.3）；② 名字直接当 revspec 用 ⇒ `reset <分支>` / `checkout --at <分支>` 不必敲哈希。**没有"当前分支"**（做它要改 `commit`/`push`/`pull`/`status`/`gc` 五处的读法，而 1+1 台位没有第三个东西要同步）⇒ 分支**不会自己往前走**，要跟上得 `branch move <名> --to HEAD` |
 | CAS | 内容寻址块仓，**站点级共享**：`<root>/.twosync/objects/<hash[0:2]>/<hash[2:]>`，块元数据行带 `project_id` 命名空间 |
 | 引擎 | `storage_engines::engine::KvEngine`（默认 `lsm_tree`），只存**元数据与清单**，不存文件字节 |
 | union | 两个 peer 的 head 集合取可达并集，取代 v0.2 的"快进"判定（§7） |
@@ -88,7 +88,7 @@ Win10 上配好"哪些项目要同步"，Ubuntu 那端接手同一个项目、�
 | FR-5 | **块级增量**：推之前做 `want/have` 块清单协商，只传对端缺失的块；**对象（`B`/`T`）也走差集**——拿亲代当基线，同名同 hash 的子树整块跳过（2026-10-18 补，§17 补记廿三：原来只有块有协商，清单每次全重发）；默认定长 4 MiB，CDC 列为 M4 增强 | 改 10 GB 文件中的 1 MB → 传输量 ≤ 若干 MB，**与 git 的传输量对比写进 README**。实测三臂在 §11.3（同形状修前 7.04 MiB / 修后 4.07 MiB；跨块最坏 8.07 MiB，口径见 §14 Q15） |
 | FR-6 | 海量小文件批量打包（**一条 SSH 连接多路复用 N 个 project + 批帧**），不把 RTT 打爆 | 1 万个 4 KB 文件的初次推送耗时可解释 |
 | FR-7 | `plan` 输出本次会提交什么 + union 判定结果 + 会碰撞的路径，**默认不执行**；`apply` 才执行 | 任何破坏性动作都有 dry-run 前置 |
-| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `merge/branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测。**落地状态（2026-10-20，2026-10-21 更新）**：第一层除 `install`/`sync` 那类尚未定义的以外都在（外加 `daemon`/`peer`/`project`/`mv`/`ls-files`/`version`）；第二层**已落三条**：`tag`（`e3e860f`，§9.3 那句"显式 `pinned`"的实现）、`reset`（`acb560f`，§7.1"选一边"的那一步真命令 —— 挪 head 集合，历史不丢）、`merge`（`e6323a5`，§7.1 三条出路的命令面：`--keep-both` 结构合并 + `--take-local`/`--take-remote`）。**名单本身补一处漏**：`merge` 原来没写进这两层的任何一行，它是第二层的"图上重写"（产出一笔两亲 commit），已补进上面那串。其余五条（branch/revert/stash/cherry-pick/blame/bisect）未动；`--take-local`/`--take-remote` 那两枚糖**不再卡在 §14 Q18**：改从会话账 `S` 倒推来源（`sessions::accepted_here`），代价是只在答案唯一时才动 —— Q18 那条"把来源变成永久事实"仍然是 open |
+| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `merge/branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测。**落地状态（2026-10-20，2026-10-21 更新）**：第一层除 `install`/`sync` 那类尚未定义的以外都在（外加 `daemon`/`peer`/`project`/`mv`/`ls-files`/`version`）；第二层**已落四条**：`tag`（`e3e860f`，§9.3 那句"显式 `pinned`"的实现）、`reset`（`acb560f`，§7.1"选一边"的那一步真命令 —— 挪 head 集合，历史不丢）、`merge`（`e6323a5`，§7.1 三条出路的命令面：`--keep-both` 结构合并 + `--take-local`/`--take-remote`）、`branch`（本批，tag 的"可以挪"版本：`list/add/rm/move/rename`，同一格 ref + 名字可当 revspec）。**名单本身补一处漏**：`merge` 原来没写进这两层的任何一行，它是第二层的"图上重写"（产出一笔两亲 commit），已补进上面那串。其余五条（revert/stash/cherry-pick/blame/bisect）未动；`--take-local`/`--take-remote` 那两枚糖**不再卡在 §14 Q18**：改从会话账 `S` 倒推来源（`sessions::accepted_here`），代价是只在答案唯一时才动 —— Q18 那条"把来源变成永久事实"仍然是 open |
 | FR-9 | **有界历史**：CAS 配额默认 ≤ root 体积 20%（**站点级全局配额**，非每项目），超出时按"最老且不可达优先 / 同 commit 整批淘汰"回收，**不得**删掉仍被保留 head 可达的块。淘汰顺序与保留意图（版本数 N / 天数 D）可配 | §10 不变量 (d) |
 | FR-10 | **删除熔断**：commit 的删除条目数 > max(已知条目的 20%, **20 条**) 或删除字节 > 2 GB → 拒绝该 commit 进 head 集合、退出码非 0，需 `--allow-mass-delete`。理由是防客户端 bug 把误 `rm -rf` 变成合法历史，不是防并发。**绝对下限是本版加的**：纯 20% 在小项目上不可用（2 个文件删 1 个就是 50%，那个仓库从此提不了交），而熔断要拦的是规模不是比例。本地 `commit` 与接收侧**都过这道闸** | 清空本地 root 后 sync，对端不动并报警；100 条里删 30 条 → 本地 commit 也拒 |
 | FR-11 | **多 head 与碰撞处理**（§7）：默认 union；出路 = `--take-local` / `--take-remote` / `--keep-both`（仅无碰撞时结构合并）/ 交给 git | 表格逐行有单测 |
@@ -290,7 +290,7 @@ v0.1 那张 16 行"相对 base 动作为 A/B"的裁决表**整张作废**（它�
 | `K` | `K\|p\|block_hash` | 块元数据：size, chunk_param, refcnt, last_access_ts, pinned | `want/have` 反查、去重统计 |
 | `k` | `k\|p\|refcnt_be\|block_hash` | 空（存在即索引） | **按 refcnt 排序的二级索引**：GC 找 0 是 `prefix_scan(k\|p\|\x00…)`，不是全表扫。**实现偏差见 §9.3**（dry-run 要报"将要归零几个"，所以 `gc` 改扫全部 `K` 行；索引照常维护） |
 | `W` | `W\|p\|path`（**目录行的 `path` 尾带一个 `/`**） | worktree 状态：kind, blob_hash, size, mtime_hint_ns, mode, symlink_target, scanned_at | 脏判定；大小写唯一性检查；**`scanned_at` 兼任"本轮看见过"的存活性标记**（见 §8 与 §17 补记）。目录为什么要多一个斜杠：**`W` 的键序就是字节序，而 `'/'`(0x2F) 夹在 `.`(0x2E) 与 `0`(0x30) 之间** ⇒ 目录行若叫 `src`，它会被兄弟 `src.rs` 与子项 `src/main.rs` 隔开，流式建树的栈就必须在"这一层还没走完"时提前结算 ⇒ 同一个目录两条条目（§17 补记十五的真 bug）。键成 `src/` 之后"目录自己 + 它全部子项"共享前缀 ⇒ 天然连续。读出来时由 `LiveRows` 剥掉那个斜杠，**路径形状对下游一字不变** |
-| `H` | `H\|p\|ref_name\|commit_hash` | 空（存在即 head）。**原设计的 `is_head` 标记已废弃**：head 身份已经在键里，值再存一份就是两个真值 | head 集合 = `prefix_scan(H\|p\|main\|\x00)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因）。**2026-10-20 起别的名字也活了**：`tag` 往同一张表写 `H|p|<tag名>\0hash`（§9.3 的 pin 就是这个），`history::rev_base` 解析时**命名引用排在 hash 前缀之前** ⇒ `tag add` 那一侧必须拒绝长得像 hash 前缀的名字（`^[0-9a-f]{7,}$`）与保留名 `main`/`head`，否则"谁先查谁赢"就成了人看不见的裁决 |
+| `H` | `H\|p\|ref_name\|commit_hash` | 空（存在即 head）。**原设计的 `is_head` 标记已废弃**：head 身份已经在键里，值再存一份就是两个真值 | head 集合 = `prefix_scan(H\|p\|main\|\x00)`；**一对多天然表达**（这是 v0.2 单主键 `refs` 撑不住多 head 的根因）。**2026-10-20 起别的名字也活了**：`tag` 往同一张表写 `H|p|<tag名>\0hash`（§9.3 的 pin 就是这个），`history::rev_base` 解析时**命名引用排在 hash 前缀之前** ⇒ `tag add` 那一侧必须拒绝长得像 hash 前缀的名字（`^[0-9a-f]{7,}$`）与保留名 `main`/`head`，否则"谁先查谁赢"就成了人看不见的裁决。**2026-10-21 `branch` 也走同一张表**：**类型编进名字而不是新开一种键**（分支 = `H|p|refs/heads/<名>\0hash`）。换来三条性质，代价零：① `gc` 的保留集从"全部 ref"出发 ⇒ 分支自动 pin；② `rev_base` 多试一种拼法就能用分支名当 revspec（两次查表共用**同一次**前缀扫，不是多一次折全库）；③ `tag list`/`branch list` 各按前缀筛，谁也不会把对方列进自己。**同名的两种拼法不可能同时命中**（tag 与分支共用一道名字闸，都拒绝 `refs/` 开头）⇒ 那一格的"解析顺序就是裁决"这条老规矩没被削弱 |
 | `A` | `A\|p\|path_folded` | canonical path | **不落地（2026-10-17 决定）**：它本来是 §8 大小写唯一映射的索引，但写一行 `A` = 每行多一次引擎调用，而 0.4.0 上**每次调用都要折一遍全库**（§9.6.1）⇒ 比"检出前按层预检"贵一个数量级，后者一次只握着一层的清单（本来就在手里）。折叠比较改在 `checkout`/导出 前跑（`checkout::check_case_collisions` + `history::walk_levels`）；`TAG_FOLDED`/`folded_key` 作为格式位保留，`keys::fold_path` 是**唯一一份**折叠规则 |
 | `S` | `S\|p\|session_id_be` | 会话统计（**2026-10-20 落地**，`store::sessions::SessionRecord`）：方向、块/字节、跳过、耗时、两边的 head 集合、验收的那个 commit。会话 id = 开始时刻的**纳秒**，所以键序就是时间序 | `status`。**为什么必须存而不是当场算**：那三格（耗时、传输字节、当时的对端 head）是**历史事实**不是当前状态 —— 头两样只有发起方知道，第三样会话一结束就取不到了。读侧对坏账是**跳过而不是报错**（`status` 是"看一眼"的命令，不该被一行坏账卡死） |
 | `P` | `P\|peer_id`（无 project 前缀，站点级） | TOFU 指纹 + 拨号偏好 | §9.5 |
@@ -602,7 +602,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    > **O(目录数)**。同时"一折 ≈ 1.4 s"的单价也标错过（那是 `health()` 的元数据遍），
    > 同一次会话两读给出 **release ≈ 0.5 s/折、debug ≈ 4 s/折**。计数读数已经做出来了，本节就是它的第一张表。（而不是继续拿 ±2× 的墙钟猜），再决定批量装载谁** |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证）。**现状（2026-10-20）**：§7 表**前四行都有单测**了（"我该拉/该推/已同步/多 head 是正常态"走 `pull`+`push` 用例，`pull_then_pull_converges_two_independently_committed_sites` 就是 union 那一行）；**第五行 collision 的检测与报账已落**（`6ee9e3e`，判据写在 §7.1）——"必须停而非猜"的程序侧是 `one_commit` 那道闸。**还欠**：~~`--take-local/--take-remote` 的旗标糖（实质等价于 `checkout --at <head>`，已有）、`--keep-both` 的多亲合并（整个没做，属 M4）~~ —— **2026-10-21 两条都落了**（`e6323a5`：`merge` 的三个旗标 + 目录层五条规则 + "来源认不出唯一就拒绝"，逐条见 §7.1 修订。内容层三方合并仍是不做，见 §16.2 第三层）；~~§7.2 的 deferred 列表在 `status` 里的可见性~~（**`d0df7c3` 已做**，四个动作逐条见 §7.2 落地状态）、以及跨机器真 SSH 下的多 head 实测 |
-| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**224 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。**第二层的前两条已落**：`tag`（`e3e860f`，§9.3 的 pin）与 `reset`（`acb560f`，§7.1 的"选一边"）。CDC/稀疏重建/批传输调优，以及 branch/revert/stash/cherry-pick/blame/bisect 未动 |
+| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**224 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。**第二层已落三条**：`tag`（`e3e860f`，§9.3 的 pin）、`reset`（`acb560f`，§7.1 的"选一边"）、`branch`（本批：tag 的"可以挪"版本，同一格 ref + 名字当 revspec，判据见 §9.2 的 `H` 行与 §17 补记四十二）。CDC/稀疏重建/批传输调优，以及 revert/stash/cherry-pick/blame/bisect 未动 |
 | **M5 多端（暂不承诺）** | 真 3+ peer：部分连通路由、NAT 穿透或自建中继、commit 签名 | 需先重开范围评审；**不在 v1 交付路径上** |
 
 M0–M1 **不需要**回答 §14 任何问题就能开工。
@@ -1613,7 +1613,7 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
 | 层 | 命令 | 代价 | 归属 |
 |---|---|---|---|
 | 一：读历史（有 DAG 就白送） | `status log diff show checkout restore ls-files gc` | 低 | M0–M1 |
-| 二：图上重写/重放 | `branch tag reset revert stash cherry-pick commit --amend blame bisect project use` | 中。`branch` = ref 命名空间（`H` 前缀里换 `ref_name`）；`blame/bisect` = DAG 遍历；`stash` = 一个临时 commit，近乎免费 | M3–M4 |
+| 二：图上重写/重放 | `branch tag reset revert stash cherry-pick commit --amend blame bisect project use` | 中。`branch` = ref 命名空间（`H` 前缀里换 `ref_name`）；`blame/bisect` = DAG 遍历；`stash` = 一个临时 commit，近乎免费。**落地状态（2026-10-21）**：`tag`（钉子）、`reset`（挪 head 集合）、`branch`（活口：`list/add/rm/move/rename`，存在 `refs/heads/` 那一格、名字直接当 revspec、**不参与同步**）三条已在；revert/stash/cherry-pick/blame/bisect 未动 | M3–M4 |
 | 三：内容三方合并 | `merge`（有同路径交集时）、`rebase -i` 的冲突解决 | **另一个量级的工程，且与 §1 的分工矛盾**（跨 OS 编辑同一份源码本该交给真 git）→ 不提供，给明确报错 | **结构那一半已落**（M3，`e6323a5`）；内容合并不做 |
 
 - **`plan` / `apply` 是 FR-7 的命名对，不是两条流水线**：`plan` 只读（预演"这次会提交什么"+ FR-10 熔断预演 + head 会怎么动），
@@ -2585,6 +2585,54 @@ ref 可达，删它的块就违反不变量 (d)；GC 是全站唯一一个"写�
 **顺手记一条对己不利的**：首建库那一格 **git 赢**（`.git` 83.2 MiB vs 我们 561.1 MiB），因为它 zlib 压了
 6.7 倍而我们按设计不压。表里原样留着，不藏——它同时解释了为什么"增量 17.9 倍"那个数还是**下界**：
 连偏袒对手的语料形状下我们都赢，满熵那一把（压缩比 1.00）里 git 的增量 = 整个文件。
+
+### v0.4 补记四十二（2026-10-21，`branch`：同一格 ref 的第二种脾气，以及"读全部 ref"那句的账）
+
+五条用例级决定 + 一处顺带抓到的老读数。用例 8 条新增，**244 passed / 0 failed**（default 与 `bplus_tree`
+各跑一遍），clippy 0 警告。
+
+**① 类型编进名字，不开新键。** 分支就是 `H|p|refs/heads/<名>\0hash`，与 tag 同一格（§9.2）。
+不开新键的理由是**解释权只有一处**：`all_ref_heads`/`all_named_refs` 同时是 `gc` 保留集的来源，
+多改一处就多一处"少收一个 ref = 删历史"的机会。换来三条白送的性质：`gc` 自动把分支当 pin；
+`rev_base` 多试一种拼法就能用分支名当 revspec；两个 `list` 各按前缀筛。
+代价测过形状：`rev_base` 从"一次 `ref_heads` 前缀扫"换成"一次 `all_named_refs` 前缀扫 + 两次查表"
+⇒ **折全库的次数不变**（门面每扫一次折一遍，§9.6.1）。这一条没重跑折数探针，是从调用形状推的。
+
+**② 同名要跨类型拒。** 只查自己那一格（"分支查 `refs/heads/foo`、tag 查 `foo`"）就能让
+`tag foo` 与分支 `foo` 同时存在，那时 `rev_base` 先命中 tag ⇒ 分支被藏住，而 `branch list` 里明明有一条、
+`reset foo` 用的是另一个东西。所以 `holder()` 按**显示名**比，且 tag 与分支**共用一道名字闸**
+（`check_ref_name`，新增"不许以 `refs/` 开头"—— 允许它等于允许人伪造另一个命名空间）。
+两个方向各有用例。
+
+**③ 没有"当前分支"，这是省下来的一大坨而不是少做的一条。** 做它要改 `commit`/`push`/`pull`/`status`/`gc`
+五处的读法（"head 集合从哪个 ref 取"），而 §2.3 的 1+1 台位里根本没有第三个东西要同步 ⇒ 与"同步只看
+`main`"直接矛盾。所以分支只兑现两件事：**pin** 与 **名字当 revspec**，并且命令自己把第三件事说死——
+"`commit` 只移 main，分支不会自己往前走"（用例 `a_branch_does_not_walk_forward_by_itself` 钉的就是这句）。
+
+**④ "松开了几条 commit"要减掉其余全部 ref，不是只比 `main`。** 两个分支常常共用祖先，只比 main 会在删
+第一个时报"松开 1 条"——那是吓人。判据搬到库层（`history::unheld_by_other_refs`，纯函数）才有用例可钉：
+`only_the_commits_nobody_else_holds_are_released`。搬的理由与 §7.1 那条同源：**"检测"与"合并"共用一把尺，
+"报账"与"回收"也必须共用一把尺**（`gc` 的保留集正是从全部 ref 出发的）。
+
+**⑤ 改名先建新再删旧。** `set_ref` 是一笔事务，但两步之间不是。反过来做，崩在中间会留下
+"旧名字已删、新名字没建"的空档 ⇒ 那段历史当场无 ref 挂着，而 `daemon` 的周期 gc 就在后面。
+现在的顺序最坏是**两个名字指着同一个 commit**，谁也不丢。
+
+**⑥ 顺带抓到一条读数的口径**：`daemon` 那句"这轮有没有提交"用的是 `all_ref_heads(_, None)`（全部 ref）。
+以前它等价于 head 集合，因为那时只有 `main` 一格有名字；**分支/ tag 出现之后**，"这十分钟里有人打了个 tag"
+也会让它报"有提交"。改成 `ref_heads(_, MAIN)`。沉淀成规矩：**凡是写"全部 ref"的地方，问的问题必须真是
+"全部 ref"** —— `gc` 的保留集是，"head 动没动"不是。
+
+**实测（release，站点在 `%TEMP%` = C: SSD，1 文件 2 commit 的小项目；报的全是计数，不报秒——这台机器上
+墙钟 run 间 ±2× 且与构建同盘）**：分支挂着 v2 时
+`gc --sweep` 报 **保留 2 事务 / 回收 事务 0**；`branch rm keep` 自己报"这 1 条 commit 现在没有任何 ref 挂着"，
+同一条 `gc --sweep` 变成 **保留 1 / 回收 事务 1 / tree 1 / 清单 1 / 待删 1 块 5 B**；
+`show keep` 从此拒绝（"既不是 HEAD/main，也不是已知的 tag 或分支"）。
+命令行还验了：`branch list` 不出现在 `tag list`、同名双向被拒、`reset old --apply` 用分支名当 revspec 落地
+（工作树 `覆盖 1`）。
+
+文档：§9.2 的 `H` 行（前缀即类型 + 三条白送性质）、§5 的 `ref` 行（"不参与同步"现在是事实：三处 head 读的都是 `MAIN`）、
+§16.2 第二层那一行、FR-8、M4 现状、本条。
 
 ### v0.4 补记四十一（2026-10-21，`e6323a5`：`merge` 三条出路 —— 一次"检测"与"合并"必须同尺的活）
 
