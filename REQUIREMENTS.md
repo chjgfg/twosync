@@ -88,7 +88,7 @@ Win10 上配好"哪些项目要同步"，Ubuntu 那端接手同一个项目、�
 | FR-5 | **块级增量**：推之前做 `want/have` 块清单协商，只传对端缺失的块；**对象（`B`/`T`）也走差集**——拿亲代当基线，同名同 hash 的子树整块跳过（2026-10-18 补，§17 补记廿三：原来只有块有协商，清单每次全重发）；默认定长 4 MiB，CDC 列为 M4 增强 | 改 10 GB 文件中的 1 MB → 传输量 ≤ 若干 MB，**与 git 的传输量对比写进 README**。实测三臂在 §11.3（同形状修前 7.04 MiB / 修后 4.07 MiB；跨块最坏 8.07 MiB，口径见 §14 Q15） |
 | FR-6 | 海量小文件批量打包（**一条 SSH 连接多路复用 N 个 project + 批帧**），不把 RTT 打爆 | 1 万个 4 KB 文件的初次推送耗时可解释 |
 | FR-7 | `plan` 输出本次会提交什么 + union 判定结果 + 会碰撞的路径，**默认不执行**；`apply` 才执行 | 任何破坏性动作都有 dry-run 前置 |
-| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `merge/branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测。**落地状态（2026-10-20，2026-10-21 更新）**：第一层除 `install`/`sync` 那类尚未定义的以外都在（外加 `daemon`/`peer`/`project`/`mv`/`ls-files`/`version`）；第二层**已落四条**：`tag`（`e3e860f`，§9.3 那句"显式 `pinned`"的实现）、`reset`（`acb560f`，§7.1"选一边"的那一步真命令 —— 挪 head 集合，历史不丢）、`merge`（`e6323a5`，§7.1 三条出路的命令面：`--keep-both` 结构合并 + `--take-local`/`--take-remote`）、`branch`（本批，tag 的"可以挪"版本：`list/add/rm/move/rename`，同一格 ref + 名字可当 revspec）、**`revert` 与 `cherry-pick`**（`40bcd7c`，同一把结构三方尺的参数换位；顺带把"只报那一趟连清单行都不写"钉成 `history::Emit`）。**名单本身补一处漏**：`merge` 原来没写进这两层的任何一行，它是第二层的"图上重写"（产出一笔两亲 commit），已补进上面那串。其余三条（stash/blame/bisect）未动；`--take-local`/`--take-remote` 那两枚糖**不再卡在 §14 Q18**：改从会话账 `S` 倒推来源（`sessions::accepted_here`），代价是只在答案唯一时才动 —— Q18 那条"把来源变成永久事实"仍然是 open |
+| FR-8 | 命令面（git 形状，分层见 §16.2）：第一层 `status/log/diff/show/checkout/restore/commit/push/pull/plan/apply/gc/agent/config`；第二层 `merge/branch/tag/reset/revert/stash/cherry-pick/blame/bisect` | 每条有单测。**落地状态（2026-10-20，2026-10-21 更新）**：第一层除 `install`/`sync` 那类尚未定义的以外都在（外加 `daemon`/`peer`/`project`/`mv`/`ls-files`/`version`）；第二层**已落七条**：`tag`（`e3e860f`，§9.3 那句"显式 `pinned`"的实现）、`reset`（`acb560f`，§7.1"选一边"的那一步真命令 —— 挪 head 集合，历史不丢）、`merge`（`e6323a5`，§7.1 三条出路的命令面：`--keep-both` 结构合并 + `--take-local`/`--take-remote`）、`branch`（本批，tag 的"可以挪"版本：`list/add/rm/move/rename`，同一格 ref + 名字可当 revspec）、**`revert` 与 `cherry-pick`**（`40bcd7c`，同一把结构三方尺的参数换位；顺带把"只报那一趟连清单行都不写"钉成 `history::Emit`）、**`blame` 与 `bisect`**（本批：`blame` = **路径级**归属，五种变化分开报，理由与边界见 §15 第 27 条；`bisect` = **无状态**二分，只承诺"区间严格变小"，见 §15 第 28 条）。**名单本身补一处漏**：`merge` 原来没写进这两层的任何一行，它是第二层的"图上重写"（产出一笔两亲 commit），已补进上面那串。**第二层只剩 `stash` 一条**（它缺一个前置出口："提交但不移 head"——现在 `build::build` 的最后一步就是移 ref，硬做 stash 就得先把那一步变成可选，那是库层改动不是命令层）；`--take-local`/`--take-remote` 那两枚糖**不再卡在 §14 Q18**：改从会话账 `S` 倒推来源（`sessions::accepted_here`），代价是只在答案唯一时才动 —— Q18 那条"把来源变成永久事实"仍然是 open |
 | FR-9 | **有界历史**：CAS 配额默认 ≤ root 体积 20%（**站点级全局配额**，非每项目），超出时按"最老且不可达优先 / 同 commit 整批淘汰"回收，**不得**删掉仍被保留 head 可达的块。淘汰顺序与保留意图（版本数 N / 天数 D）可配 | §10 不变量 (d) |
 | FR-10 | **删除熔断**：commit 的删除条目数 > max(已知条目的 20%, **20 条**) 或删除字节 > 2 GB → 拒绝该 commit 进 head 集合、退出码非 0，需 `--allow-mass-delete`。理由是防客户端 bug 把误 `rm -rf` 变成合法历史，不是防并发。**绝对下限是本版加的**：纯 20% 在小项目上不可用（2 个文件删 1 个就是 50%，那个仓库从此提不了交），而熔断要拦的是规模不是比例。本地 `commit` 与接收侧**都过这道闸** | 清空本地 root 后 sync，对端不动并报警；100 条里删 30 条 → 本地 commit 也拒 |
 | FR-11 | **多 head 与碰撞处理**（§7）：默认 union；出路 = `--take-local` / `--take-remote` / `--keep-both`（仅无碰撞时结构合并）/ 交给 git | 表格逐行有单测 |
@@ -602,7 +602,7 @@ storage-engines = "0.4.0"          # 默认：crates.io 快照，可复现、CI 
    > **O(目录数)**。同时"一折 ≈ 1.4 s"的单价也标错过（那是 `health()` 的元数据遍），
    > 同一次会话两读给出 **release ≈ 0.5 s/折、debug ≈ 4 s/折**。计数读数已经做出来了，本节就是它的第一张表。（而不是继续拿 ±2× 的墙钟猜），再决定批量装载谁** |
 | **M3 双向 + 多 head** | 两 peer 独立提交；§7 五行表全实现；union 判定；collision 报告 + 四条出路；§7.2 deferred | 不变量 (a)(b)(c)(e) 通过；§7 表逐行有单测；collision 必须停而非猜（人工验证）。**现状（2026-10-20）**：§7 表**前四行都有单测**了（"我该拉/该推/已同步/多 head 是正常态"走 `pull`+`push` 用例，`pull_then_pull_converges_two_independently_committed_sites` 就是 union 那一行）；**第五行 collision 的检测与报账已落**（`6ee9e3e`，判据写在 §7.1）——"必须停而非猜"的程序侧是 `one_commit` 那道闸。**还欠**：~~`--take-local/--take-remote` 的旗标糖（实质等价于 `checkout --at <head>`，已有）、`--keep-both` 的多亲合并（整个没做，属 M4）~~ —— **2026-10-21 两条都落了**（`e6323a5`：`merge` 的三个旗标 + 目录层五条规则 + "来源认不出唯一就拒绝"，逐条见 §7.1 修订。内容层三方合并仍是不做，见 §16.2 第三层）；~~§7.2 的 deferred 列表在 `status` 里的可见性~~（**`d0df7c3` 已做**，四个动作逐条见 §7.2 落地状态）、以及跨机器真 SSH 下的多 head 实测 |
-| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**224 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。**第二层已落五条**：`tag`（`e3e860f`，§9.3 的 pin）、`reset`（`acb560f`，§7.1 的"选一边"）、`branch`（本批：tag 的"可以挪"版本，同一格 ref + 名字当 revspec，判据见 §9.2 的 `H` 行与 §17 补记四十二）、`revert`+`cherry-pick`（`40bcd7c`，同一次结构三方合并的参数换位，见 §16.2 第三层那条边界）。CDC/稀疏重建/批传输调优，以及 stash/blame/bisect 未动 |
+| **M4 硬化** | CDC 变长分块、稀疏重建、批传输调优、**第二层命令（branch/tag/reset/revert/stash/cherry-pick/blame/bisect）**、§10.8 引擎矩阵、72 h 长跑、README/发布 | §10.4 差分表与基准数据入库；指标写进 README；依赖是 crates.io 版本号、不残留 path（§9.7）。**现状（2026-10-20）**：§10.8 矩阵**已落两层**（`da44cd8` + `ef31796`）——画像层实测出"只有 `lsm_tree`/`bplus_tree` 过 FR-21，`bitcask` 缺数据校验和、`memory` 三项全缺"，场景层在同一条本地流程上两引擎逐格计数相同；再往上整套用例已可按 `TWOSYNC_TEST_ENGINE` 切换，**224 条在两个引擎上都是 0 failed**。剩下的是那张"四引擎 RSS/CPU/p99/磁盘增长"基准表（性能跨引擎还没比过）。**第二层已落七条**：`tag`（`e3e860f`，§9.3 的 pin）、`reset`（`acb560f`，§7.1 的"选一边"）、`branch`（本批：tag 的"可以挪"版本，同一格 ref + 名字当 revspec，判据见 §9.2 的 `H` 行与 §17 补记四十二）、`revert`+`cherry-pick`（`40bcd7c`，同一次结构三方合并的参数换位，见 §16.2 第三层那条边界）、`blame`+`bisect`（本批：路径级归属与无状态二分，边界写在 §15 第 27、28 条）。CDC/稀疏重建/批传输调优，以及 `stash`（要先开库层"提交但不移 head"那个出口）未动 |
 | **M5 多端（暂不承诺）** | 真 3+ peer：部分连通路由、NAT 穿透或自建中继、commit 签名 | 需先重开范围评审；**不在 v1 交付路径上** |
 
 M0–M1 **不需要**回答 §14 任何问题就能开工。
@@ -1612,6 +1612,17 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
     24 条目两个仓库上跑，**发起端折数必须一模一样**（11，绝对上界 ≤ 30）；
     收端此刻仍随规模涨（26 → 47），所以那条用例**故意断言它在涨**——谁修好了它就会收到一条红，
     逼着回来更新本节，而不是让注释烂掉。
+27. **`blame` 是路径级，不是行级**（2026-10-21 落地）：本工具的语料是 2–10 GB 的大二进制，
+    切块单位 4 MiB，而"行"不是任何一层的身份（`B` 清单只有 `(块号, hash, 大小)`）。
+    硬做行级 blame 得到的是"看起来像 `git blame`、语义是猜"的东西，所以不提供；
+    命令给的是"哪几本动过这条路径 + 各自变成了什么"，`Content`/`Mode`/`KindSwap`/`Appeared`/`Disappeared`
+    五种分开报。**目录也算**：她那棵子树的 hash 变了就算动过（粗，但一致）。
+    窗口截断（`--max`）时最老那一行**不代表**她第一次出现 —— 命令自己会打印这一句。
+28. **`bisect` 不落游标，也不承诺"对折"**（2026-10-21）：git 那套 `BISECT_LOG` 状态要么写库要么写文件，
+    就有了"bisect 卡住要先 reset"这类坏账；这里每次从 `--bad`/`--good` 两个端点重算
+    （一次 `c|p` 前缀扫 + 两个内存闭包），代价是人要把上一条答案抄回命令行。
+    能保证的只有一条：**候选属于怀疑集 ⇒ 每问一次区间严格变小**（`suspects > 1` 时；收到 1 本就改口报"结论"）。
+    历史里有合并时**时间序不等于拓扑序**，所以**不保证**正好缩一半 —— 这句话命令自己打印，不藏在文档里。
 
 ## 16. 附录：多项目布局与命令面（v0.3 新增）
 
@@ -1630,7 +1641,8 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
 | 一：读历史（有 DAG 就白送） | `status log diff show checkout restore ls-files gc` | 低 | M0–M1 |
 | 二：图上重写/重放 | `branch tag reset revert stash cherry-pick commit --amend blame bisect project use` | 中。`branch` = ref 命名空间（`H` 前缀里换 `ref_name`）；`blame/bisect` = DAG 遍历；`stash` = 一个临时 commit，近乎免费。**落地状态（2026-10-21）**：`tag`（钉子）、`reset`（挪 head 集合）、`branch`（活口：`list/add/rm/move/rename`，存在 `refs/heads/` 那一格、名字直接当 revspec、**不参与同步**）三条已在；`revert`/`cherry-pick`（`40bcd7c`）= 同一次结构三方合并的参数换位（ours=当前 head，
 theirs=那一版，base=它的亲代/它自己），所以它们复用 §7.1 那把尺、共享"有冲突就不落盘"；
-剩下 stash/blame/bisect 未动 | M3–M4 |
+剩下**只有 `stash` 未做**：`blame`（路径级，§15 第 27 条）与 `bisect`（无状态，§15 第 28 条）本批已落；
+而 `stash` 缺的不是命令层胶水，是库层一个**"提交但不移 head"**的出口（`build::build` 的最后一步就是 `set_ref`） | M3–M4 |
 | 三：内容三方合并 | `merge`（有同路径交集时）、`rebase -i` 的冲突解决 | **另一个量级的工程，且与 §1 的分工矛盾**（跨 OS 编辑同一份源码本该交给真 git）→ 不提供，给明确报错 | **结构那一半已落**（M3，`e6323a5`）；内容合并不做 |
 
 - **`plan` / `apply` 是 FR-7 的命名对，不是两条流水线**：`plan` 只读（预演"这次会提交什么"+ FR-10 熔断预演 + head 会怎么动），
@@ -2608,6 +2620,54 @@ ref 可达，删它的块就违反不变量 (d)；GC 是全站唯一一个"写�
 **顺手记一条对己不利的**：首建库那一格 **git 赢**（`.git` 83.2 MiB vs 我们 561.1 MiB），因为它 zlib 压了
 6.7 倍而我们按设计不压。表里原样留着，不藏——它同时解释了为什么"增量 17.9 倍"那个数还是**下界**：
 连偏袒对手的语料形状下我们都赢，满熵那一把（压缩比 1.00）里 git 的增量 = 整个文件。
+
+### v0.4 补记四十四（2026-10-21，`blame`/`bisect`：判据住库层、措辞住命令层 —— 外加一次我自己造成的空格事故）
+
+第二层只剩 `stash` 了。新增 9 条用例，**263 passed / 0 failed**（`lsm_tree` 与 `bplus_tree` 各一遍），
+clippy 0 警告。四条值得留字。
+
+**① 判据搬到库层，命令只留措辞。** `history::blame_path` 返回 `Vec<PathHit>`（枚举 `PathChange` 五种：
+`Appeared`/`Disappeared`/`Content`/`Mode`/`KindSwap`），`history::bisect_step` 返回 `BisectVerdict`。
+理由不是洁癖：**`format!` 出来的那句话钉不住，枚举钉得住**。顺带把"逐层走一条路径"收成一份实现
+（`entry_at`，`resolve` 用点读、`resolve_cached` 用装载好的 `TreeIndex`）——
+两份走法迟早一个认 `..` 一个不认。`blame` 用后者是因为它每本都要查同一片目录：
+逐本点读就是 `O(版本数 × 层数)` 次门面读，而每次门面读折一遍全库（§9.6.1）。
+
+**② `blame` 不做行级是产品边界，`Mode` 那一支却要能测。** 4 MiB 块 + 二进制语料里"行"不是任何一层的
+身份（`B` 清单只有 `(块号, hash, 大小)`），做行级就是做一个"看起来像 `git blame` 而语义是猜"的东西。
+但 `mode` 进树的 hash、不进 blob 的 hash（§8），所以"只改了权限"是一类**真实存在**的变化；
+Windows 上 `fs::write` 造不出这个形状 ⇒ 用例直接手写两笔 commit（`handwritten`）。
+**判据可达就要能测**，哪怕要在台架里绕过扫描器。
+
+**③ `bisect` 只承诺能证的那一条。** 无状态（不落游标）换来"没有东西会卡住"，代价是抄命令行；
+保证写成"候选属于怀疑集 ⇒ 区间严格变小"，而**不是**"对折"（时间序不等于拓扑序）。
+两处细节：
+- "两端之间一条都没有"那一支**不写**：`bad` 永远在自己的闭包里，所以只要 `bad ∉ closure(good)`
+  （`Reversed` 那条已经查过），怀疑集至少还剩 `bad` 自己。写一个到不了的分支 = 让下一个人测一条永远绿的路径。
+- **`Reversed` 必须判在 `GoodNotAncestor` 前面**。第一版顺序反了，于是"两端写反"这种最常见的误操作
+  永远只会收到那句更没用的"不在同一条线上"——判据对、**可达性错**，是用例
+  `bisect_refuses_endpoints_that_are_not_on_one_line` 第一次跑就抓到的。
+
+**④ 我自己造成的空格事故（工具链教训，与"别裸跑 cargo fmt"同族）。**
+用 bash heredoc + python 生成这两条命令的源码时，Rust 字符串里的 `\` 续行被压成了**字面空格**，
+命令行实测就打出了"…（`B` 清单只有块号/hash/大小），         做出来的是…"。
+修的方法本来是删空格，但正则删下去连带把 **49 处列对齐**也删了（`补救      = ` 变成 `补救= `）——
+那套对齐是全仓库的输出约定（标签按 10 列补齐），不是可有可无的空格。
+正确的收口办法不是手工补回去，而是**从 `git show HEAD:src/cli/m4.rs` 取回已提交的那一整段，
+只把新增段追加上去**，然后 `git diff --stat` 验它是**纯新增（153 insertions, 0 deletions）**。
+⇒ 沉淀成规矩：**批量生成/改写源码之后，提交前必须看一眼 diff 是不是只动了本该动的行**；
+能靠"重新拼已提交内容"复原的，就不要手工补。
+
+**实测（release，站点在 `%TEMP%` = C: SSD，7 本 commit / 5 条路径，只报计数）**：
+`blame a.txt` → 动过她 **2 本**（v1 出现、v2 内容换成 `1b4c968f`），现在 = 文件 5 B；
+`blame sub` → **2 本**（目录的判据是子树 hash 变，粗而一致）；
+`blame a.txt --max 2` → 1 本 **并且打印**"窗口截断在第 2 本 ⇒ 最老那一行不代表她第一次出现"；
+`blame never-existed.txt` → 0 本 + "这一版里没有这条路径"（不是错误）；
+`bisect --bad tip --good v1` → 怀疑 **6 本**，候选 v4；相邻两端 → 怀疑 1 本，改口报"结论"不再给下一步；
+两端写反 → 拒绝，退出码 1。
+
+文档：§15 新增第 27、28 条（两条边界原样列进 README 的那一批）、FR-8（第二层七条 + `stash` 缺的是库层出口）、
+§16.2 第二层那一行、M4 现状、本条。
 
 ### v0.4 补记四十三（2026-10-21，`40bcd7c`：`revert`/`cherry-pick` 是同一把尺的参数换位 —— 顺带被自己的演示抓到两处）
 
