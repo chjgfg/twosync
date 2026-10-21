@@ -1454,6 +1454,24 @@ pub fn ref_heads(db: &dyn KvEngine, pid: ProjectId, r: &str) -> Result<Vec<Hash>
     all_ref_heads(db, pid, Some(r))
 }
 
+/// `branch` 那类 ref 的名字前缀（§9.2 的 `H|p|名|0x00|hash`，前缀就是"名"的一部分）。
+///
+/// **为什么把类型编进名字而不是另开一种键**：键的形状只有 [`all_ref_heads`] / [`all_named_refs`]
+/// 两处解释，而它们同时是 `gc` 保留集的来源——多改一处就多一处"少收一个 ref = 删历史"的机会。
+/// 用前缀换来三条白送的性质：`gc` 取的是**全部** ref ⇒ 分支自动 pin；`rev_base` 多试一种拼法
+/// 就能把分支名当 revspec；`tag list` 与 `branch list` 各自按前缀筛，谁也不会把对方列进自己。
+pub const BRANCH_PREFIX: &str = "refs/heads/";
+
+/// 分支名 → ref 名。
+pub fn branch_ref(name: &str) -> String {
+    format!("{BRANCH_PREFIX}{name}")
+}
+
+/// ref 名去掉分支前缀（`tag list`/`branch list` 打印给人看的那一栏）。
+pub fn ref_display(r: &str) -> &str {
+    r.strip_prefix(BRANCH_PREFIX).unwrap_or(r)
+}
+
 /// 本项目**所有 ref** 指向的 commit 集合（`r = None`），或指定那一个 ref 的集合。
 ///
 /// GC 的保留集必须从"全部 ref"出发而不是只看 `main`：M4 会带来 branch/tag，到时候

@@ -390,6 +390,21 @@ pub enum Cmd {
         cmd: TagCmd,
     },
 
+    /// M4 第二层第三条：**给一段历史挂一个可以挪的本地名字**
+    ///
+    /// 与 `tag` 是同一格 ref（§9.2 的 `H|p|名|0x00|hash`，分支带 `refs/heads/` 前缀）的两种脾气：
+    /// tag 是钉子（不许挪，要挪先删），branch 是活口（`move` 就是它的正职）。
+    ///
+    /// **它不参与同步**：v1 的 push/pull 只看 `main`（§5、§16.2），而"当前分支"这个概念要动
+    /// `commit`/`push`/`pull`/`status`/`gc` 五处的读法，1+1 台位里没有第三个东西要同步 ⇒ 不做，
+    /// 分支在这里兑现的是两件事：① 那段历史被 ref 担保，`gc` 收不到（§9.3）；
+    /// ② 名字可以直接当 revspec 用 —— `reset <分支>` / `checkout --at <分支>`。
+    /// 所以分支**不会自己往前走**，`commit` 之后要 `branch move <名字> --to HEAD`。
+    Branch {
+        #[command(subcommand)]
+        cmd: BranchCmd,
+    },
+
     /// M4 第二层的第二条：把 head 集合**挪**到一个 commit，`--apply` 时顺手把工作树落成那个样子
     ///
     /// 与 `checkout --at` 的分别是唯一的一条：那个不动 head，这一个专动 head。
@@ -435,12 +450,12 @@ pub enum Cmd {
 
     // ── M1 剩下的 ── 块级配额淘汰（FR-9）
     // ── M2 剩下的 ── watch 窄扫（要先改删除判定，见 `Daemon` 的文档）
-    // ── M3 ── pull / sync
-    // ── M4 ── branch / reset / revert / stash / cherry-pick / blame / bisect（tag 已落）
+    // ── M3 剩下的 ── 跨机器真 SSH 的多 head 实测（三条出路的命令面已落 `merge`）
+    // ── M4 ── revert / stash / cherry-pick / blame / bisect（tag/reset/branch 已落）
 }
 
-/// `tag` 的三个动作。名字里不许用 `main`/`head`，也不许长得像 commit hash 前缀 ——
-/// 理由见 [`crate::store::history::rev_base`] 的解析顺序。
+/// `tag` 的三个动作。名字规矩在 `cli::m4::check_ref_name`（与分支共用一道闸：`main`/`head` 是保留名、
+/// 不许长得像 commit hash 前缀、不许以 `refs/` 开头 —— 理由都写在那条函数的文档里）。
 #[derive(Subcommand, Clone)]
 pub enum TagCmd {
     /// 列出全部 tag：名字、指向哪个 commit、那一刻的时间与说明
@@ -459,6 +474,44 @@ pub enum TagCmd {
     Rm {
         /// 要删的 tag 名字
         name: String,
+    },
+}
+
+/// `branch` 的五个动作。名字规矩与 tag **共用同一道闸**（`cli::m4::check_ref_name`）：
+/// 两套闸迟早会长得不一样，那时"一个名字指着两个东西"这种歧义就会从缝里钻进来。
+#[derive(Subcommand, Clone)]
+pub enum BranchCmd {
+    /// 列出全部分支：名字、tip commit，以及它与 `main` 差多少条 commit（"还要不要留"的依据）
+    List,
+    /// 建一个分支。省略 `--at` = 当前 `main` 的那一个 head（多 head 时 `--at` 必填，不许替人挑）
+    Add {
+        /// 分支名字
+        name: String,
+        /// 从哪个 rev 开始：commit hash 前缀、tag、另一个分支、或 `HEAD~2` 那种写法
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// 删一个分支。**删掉之后那段历史若没有别的 ref 挂着，`gc --sweep --apply` 就会收走**（§9.3）
+    ///
+    /// 命令会算出"松开几条 commit"并打印出来 —— 这个数是 `branch rm` 唯一真正在说的东西。
+    Rm {
+        /// 要删的分支名字
+        name: String,
+    },
+    /// 把分支挪到另一个 commit（工作树**不动**，要落地另跑 `checkout --at <分支>`）
+    Move {
+        /// 分支名字
+        name: String,
+        /// 挪到哪个 rev。必填：`move` 省掉它就等于猜"你要 head 还是 head~3"
+        #[arg(long)]
+        to: String,
+    },
+    /// 改名。**先建新再删旧**：中间崩了最多两个名字指着同一个 commit，不会留下无 ref 挂着的历史
+    Rename {
+        /// 老名字
+        from: String,
+        /// 新名字
+        to: String,
     },
 }
 

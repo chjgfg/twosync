@@ -200,7 +200,10 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         }
         let db = cli.store()?;
         let pid = crate::store::keys::project_id(&name);
-        let before = build::all_ref_heads(&*db, pid, None)?;
+        // 问的是"`commit` 有没有动 head"，所以看 `main` 那一格而不是全部 ref：
+        // M4 之后 tag/branch 也住在 `H` 里，用 `all_ref_heads(None)` 会把"这十分钟里有人打了个 tag"
+        // 报成"有提交"——那一格报的是提交与否，不是"库里多了一行没有"。
+        let before = build::ref_heads(&*db, pid, build::MAIN)?;
         m0::commit(
             cli,
             Some(&format!("daemon 第 {round} 轮（{trigger:?}）")),
@@ -211,7 +214,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
             },
         )?;
         let db = cli.store()?;
-        let after = build::all_ref_heads(&*db, pid, None)?;
+        let after = build::ref_heads(&*db, pid, build::MAIN)?;
         let committed = after != before;
 
         // ── pull（先收，再送）──

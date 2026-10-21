@@ -144,6 +144,7 @@ fn dispatch(cli: &Cli) -> Result<()> {
         ),
         Cmd::Peer { cmd } => m1::peer(cli, cmd.clone()),
         Cmd::Tag { cmd } => m4::tag(cli, cmd),
+        Cmd::Branch { cmd } => m4::branch(cli, cmd),
         Cmd::Merge {
             keep_both,
             take_local,

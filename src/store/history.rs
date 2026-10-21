@@ -370,16 +370,22 @@ fn rev_base(db: &dyn KvEngine, pid: ProjectId, rev: &str) -> Result<Vec<Hash>> {
     // **命名引用（tag/branch）排在 hex 前缀之前**。理由不是好看：一个 8 个字符的 tag 名
     // 完全可以同时是合法的 hash 前缀，顺序反了就会出现"人写的是名字、系统按前缀猜到了别的
     // commit"。这种歧义不许靠解析顺序解决，所以 `tag add` 那一侧直接拒绝长得像 hash 前缀的
-    // 名字（`cli::m4::check_tag_name`），两边合起来才是"不猜"。
-    let named = build::ref_heads(db, pid, rev)?;
-    if !named.is_empty() {
-        return Ok(named);
+    // 名字（`cli::m4::check_ref_name`），两边合起来才是"不猜"。
+    // 先查字面名再查带前缀的名：`refs/heads/x` 这种全写法也要能直接敲出来，而 tag 与分支的名字
+    // 都不许以 `refs/` 开头（同一道闸 ⇒ 两种拼法不可能同时命中 ⇒ 不存在"谁先查谁赢"的暗裁决）。
+    // 两次查表用的是**同一次**前缀扫（`all_named_refs`）：门面每扫一次就折一遍全库（§9.6.1），
+    // 为"多认一种名字"再加点一次 `ref_heads` 就是把每条 revspec 变贵一倍。
+    let refs = build::all_named_refs(db, pid)?;
+    for name in [rev.to_string(), build::branch_ref(rev)] {
+        if let Some(hs) = refs.get(&name) {
+            return Ok(hs.clone());
+        }
     }
     let bytes = match hex_prefix(rev) {
         Some(b) => b,
         None => {
             return Err(Error::Codec(format!(
-                "rev {rev:?} 看不懂：既不是 HEAD/{m}，也不是已知的 tag，也不是十六进制 commit 前缀（可接 `~N`）",
+                "rev {rev:?} 看不懂：既不是 HEAD/{m}，也不是已知的 tag 或分支，也不是十六进制 commit 前缀（可接 `~N`）",
                 m = build::MAIN
             )));
         }
@@ -561,6 +567,31 @@ pub fn collisions(db: &dyn KvEngine, pid: ProjectId, heads: &[Hash]) -> Result<V
         .into_iter()
         .map(|(path, hs)| Collision { path, heads: hs.into_iter().collect() })
         .collect())
+}
+
+/// 删掉/挪走 `skip` 这一格之后，`from` 的闭包里**再没有别的 ref 挂着**的那些 commit。
+///
+/// 为什么要减掉"其余全部 ref"而不是只减 `main`：两个分支常常共用祖先，只比 main 会把那些
+/// 报成"要变垃圾"，那是吓人不是报账。`gc` 的保留集正是从全部 ref 出发的
+/// （[`build::all_ref_heads`]），所以这里算的是同一件事，命令里报的数才与回收真会做的对得上。
+///
+/// 纯函数（refs/亲代索引都在内存里，一次引擎调用都不做），因为这条判据要能单测：
+/// "松开几条"写错方向（多报/少报）都会让人在错误的时刻去 `tag add`。
+pub fn unheld_by_other_refs(
+    refs: &BTreeMap<String, Vec<Hash>>,
+    index: &BTreeMap<Hash, Vec<Hash>>,
+    skip: &str,
+    from: &[Hash],
+) -> Vec<Hash> {
+    let reach = reachable_from(index, from, &[]);
+    let mut others: BTreeSet<Hash> = BTreeSet::new();
+    for (k, hs) in refs {
+        if k == skip {
+            continue;
+        }
+        others.extend(reachable_from(index, hs, &[]));
+    }
+    reach.difference(&others).copied().collect()
 }
 
 /// `a` 与 `b` 的**极大**共同祖先（可能多个，见 [`collisions`] 那条近似）。空 = 没有共同祖先。
