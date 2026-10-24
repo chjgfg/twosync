@@ -89,6 +89,34 @@ fn write_payload(work: &Path) -> usize {
     n
 }
 
+/// 库的**形状**：文件数 / 总字节 / 最大单个文件。
+///
+/// 为什么单独量这一列：10-25 的对照实验（把副本的版本链从 501 581 行压到 84 258 行）发现
+/// **行数降到 1/6 而堆峰反而升 36 %**，同一趟里库磁盘字节升了 34.5 % —— 于是"堆峰 ∝ 行数"
+/// 这条归因被自己写的实验推翻了（原判断在 §10.8 那一列的修订里留着）。留下的候选是
+/// "一次折叠 ∝ 读进来的库字节"，要分辨它就得把**库字节与最大单文件**一起打印出来，
+/// 而不是让人回家 `ls`。
+fn shape(root: &Path) -> (u64, u64, u64) {
+    let mut stack = vec![root.to_path_buf()];
+    let (mut files, mut bytes, mut max) = (0u64, 0u64, 0u64);
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let Ok(md) = fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                files += 1;
+                bytes += md.len();
+                max = max.max(md.len());
+            }
+        }
+    }
+    (files, bytes, max)
+}
+
 #[test]
 #[ignore = "§10.8 性能表：必须按 TWOSYNC_PERF_ENGINE 一个引擎一个进程地跑（进程峰值 RSS 只能这样归因）"]
 fn engine_perf_table() {
@@ -354,6 +382,22 @@ fn engine_perf_table() {
         "库磁盘    = {:>8.2} MiB / {} 行（alive≈全库物化行数，含版本链）",
         dbs.bytes as f64 / 1_048_576.0,
         h.total_rows
+    );
+    let (db_files, db_bytes, db_max) = shape(&db_dir(&root));
+    let heap_max = phases.iter().map(|p| p.heap_peak).max().unwrap_or(0);
+    println!(
+        "库形状    = {} 个文件 / {:.2} MiB / 最大单文件 {:.2} MiB ⇒ **堆峰 ÷ 库字节 = {:.2}**（{:.2} MiB ÷ {:.2} MiB）\
+         —— 行数与库字节在 10-25 那次对照实验里分开了（行 ÷ 6 而堆峰 × 1.36），所以分辨归因靠这一行，不是上一行",
+        db_files,
+        db_bytes as f64 / 1_048_576.0,
+        db_max as f64 / 1_048_576.0,
+        if db_bytes == 0 {
+            0.0
+        } else {
+            heap_max as f64 / db_bytes as f64
+        },
+        heap_max as f64 / 1_048_576.0,
+        db_bytes as f64 / 1_048_576.0,
     );
     println!(
         "CAS 磁盘  = {:>8.2} MiB / {} 个块文件",
