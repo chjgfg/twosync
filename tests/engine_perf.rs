@@ -211,7 +211,7 @@ fn engine_perf_table() {
         assert!(!p.changes.is_empty() || p.entries > 0, "plan 读不到东西，测的是空气");
         if read_only {
             notes.push(format!(
-                "plan 的账  = {} 条在册 / 已扫描未提交 {} 项（+{} ~{} -{} 改名 {}）",
+                "plan 的账  = {} 条在册 / 已知 {} 行（后者是 FR-10 的分母，不是\"未提交\"）⇒ 改动 +{} ~{} -{} 改名 {}",
                 p.entries,
                 p.known,
                 p.changes.add,
