@@ -38,7 +38,7 @@ use storage_engines::{EngineConfig, StorageConfig};
 use twosync::allocstats;
 use twosync::store::build;
 use twosync::store::cas::Cas;
-use twosync::store::{checkout, gc, history, keys, worktree};
+use twosync::store::{checkout, gc, history, keys, object, worktree};
 use twosync::utils::{check_durability_gate, counted, db_dir, dir_size, Meter};
 
 const BLOCK: u64 = 4096;
@@ -75,11 +75,11 @@ impl Phase {
     }
 }
 
-fn write_payload(work: &Path, paths: usize, file_kib: usize) -> usize {
+fn write_payload(work: &Path, dirs: usize, paths: usize, file_kib: usize) -> usize {
     let mut n = 0usize;
-    let per_dir = (paths / DIRS).max(1);
+    let per_dir = (paths / dirs).max(1);
     let mut buf = vec![0u8; file_kib * 1024];
-    for d in 0..DIRS {
+    for d in 0..dirs {
         let dir = work.join(format!("d{d}"));
         fs::create_dir_all(&dir).unwrap();
         for i in 0..per_dir {
@@ -175,22 +175,30 @@ fn engine_perf_table() {
     let pid = keys::project_id(&project);
     let store = Cas::new(&twosync::utils::objects_dir(&root), BLOCK).unwrap();
 
+    // 只拨"目录数"这一维（默认 8）。`criterion` 那批基准是**每 10 个文件一层目录** ⇒ 它扫规模时
+    // 目录数跟着规模一起长（200 条 = 20 层，4 000 条 = 400 层），而本台架原本钉死 8 层 ——
+    // 这就是两个仪表对 (f1)"每单位成本平不平"读出**相反形状**的原因。2×2 因子表：目录数 × 单文件大小。
+    let dirs = std::env::var("TWOSYNC_PERF_DIRS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|d| (1..=5000).contains(d))
+        .unwrap_or(DIRS);
     // 只拨"文件大小"这一维的旋钮（默认 16 KiB）。
     let file_kib = std::env::var("TWOSYNC_PERF_FILE_KIB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|k| (1..=4096).contains(k))
         .unwrap_or(FILE_KIB);
-    // 只拨"条目数"这一维（默认 1 000，取 8 的整数倍 ⇒ 每目录均分）。
+    // 只拨"条目数"这一维（默认 1 000）。
     let paths = std::env::var("TWOSYNC_PERF_PATHS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|p| (DIRS..=200_000).contains(p))
+        .filter(|p| (1..=200_000).contains(p))
         .unwrap_or(DIRS * PER_DIR);
     let files = if read_only {
         0
     } else {
-        write_payload(&work, paths, file_kib)
+        write_payload(&work, dirs, paths, file_kib)
     };
     // 只读台架多出来的这一列是"这一趟没测/测的是什么"的账，表下面原样打印。
     let mut notes: Vec<String> = Vec::new();
@@ -358,6 +366,32 @@ fn engine_perf_table() {
     }
     lat.sort();
 
+    // ── 装载器那一格（**放在所有 `measure` 窗口之外**，所以不污染上面任何一行的折数/墙钟）──
+    //
+    // 这一格才是 §15 第 30 条 "(f1) 每单位成本为什么随规模升" 的**直接证据**：
+    // `plan` 的折数在预算内是常数，一旦 `T|p` 的 value 超过 4 MiB 就**退回逐目录点读**
+    // ⇒ 折数从个位数跳到 O(目录数)。到底是哪种，问装载器自己，别从墙钟反推。
+    // 两次装载：① 生产预算那一份（走的就是 `plan` 那条路）；② 预算无限那一份
+    // （只为读出"不退预算要吃多少字节/内存"，那是这个装载器唯一的失控维度）。
+    let probe = |budget: u64| -> (usize, u64, usize, bool, u64, usize) {
+        let m0 = meter.snapshot();
+        let wm = allocstats::watermark();
+        let ix = object::TreeIndex::with_budget(&*db, pid, budget).unwrap();
+        let out = (
+            ix.rows(),
+            ix.bytes(),
+            ix.loaded(),
+            ix.over_budget(),
+            // 装载这一次付了几折
+            meter.snapshot().folds().saturating_sub(m0.folds()),
+            wm.peak_growth(),
+        );
+        drop(ix);
+        out
+    };
+    let prod = probe(object::TreeIndex::BUDGET_BYTES);
+    let unlim = probe(u64::MAX);
+
     let h = db.health();
     let dbs = dir_size(&db_dir(&root));
     let objs = dir_size(&twosync::utils::objects_dir(&root));
@@ -371,7 +405,7 @@ fn engine_perf_table() {
         );
     } else {
         println!(
-            "负载      = {files} 条路径 / {} MiB 原始 / {} 块（block {} B，定长，**单文件 {file_kib} KiB**）",
+            "负载      = {files} 条路径 / **{dirs} 层目录** / {} MiB 原始 / {} 块（block {} B，定长，单文件 {file_kib} KiB）",
             files * file_kib / 1024,
             files * file_kib * 1024 / BLOCK as usize,
             BLOCK
@@ -437,6 +471,26 @@ fn engine_perf_table() {
         plan_heap as f64 / 1_048_576.0,
         per(heap_max),
         heap_max as f64 / 1_048_576.0,
+    );
+    println!(
+        "装载器(预算内 {:>2} MiB) = {} 行 / value {:.2} MiB / 装进表 {} 张 / **退回点读 = {}** / 这一趟 {} 折 / 堆峰 {:.2} MiB",
+        object::TreeIndex::BUDGET_BYTES / 1_048_576,
+        prod.0,
+        prod.1 as f64 / 1_048_576.0,
+        prod.2,
+        prod.3,
+        prod.4,
+        prod.5 as f64 / 1_048_576.0,
+    );
+    println!(
+        "装载器(预算无限)        = {} 行 / value {:.2} MiB / 装进表 {} 张 / 这一趟 {} 折 / 堆峰 {:.2} MiB\
+         ⇒ 这两行合起来才是 (f1) 的证据：**退回点读 = true 而折数跳到 O(目录数)** 才是\
+         \"每单位成本随规模升\"的机制；装载器没退而折数不变，就得另找原因",
+        unlim.0,
+        unlim.1 as f64 / 1_048_576.0,
+        unlim.2,
+        unlim.4,
+        unlim.5 as f64 / 1_048_576.0,
     );
     println!(
         "CAS 磁盘  = {:>8.2} MiB / {} 个块文件",
