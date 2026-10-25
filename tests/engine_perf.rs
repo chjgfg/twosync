@@ -43,6 +43,12 @@ use twosync::utils::{check_durability_gate, counted, db_dir, dir_size, Meter};
 
 const BLOCK: u64 = 4096;
 /// 负载形状：8 个目录 × 125 个文件 × 16 KiB = 1 000 条路径 / 16 MiB / 4 096 个块。
+/// 两个旋钮各拨一维：
+/// - `TWOSYNC_PERF_FILE_KIB` 只拨**文件大小** ⇒ 块数与库字节跟着涨。⚠️ 它**拨不动"只涨字节"**：
+///   本项目每个块都写 `K`+`k` 两行，所以块数一变**行数也跟着变**（10-25 实测 16→64 KiB：
+///   字节 ×3.03、行数 ×3.18、堆峰 ×3.71 ⇒ 两臂同向，这一对分不开行数与字节）。
+/// - `TWOSYNC_PERF_PATHS` 只拨**条目数**（块大小固定时，条目多 ⇒ `W` 行数与目录清单涨，
+///   而字节按 `条目 × file_kib` 走）。两个旋钮合起来才凑得出"字节同、行数差很多"那一臂。
 const DIRS: usize = 8;
 const PER_DIR: usize = 125;
 const FILE_KIB: usize = 16;
@@ -69,13 +75,14 @@ impl Phase {
     }
 }
 
-fn write_payload(work: &Path) -> usize {
+fn write_payload(work: &Path, paths: usize, file_kib: usize) -> usize {
     let mut n = 0usize;
-    let mut buf = vec![0u8; FILE_KIB * 1024];
+    let per_dir = (paths / DIRS).max(1);
+    let mut buf = vec![0u8; file_kib * 1024];
     for d in 0..DIRS {
         let dir = work.join(format!("d{d}"));
         fs::create_dir_all(&dir).unwrap();
-        for i in 0..PER_DIR {
+        for i in 0..per_dir {
             // 内容按 (目录, 序号) 派生：**四个引擎拿到的是同一份字节**，
             // 不然"哪个引擎省了空间"这种比较就成了比语料。
             let seed = format!("d{d}/f{i}.txt");
@@ -168,7 +175,23 @@ fn engine_perf_table() {
     let pid = keys::project_id(&project);
     let store = Cas::new(&twosync::utils::objects_dir(&root), BLOCK).unwrap();
 
-    let files = if read_only { 0 } else { write_payload(&work) };
+    // 只拨"文件大小"这一维的旋钮（默认 16 KiB）。
+    let file_kib = std::env::var("TWOSYNC_PERF_FILE_KIB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|k| (1..=4096).contains(k))
+        .unwrap_or(FILE_KIB);
+    // 只拨"条目数"这一维（默认 1 000，取 8 的整数倍 ⇒ 每目录均分）。
+    let paths = std::env::var("TWOSYNC_PERF_PATHS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|p| (DIRS..=200_000).contains(p))
+        .unwrap_or(DIRS * PER_DIR);
+    let files = if read_only {
+        0
+    } else {
+        write_payload(&work, paths, file_kib)
+    };
     // 只读台架多出来的这一列是"这一趟没测/测的是什么"的账，表下面原样打印。
     let mut notes: Vec<String> = Vec::new();
     let mut phases: Vec<Phase> = Vec::new();
@@ -217,7 +240,7 @@ fn engine_perf_table() {
         });
     }
     if !read_only {
-        measure("commit 首次(1000 条)", &mut || {
+        measure("commit 首次(整库)", &mut || {
             let built = build::build(
                 &*db,
                 pid,
@@ -305,7 +328,8 @@ fn engine_perf_table() {
     }
     if !read_only {
         measure("commit 稳态(改 1 文件)", &mut || {
-            fs::write(work.join("d3/f7.txt"), [7u8; FILE_KIB * 1024]).unwrap();
+            // 挑 `d0/f0`：这一格要随"条目数"旋钮一起能用，写死 `d3/f7` 在小条目数那档就不存在了。
+            fs::write(work.join("d0/f0.txt"), vec![7u8; file_kib * 1024]).unwrap();
             worktree::scan(&*db, pid, &work, false, 2000).unwrap();
             let built = build::build(
                 &*db,
@@ -347,9 +371,9 @@ fn engine_perf_table() {
         );
     } else {
         println!(
-            "负载      = {files} 条路径 / {} MiB 原始 / {} 块（block {} B，定长）",
-            files * FILE_KIB / 1024,
-            files * FILE_KIB * 1024 / BLOCK as usize,
+            "负载      = {files} 条路径 / {} MiB 原始 / {} 块（block {} B，定长，**单文件 {file_kib} KiB**）",
+            files * file_kib / 1024,
+            files * file_kib * 1024 / BLOCK as usize,
             BLOCK
         );
     }
@@ -384,20 +408,35 @@ fn engine_perf_table() {
         h.total_rows
     );
     let (db_files, db_bytes, db_max) = shape(&db_dir(&root));
+    // **两条比值分开印**，因为 10-25 的三臂对照证明把它们混成一条会误导：
+    // `plan` 那一档是**读侧**（这条才是 NFR-1 关心的"只读命令吃多少"），而"最贵一阶段"常常是
+    // **写侧**的首次 `commit`（它随条目数长得更快）。合成一条数会让人拿写侧的系数去推读侧的判据。
+    let plan_heap = phases
+        .iter()
+        .find(|p| p.name.starts_with("plan"))
+        .map(|p| p.heap_peak)
+        .unwrap_or(0);
     let heap_max = phases.iter().map(|p| p.heap_peak).max().unwrap_or(0);
-    println!(
-        "库形状    = {} 个文件 / {:.2} MiB / 最大单文件 {:.2} MiB ⇒ **堆峰 ÷ 库字节 = {:.2}**（{:.2} MiB ÷ {:.2} MiB）\
-         —— 行数与库字节在 10-25 那次对照实验里分开了（行 ÷ 6 而堆峰 × 1.36），所以分辨归因靠这一行，不是上一行",
-        db_files,
-        db_bytes as f64 / 1_048_576.0,
-        db_max as f64 / 1_048_576.0,
+    let per = |h: usize| -> f64 {
         if db_bytes == 0 {
             0.0
         } else {
-            heap_max as f64 / db_bytes as f64
-        },
-        heap_max as f64 / 1_048_576.0,
+            h as f64 / db_bytes as f64
+        }
+    };
+    println!(
+        "库形状    = {} 个文件 / {:.2} MiB / 最大单文件 {:.2} MiB",
+        db_files,
         db_bytes as f64 / 1_048_576.0,
+        db_max as f64 / 1_048_576.0,
+    );
+    println!(
+        "堆峰÷库字节 = 读侧(plan) **{:.2}**（{:.2} MiB） / 最贵一阶段(多是写侧) {:.2}（{:.2} MiB）\
+         —— 10-25 三臂实测这个比值在 **1.26–1.94** 之间漂 ⇒ **别把它当系数用**，只能当『同向』看",
+        per(plan_heap),
+        plan_heap as f64 / 1_048_576.0,
+        per(heap_max),
+        heap_max as f64 / 1_048_576.0,
     );
     println!(
         "CAS 磁盘  = {:>8.2} MiB / {} 个块文件",
