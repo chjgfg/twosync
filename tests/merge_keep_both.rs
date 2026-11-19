@@ -59,6 +59,7 @@ impl Site {
             project: Some("p".to_string()),
             engine: None,
             io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: Cmd::Init,
         };
@@ -332,6 +333,7 @@ fn take_remote_picks_the_head_this_site_accepted_and_lands_it() {
             our_heads: vec![l, r],
             their_heads: vec![r],
             accepted: Some(r),
+            cpu_peak: 0,
         },
     )
     .unwrap();
@@ -390,6 +392,7 @@ fn taking_a_side_goes_through_the_same_warning_as_reset() {
             our_heads: vec![l, r],
             their_heads: vec![r],
             accepted: Some(r),
+            cpu_peak: 0,
         },
     )
     .unwrap();
@@ -409,4 +412,92 @@ fn taking_a_side_goes_through_the_same_warning_as_reset() {
     let store = Cas::new(&objects_dir(&site.root()), BLK).unwrap();
     let p = twosync::store::gc::sweep(&*site.db, &store, site.pid, false).unwrap();
     assert_eq!(p.commits_dropped, 0, "tag 挂着的 l 不许被收走：{p:?}");
+}
+
+// ── Q21（2026-11-19 定案）：删-vs-改在命令层也必须停 ─────────────────────────────
+
+/// 共同祖先里有 a.txt：左支删了它、右支改了它 ⇒ `--keep-both` **拒绝**。
+/// 定案前规则④不查基，会静默取存在的那一边（= 丢掉左支的删除）。
+#[test]
+fn keep_both_refuses_delete_versus_modify() {
+    let site = Site::new();
+    site.write("a.txt", "base");
+    let base = site.commit("base");
+    // 左支：删掉 a.txt
+    fs::remove_file(site.work().join("a.txt")).unwrap();
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    let l = site.commit("left deletes a.txt");
+    // 右支：改 a.txt（工作树先换回 base 的样子，fork 台架同一条规矩）
+    site.write("a.txt", "base");
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    site.write("a.txt", "right edits");
+    let r = site.commit("right edits a.txt");
+    build::set_ref(&*site.db, site.pid, MAIN, &[l, r]).unwrap();
+    let rows = site.rows();
+
+    let e = site
+        .merge(true, false, false, true)
+        .expect_err("删-vs-改 ⇒ 冲突，不许静默丢删除");
+    assert!(e.to_string().contains("--keep-both 被"), "{e}");
+    assert_eq!(site.rows(), rows, "被拒的那一趟不许写库");
+    assert_eq!(site.heads(), pair(l, r), "被拒的那一趟不许动 head");
+}
+
+/// 一边删了目录、另一边只改了目录里**一个**文件 ⇒ 冲突只报那一片叶子；
+/// 没被动的兄弟文件跟着删除走（规则③），不算冲突。
+#[test]
+fn keep_both_refuses_directory_delete_versus_leaf_modify() {
+    let site = Site::new();
+    site.write("d/x.txt", "x");
+    site.write("d/y.txt", "y");
+    let base = site.commit("base");
+    // 左支：整个目录删掉
+    fs::remove_dir_all(site.work().join("d")).unwrap();
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    let l = site.commit("left deletes d/");
+    // 右支：只改 d/x.txt
+    site.write("d/x.txt", "x");
+    site.write("d/y.txt", "y");
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    site.write("d/x.txt", "x edited");
+    let r = site.commit("right edits d/x");
+    build::set_ref(&*site.db, site.pid, MAIN, &[l, r]).unwrap();
+
+    let e = site
+        .merge(true, false, false, true)
+        .expect_err("目录删除对上叶子改动 ⇒ 冲突");
+    assert!(e.to_string().contains("1 条"), "只报被改的那片叶子：{e}");
+    assert_eq!(site.heads(), pair(l, r));
+}
+
+/// 一边删了、另一边**没动** ⇒ 不冲突，`--keep-both` 合得上且**删除生效**。
+/// 这条与上一条成对：判据改严之后不许把 union 的正常态也拦下来。
+#[test]
+fn keep_both_lets_a_one_sided_delete_through() {
+    let site = Site::new();
+    site.write("a.txt", "base");
+    site.write("keep.txt", "k");
+    let base = site.commit("base");
+    // 左支：删 a.txt
+    fs::remove_file(site.work().join("a.txt")).unwrap();
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    let l = site.commit("left deletes a.txt");
+    // 右支：只加一个新文件（a.txt 保持 base 的样子 = 没动）
+    site.write("a.txt", "base");
+    build::set_ref(&*site.db, site.pid, MAIN, &[base]).unwrap();
+    site.write("right.txt", "r");
+    let r = site.commit("right adds right.txt");
+    build::set_ref(&*site.db, site.pid, MAIN, &[l, r]).unwrap();
+
+    site.merge(true, false, false, true).unwrap();
+    let heads = site.heads();
+    assert_eq!(heads.len(), 1);
+    let m = object::read_commit(&*site.db, site.pid, &heads[0]).unwrap();
+    let mut leaves = site.leaves(&m.tree);
+    leaves.sort();
+    assert_eq!(
+        leaves,
+        vec!["keep.txt".to_string(), "right.txt".to_string()],
+        "删除要生效、新增要活下来：{leaves:?}"
+    );
 }

@@ -51,6 +51,7 @@ impl Site {
             engine: None,
             // 每命令一个 `Cli` ⇒ 每命令一个新桶（和真实 CLI 一样）。只有 `daemon` 会跨阶段共用。
             io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         }

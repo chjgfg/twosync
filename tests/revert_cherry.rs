@@ -112,6 +112,7 @@ impl Site {
             project: Some("p".to_string()),
             engine: None,
             io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: Cmd::Init,
         };
@@ -385,4 +386,98 @@ fn landing_trusts_the_last_scan_so_an_unscanned_external_delete_is_not_restored(
     site.checkout(&made, true).unwrap();
     assert!(site.exists("b.txt"), "scan 过之后 checkout 就该把她取回来");
     assert_eq!(site.read("b.txt"), "two");
+}
+
+/// Q21（2026-11-19 定案）：撤一个"新增"，而那条路径**后来又被改过** ⇒
+/// 撤销侧要删、落点侧有改动 = 删-vs-改 ⇒ **报冲突拒绝**。
+/// 定案前规则④不查基，这里静默报"什么都没带来"（REQUIREMENTS §17 补记四十三踩到的那处）。
+#[test]
+fn reverting_an_add_that_was_later_modified_is_refused_as_delete_vs_modify() {
+    let site = Site::new();
+    site.write("seed.txt", "s");
+    site.commit("v1");
+    site.write("b.txt", "two");
+    let v2 = site.commit("v2 加了 b");
+    site.write("b.txt", "three");
+    let v3 = site.commit("v3 改了 b");
+
+    let rows = site.rows();
+    let e = site
+        .revert(&keys::hex(&v2), true)
+        .expect_err("撤销侧删、落点侧改 ⇒ 冲突，不许静默什么都不做");
+    assert!(e.to_string().contains("1 条同路径冲突"), "{e}");
+    assert_eq!(site.heads(), vec![v3], "被拒那一趟 head 不动");
+    assert_eq!(site.rows(), rows, "被拒那一趟连清单行都不写");
+    assert_eq!(site.read("b.txt"), "three", "工作树也不许动");
+}
+
+/// 与上一条成对：新增之后**没再动过** ⇒ 撤销照常把她删掉（规则③：另一侧没动，删除生效）。
+/// 判据改严之后不许把这条正常路径也拦下来。
+#[test]
+fn reverting_an_untouched_add_still_removes_it() {
+    let site = Site::new();
+    site.write("seed.txt", "s");
+    site.commit("v1");
+    site.write("b.txt", "two");
+    let v2 = site.commit("v2 加了 b");
+
+    site.revert(&keys::hex(&v2), true).unwrap();
+    assert!(!site.exists("b.txt"), "没再动过的新增，撤销就是删掉她");
+    let made = site.heads()[0];
+    let c = object::read_commit(&*site.db, site.pid, &made).unwrap();
+    assert_eq!(c.stats.delete, 1, "{:?}", c.stats);
+}
+
+// ── commit --amend（2026-11-19）──────────────────────────────────────────────
+
+/// amend 替换唯一 head：新 commit 的亲代 = 旧 head 的亲代，旧 head 变不可达。
+#[test]
+fn amend_replaces_the_head_and_keeps_the_grandparent_as_parent() {
+    let site = Site::new();
+    site.write("a.txt", "one");
+    let v1 = site.commit("v1");
+    site.write("a.txt", "two");
+    let v2 = site.commit("v2");
+
+    m4::amend(&site.cli(), Some("v2 amended"), true).unwrap();
+    let heads = site.heads();
+    assert_eq!(heads.len(), 1);
+    assert_ne!(heads[0], v2, "amend 要换一笔新的");
+    let c = object::read_commit(&*site.db, site.pid, &heads[0]).unwrap();
+    assert_eq!(c.parents, vec![v1], "亲代是旧 head 的亲代（v1），不是旧 head（v2）");
+    assert_eq!(c.msg, "v2 amended");
+    // 旧 head 不可达 ⇒ sweep 收得走（这里只验它不在保留集里）。
+    let store = Cas::new(&objects_dir(&site.root()), BLK).unwrap();
+    let p = twosync::store::gc::sweep(&*site.db, &store, site.pid, true).unwrap();
+    assert!(p.commits_dropped >= 1, "旧 head 该被判不可达：{p:?}");
+}
+
+/// 只改 msg、内容没变也要能 amend（绕过空变更早退）。
+#[test]
+fn amend_with_only_a_message_change_still_builds() {
+    let site = Site::new();
+    site.write("a.txt", "one");
+    let v1 = site.commit("v1");
+    // 不再改文件，直接 amend 换 msg。
+    m4::amend(&site.cli(), Some("just a new message"), true).unwrap();
+    let heads = site.heads();
+    assert_eq!(heads.len(), 1);
+    assert_ne!(heads[0], v1);
+    let c = object::read_commit(&*site.db, site.pid, &heads[0]).unwrap();
+    assert_eq!(c.msg, "just a new message");
+    assert_eq!(c.parents, Vec::<Hash>::new(), "初始提交的 amend 亲代为空");
+}
+
+/// 多 head 时 amend 拒绝（替换哪一个没有定义）。
+#[test]
+fn amend_refuses_when_there_are_multiple_heads() {
+    let site = Site::new();
+    site.write("a.txt", "one");
+    let v1 = site.commit("v1");
+    site.write("a.txt", "two");
+    let v2 = site.commit("v2");
+    build::set_ref(&*site.db, site.pid, MAIN, &[v1, v2]).unwrap();
+    let e = m4::amend(&site.cli(), None, true).expect_err("两个 head 时不许猜");
+    assert!(e.to_string().contains("2 个"), "{e}");
+    assert_eq!(site.heads().len(), 2, "被拒那一趟 head 不动");
 }

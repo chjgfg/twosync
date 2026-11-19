@@ -540,6 +540,44 @@ pub fn pull(
     Ok(rep)
 }
 
+/// **只问对端 head，不传块**（status 的"实时对端 head"格，2026-11-19）。
+///
+/// 握手与 TOFU 与 `push` 一字一样（顺序也是：说出项目名之前先核身份），开场帧换成
+/// `HeadsQuery`，读到 `HeadsState` 就收尾 —— 不进 body、不记 S 账。返回对端的 head 集合。
+pub fn query_heads(io: &mut impl Io, db: &dyn KvEngine, opts: &PushOpts<'_>) -> Result<Vec<Hash>> {
+    let pid = keys::project_id(opts.project);
+    frame::encode(
+        io,
+        &Proto::Hello {
+            proto_ver: PROTO_VER,
+            peer_id: opts.peer_id.to_vec(),
+            caps: opts.caps,
+        },
+    )?;
+    let theirs = match frame::decode(io)? {
+        Proto::Hello { proto_ver, peer_id, .. } => (proto_ver, peer_id),
+        other => return Err(unexpected(&other, "Hello")),
+    };
+    if theirs.0 != PROTO_VER {
+        return Err(Error::BadInput(format!(
+            "对端协议版本 {} ≠ 本端 {PROTO_VER}：先对齐版本再同步",
+            theirs.0
+        )));
+    }
+    if !opts.peer_name.is_empty() {
+        check_or_record_peer(db, opts.peer_name, &theirs.1)?;
+    }
+    frame::encode(
+        io,
+        &Proto::HeadsQuery { project: opts.project.to_string(), pid },
+    )?;
+    match frame::decode(io)? {
+        Proto::HeadsState { heads, .. } => Ok(heads),
+        Proto::Abort { msg } => Err(Error::BadInput(format!("对端拒绝开场：{msg}"))),
+        other => Err(unexpected(&other, "HeadsState")),
+    }
+}
+
 /// 服务端一场会话。`resolve` 把项目名换成本端 pid，**换不成就给一句给人看的原因**。
 ///
 /// 为什么是 `Result` 而不是 `Option`：§9.5.3 之后"认不得这个项目"有两种完全不同的理由——
@@ -596,7 +634,25 @@ pub fn serve(
             ancestors,
             max_bytes,
         } => (project, pid, heads, ancestors, Side::Send, max_bytes),
-        other => return Err(unexpected(&other, "BeginSession/PullRequest")),
+        // 只问 head 不传块（status --peer）：回 HeadsState 之后直接收尾，不进 body、不记 S 账。
+        Proto::HeadsQuery { project, pid } => {
+            frame::check_project_id(&project, pid)?;
+            let pid = match resolve(&project) {
+                Ok(p) => p,
+                Err(why) => {
+                    let msg = format!("本端拒绝项目 {project:?}：{why}");
+                    frame::encode(io, &Proto::Abort { msg: msg.clone() })?;
+                    return Err(Error::BadInput(msg));
+                }
+            };
+            let heads = build::ref_heads(db, pid, build::MAIN)?;
+            frame::encode(io, &Proto::HeadsState { heads, ancestors: Vec::new() })?;
+            rep.project = project;
+            rep.accepted = true;
+            rep.reason = "heads-only 查询：只报 head，不传块".to_string();
+            return Ok(rep);
+        }
+        other => return Err(unexpected(&other, "BeginSession/PullRequest/HeadsQuery")),
     };
     frame::check_project_id(&project, pid_claimed)?;
     let pid = match resolve(&project) {

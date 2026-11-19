@@ -100,6 +100,18 @@ pub const TAG_PEER: u8 = b'P';
 /// 崩在中间就是"清单引用一个不存在的块"。归零的块先进这张表，unlink 是**后面一趟限额的活**，
 /// 崩了下次接着做，而且 `gc` 能报出"还欠着多少个没删"。
 pub const TAG_PENDING: u8 = b'D';
+/// shallow 边界（`prune --expire`，2026-11-19）：`G|p|<child hash>` → 空值。
+///
+/// 语义：**这个 commit 的亲代链在这里被裁断**——它的 `C` 体里 parents 仍指向被裁掉的
+/// 老 commit（parents 编进 hash，改不得），但那些亲代已经不在库里。读侧（`walk` /
+/// `parent_index` / `parents_of`）见到这一行就把该 commit 当"没有亲代"处理，
+/// 于是 `log`/`blame`/`bisect` 在边界处自然停住，而不是撞 `MissingObject`。
+///
+/// 为什么是独立标签而不是改 `Commit` 字段：postcard 非自描述，加字段 = 旧 C 行解码失败，
+/// 而且 parents 进 hash ⇒ 改字段会作废全部历史身份。一行一标记不动任何 hash。
+/// 标签选 `G`：与现有 C/c/T/B/K/k/W/H/Z/A/S/P/D/R 均不冲突，也不落在任何前缀扫区间里。
+pub const TAG_SHALLOW: u8 = b'G';
+
 /// deferred 名单（§7.2）：`R|p|<path>` → `worktree::DeferredRec`。
 ///
 /// 为什么要有这么一行而不只把 deferred 当扫描报告里的一个数：§7.2 要求两件事——
@@ -226,6 +238,11 @@ pub fn peer_key(peer_id: &[u8]) -> Vec<u8> {
 /// unlink 那一趟要按字节数从 FR-15 的桶里扣，而这不该再回头点查 `K`（门面每次读折全库，§9.6.1）。
 pub fn pending_key(pid: ProjectId, hash: &Hash) -> Vec<u8> {
     keyed(TAG_PENDING, pid, hash)
+}
+
+/// shallow 边界的一行：`G|p|hash` → 空值（存在即语义，见 [`TAG_SHALLOW`]）。
+pub fn shallow_key(pid: ProjectId, hash: &Hash) -> Vec<u8> {
+    keyed(TAG_SHALLOW, pid, hash)
 }
 
 /// deferred 的一行：路径是变长段，**放在键尾**（§9.2 规则 3）。

@@ -103,6 +103,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         debounce,
         rounds,
         max_mbps,
+        max_cpu_mbps,
         no_push,
         peer,
         agent_bin,
@@ -129,9 +130,13 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
     };
     let interval = Duration::from_secs(interval.max(1));
     let debounce = Duration::from_secs(debounce.max(1));
+    // 拨号偏好（§16.3）：站点配置里的 dial_preference，默认 both（先 pull 再 push）。
+    let dial = crate::cli::config::Config::load(&cli.root)?.dial_preference()?;
+    let do_pull = dial != "push-only";
+    let do_push = dial != "pull-only";
 
     println!(
-        "daemon      = project {name} 根 {} · 兜底 {} s · 静默 {} s · 限速 {} · gc {}",
+        "daemon      = project {name} 根 {} · 兜底 {} s · 静默 {} s · 限速 {} · gc {} · 拨号 {dial}",
         work.display(),
         interval.as_secs(),
         debounce.as_secs(),
@@ -182,6 +187,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         next_forced = Instant::now() + interval;
         let started = Instant::now();
         println!("第 {round} 轮   = 触发 = {trigger:?}");
+        tracing::info!(round, trigger = ?trigger, project = %name, "daemon 一轮开始");
 
         // ── scan + commit ──
         // head 前后各读一次：`commit` 自己会打印，但"有没有真的产生提交"这件事循环层要知道
@@ -193,10 +199,10 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         match &trigger {
             Trigger::Quiet(dirs) if !dirs.is_empty() => {
                 for d in dirs {
-                    m0::scan(cli, false, 2000, Some(d))?;
+                    m0::scan(cli, false, 2000, Some(d), max_cpu_mbps)?;
                 }
             }
-            _ => m0::scan(cli, false, 2000, None)?,
+            _ => m0::scan(cli, false, 2000, None, max_cpu_mbps)?,
         }
         let db = cli.store()?;
         let pid = crate::store::keys::project_id(&name);
@@ -211,6 +217,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
             Import {
                 fast: false,
                 max_mbps,
+                max_cpu_mbps,
             },
         )?;
         let db = cli.store()?;
@@ -224,7 +231,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
         // **pull 失败不进退避曲线**：对端还是个空站点（没有 head）时它必然拒开场，
         // 那是**正常状态**不是网络故障；把它算进 `failures` 会让第一天的循环一路退避到 15 分钟。
         let mut pulled = false;
-        if !no_push {
+        if !no_push && do_pull {
             match m1::pull(
                 cli,
                 &PullArgs {
@@ -249,7 +256,7 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
 
         // ── push ──
         let mut pushed = false;
-        if !no_push {
+        if !no_push && do_push {
             // 没提交也推：对端可能比我们新（它自己提交过）时，push 是"让对端也看到我们的 head"，
             // 没新东西时它自己会报 `blocks_sent = 0`，代价是一次会话。
             match m1::push(
@@ -332,6 +339,15 @@ pub fn daemon(cli: &Cli, args: &DaemonArgs) -> Result<()> {
                 cli.io_bucket.limit().unwrap_or(0) as f64 / 1048576.0
             );
         }
+        tracing::info!(
+            round,
+            committed,
+            pulled,
+            pushed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            project = %name,
+            "daemon 一轮结束"
+        );
         if rounds != 0 && round >= rounds {
             println!("跑满 {round} 轮，退出（--rounds）");
             return Ok(());

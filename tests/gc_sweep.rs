@@ -574,3 +574,243 @@ fn count_rows(db: &dyn storage_engines::KvEngine, tag: u8, pid: u32) -> usize {
     tx.commit();
     rows.len()
 }
+
+// ── Q19（2026-11-19 定案）：gc 的引擎那一半循环到净减 0 ─────────────────────────
+
+/// 命令层 gc 用例的站点：引擎句柄用 `Arc` 共享（`Cli.store_slot` 注入同一个），
+/// 不能再开第二个句柄（库级文件锁，§9.6.4）。形状照 `merge_keep_both.rs` 的 Site。
+struct CliSite {
+    tmp: tempfile::TempDir,
+    db: std::sync::Arc<dyn storage_engines::KvEngine>,
+    pid: u32,
+}
+
+impl CliSite {
+    fn with_chains() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        common::pin_engine_in_config(tmp.path());
+        let db: std::sync::Arc<dyn storage_engines::KvEngine> =
+            std::sync::Arc::from(open_store(tmp.path(), common::engine()).expect("open_store"));
+        let pid = keys::project_id(PROJECT);
+        let root = tmp.path().join(PROJECT);
+        fs::create_dir_all(&root).expect("项目目录");
+        let store = Cas::new(&objects_dir(tmp.path()), BLOCK).expect("CAS");
+        // 同一个文件连提 6 版：热点键上攒出旧版本行（rows_above_one > 0）。
+        for i in 0..6u8 {
+            fs::write(root.join("hot.bin"), [i; 4096]).expect("写文件");
+            worktree::scan(&*db, pid, &root, false, 500).expect("scan");
+            build::build(
+                &*db,
+                pid,
+                &store,
+                &root,
+                Meta { peer: "t", msg: "用例", ts: i as i64 + 1, allow_mass_delete: true },
+            )
+            .expect("commit")
+            .commit
+            .expect("这一轮该有提交");
+        }
+        assert!(
+            db.health().rows_above_one > 0,
+            "台架前提：版本链得真的攒出来，否则用例什么都测不到"
+        );
+        Self { tmp, db, pid }
+    }
+
+    fn cli(&self) -> twosync::cli::Cli {
+        let cli = twosync::cli::Cli {
+            root: self.tmp.path().to_path_buf(),
+            project: Some(PROJECT.to_string()),
+            engine: None,
+            io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
+            store_slot: Default::default(),
+            cmd: twosync::cli::Cmd::Init,
+        };
+        let _ = cli.store_slot.set(self.db.clone());
+        cli
+    }
+}
+
+/// `gc --apply` 之后必须收到**不动点**：`rows_above_one = 0`。
+/// 定案前单趟 vacuum 收不干净（§11.4h：四次里有一次只从 40 层收到 26 层），
+/// 这条用例钉的是"跑过 gc 的周期点上链不再挂着旧版本"。
+#[test]
+fn gc_apply_vacuums_to_the_fixpoint() {
+    let site = CliSite::with_chains();
+    twosync::cli::m1::gc(&site.cli(), None, false, true, 0, 0.0, 0.0).expect("gc --apply");
+    let h = site.db.health();
+    assert_eq!(h.rows_above_one, 0, "循环到净减 0 之后不许再挂旧版本：{h:?}");
+    assert_eq!(h.max_chain, 1, "链深必须收到 1：{h:?}");
+    // 历史一条不许少：6 笔 commit 都还在
+    assert_eq!(count_rows(&*site.db, keys::TAG_COMMIT, site.pid), 6);
+}
+
+/// dry-run（不带 `--apply`）不进循环、一行不裁（FR-7，cli_surface 那两条的同源判据）。
+#[test]
+fn gc_dry_run_does_not_enter_the_vacuum_loop() {
+    let site = CliSite::with_chains();
+    let before = site.db.health();
+    let cli = site.cli();
+    twosync::cli::m1::gc(&cli, None, false, false, 0, 0.0, 0.0).expect("gc dry");
+    let after = site.db.health();
+    assert_eq!(after.total_rows, before.total_rows, "dry 不许裁一行");
+    assert_eq!(
+        cli.io_bucket.written(),
+        None,
+        "dry 连桶都不许扣（没有 configure 过 ⇒ 桶是空的）"
+    );
+}
+
+// ── prune --expire（FR-9 的自动过期，2026-11-19）──────────────────────────────
+
+const DAY_NS: i64 = 86_400 * 1_000_000_000;
+
+/// 造一条 5 本的线性历史，ts = 1..5 天（纳秒），返回各 commit。
+fn chain_site() -> CliSite {
+    let site = CliSite::with_chains_empty();
+    for i in 1..=5i64 {
+        site.commit_one(&format!("v{i}"), i * DAY_NS);
+    }
+    site
+}
+
+impl CliSite {
+    fn with_chains_empty() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        common::pin_engine_in_config(tmp.path());
+        let db: std::sync::Arc<dyn storage_engines::KvEngine> =
+            std::sync::Arc::from(open_store(tmp.path(), common::engine()).expect("open_store"));
+        let pid = keys::project_id(PROJECT);
+        fs::create_dir_all(tmp.path().join(PROJECT)).expect("项目目录");
+        // 命令层（prune/tag/revert）走 resolve_project ⇒ 要有注册表。
+        let mut reg = twosync::cli::registry::Registry::default();
+        reg.add(PROJECT, PROJECT).expect("注册项目");
+        reg.save(tmp.path()).expect("写注册表");
+        Self { tmp, db, pid }
+    }
+
+    fn commit_one(&self, body: &str, ts: i64) -> Hash {
+        let root = self.tmp.path().join(PROJECT);
+        fs::write(root.join("f.bin"), body).expect("写文件");
+        worktree::scan(&*self.db, self.pid, &root, false, 500).expect("scan");
+        let store = Cas::new(&objects_dir(self.tmp.path()), BLOCK).expect("CAS");
+        build::build(
+            &*self.db,
+            self.pid,
+            &store,
+            &root,
+            Meta { peer: "t", msg: body, ts, allow_mass_delete: true },
+        )
+        .expect("commit")
+        .commit
+        .expect("这一轮该有提交")
+    }
+
+    fn commit_hashes(&self) -> Vec<Hash> {
+        let mut hs: Vec<Hash> = count_rows_tag(&*self.db, keys::TAG_COMMIT, self.pid);
+        hs.sort();
+        hs
+    }
+
+    fn heads(&self) -> Vec<Hash> {
+        build::ref_heads(&*self.db, self.pid, build::MAIN).expect("heads")
+    }
+}
+
+fn count_rows_tag(db: &dyn storage_engines::KvEngine, tag: u8, pid: u32) -> Vec<Hash> {
+    let mut prefix = vec![tag];
+    prefix.extend_from_slice(&pid.to_be_bytes());
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    rows.iter()
+        .filter_map(|r| {
+            let t = r.key.get(prefix.len()..)?;
+            if t.len() != 32 {
+                return None;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(t);
+            Some(h)
+        })
+        .collect()
+}
+
+/// --keep 2：5 本线性链裁成最新 2 本，最老 3 本的 C 行消失，head 不动。
+#[test]
+fn prune_keep_n_drops_the_oldest_commits() {
+    let site = chain_site();
+    let before = site.commit_hashes();
+    assert_eq!(before.len(), 5);
+    twosync::cli::m4::prune(&site.cli(), None, Some(2), true, 0.0).expect("prune --keep 2");
+    let after = site.commit_hashes();
+    assert_eq!(after.len(), 2, "只留最新 2 本：{after:?}");
+    // head 仍是最新那一本（prune 不动 ref）
+    let heads = build::ref_heads(&*site.db, site.pid, build::MAIN).expect("heads");
+    assert_eq!(heads.len(), 1);
+    assert!(after.contains(&heads[0]));
+}
+
+/// --days 2：只留最近 2 天（ts=4,5 天那两本），更老的裁掉。
+#[test]
+fn prune_days_drops_commits_older_than_the_window() {
+    let site = chain_site();
+    // now = 第 6 天 ⇒ cutoff = 第 4 天 ⇒ ts<4 天的三本被裁
+    let plan = gc::prune_keep(&*site.db, site.pid, Some(2), None, 6 * DAY_NS).expect("plan");
+    assert_eq!(plan.dropped.len(), 3, "ts=1,2,3 天那三本：{plan:?}");
+    assert_eq!(plan.keep.len(), 2);
+    assert_eq!(plan.boundaries.len(), 1, "ts=4 天那一本是边界");
+}
+
+/// 被 tag 挂住的老 commit 不裁（pin 语义）。
+#[test]
+fn prune_never_drops_a_commit_held_by_a_tag() {
+    let site = chain_site();
+    let oldest = {
+        let nodes = history::walk(&*site.db, site.pid, &site.heads(), 0).expect("walk");
+        nodes.last().expect("最老一本").hash
+    };
+    twosync::cli::m4::tag(
+        &site.cli(),
+        &twosync::cli::cmd::TagCmd::Add {
+            name: "pin".to_string(),
+            at: Some(keys::hex(&oldest)),
+        },
+    )
+    .expect("tag add");
+    twosync::cli::m4::prune(&site.cli(), None, Some(2), true, 0.0).expect("prune");
+    let after = site.commit_hashes();
+    assert!(after.contains(&oldest), "tag 挂着的最老一本不许裁：{after:?}");
+    // 最新 2 本 + 被挂住的 1 本 = 3
+    assert_eq!(after.len(), 3);
+}
+
+/// dry-run 一个字不写（FR-7）。
+#[test]
+fn prune_dry_run_writes_nothing() {
+    let site = chain_site();
+    let rows = site.db.health().total_rows;
+    twosync::cli::m4::prune(&site.cli(), None, Some(2), false, 0.0).expect("prune dry");
+    assert_eq!(site.db.health().total_rows, rows, "dry 不许写一行");
+    assert_eq!(site.commit_hashes().len(), 5);
+}
+
+/// shallow 边界之后 log/blame 正常停住，不撞 MissingObject；跨界 revert 报明确错误。
+#[test]
+fn after_prune_log_stops_at_the_boundary_and_revert_refuses_crossing_it() {
+    let site = chain_site();
+    let nodes = history::walk(&*site.db, site.pid, &site.heads(), 0).expect("walk");
+    let boundary = nodes[1].hash; // 最新 2 本里较老的那本 = 边界
+    twosync::cli::m4::prune(&site.cli(), None, Some(2), true, 0.0).expect("prune");
+    // log 只看到 2 本，不报错
+    let after = history::walk(&*site.db, site.pid, &site.heads(), 0).expect("walk after prune");
+    assert_eq!(after.len(), 2, "shallow 边界处停住：{after:?}");
+    // blame 也正常（不撞 MissingObject）
+    let bh = history::blame_path(&*site.db, site.pid, &site.heads(), "f.bin", 0).expect("blame");
+    assert!(!bh.hits.is_empty());
+    // 跨界 revert：边界那本的亲代被裁 ⇒ 拒绝
+    let e = twosync::cli::m4::revert(&site.cli(), &keys::hex(&boundary), true, true)
+        .expect_err("亲代被裁的 revert 该拒绝");
+    assert!(e.to_string().contains("shallow"), "{e}");
+}

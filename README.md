@@ -44,7 +44,7 @@ twosync --root /data/ts --project buildout daemon --peer peer-a   # 常驻：wat
 
 | 层 | 命令 |
 |---|---|
-| 一：读历史 / 落盘 / 同步 | `init` `doctor` `version` `config` `project` `scan` `commit` `log` `show` `diff` `status` `plan` `apply` `restore` `checkout` `ls-files` `mv` `gc` `push` `pull` `agent` `daemon` `peer` |
+| 一：读历史 / 落盘 / 同步 | `init` `doctor` `version` `config` `project` `scan` `commit`（含 `--amend`） `log` `show` `diff` `status`（`--peer` 问实时对端 head） `plan` `apply` `restore` `checkout` `ls-files` `mv` `gc` `prune` `push` `pull` `agent` `daemon` `peer` |
 | 二：图上重写 / 重放 | `tag` `branch` `reset` `merge` `revert` `cherry-pick` `blame` `bisect` `stash` |
 
 几个和 git 不同、且**故意**不同的点：
@@ -104,9 +104,9 @@ CAS 那一侧四家一字不变（15.63 MiB / 4 001 文件）⇒ 文件字节根
 
 1. **不兼容 git 对象格式与 git 协议**，所以真 git 命令读不了本库；手感照 git 自建（§16.2），语义相近但**不是**同一实现。原因见 §1 第 1、2 条与 §17。
 2. `branch`/`tag` 只是本地命名，v1 **不参与同步**；跨站协作仍需真 git。
-3. collision 只能人选一边，不合并内容。**再补一条今天真实的边界（2026-10-21）**：
-   "一边删了这条路径、另一边改了它"**今天不报成 collision**，而是静默保留内容、丢掉那个删除 ⇒
-   见 §14 Q21（改判据要动 `status` 的碰撞清单，等你点头才做）。
+3. collision 只能人选一边，不合并内容。**2026-11-19 起"一边删了、另一边改了"也判成 collision**
+   （Q21 定案①，git 的 modify/delete 语义）：报冲突、拒绝、交给人选，不再静默丢删除。
+   两边都删 ⇒ 同一个结果，不冲突。
 4. 硬链接不识别（§8）。
 5. 不转 CRLF/LF，不做文本友好化。
 6. v1 实现只有 1+1 个 peer；**多端、NAT 穿透、部分连通路由不做**（§2.3、M5）。
@@ -252,6 +252,12 @@ CAS 那一侧四家一字不变（15.63 MiB / 4 001 文件）⇒ 文件字节根
 
 ---
 
+## 二进制体积（NFR-9）
+
+`cargo build --release`（thin-LTO + strip + codegen-units=1，2026-11-19 实测）：
+**twosync.exe = 5.69 MiB**（5 969 408 B），对 NFR-9 的 ≤ 15 MB 目标余量充足。
+Linux musl 静态构建未验（无 Linux 机器，与真 SSH 那格同因暂缓）。
+
 ## 依赖
 
 `storage-engines = "0.4.0"`（crates.io，纯 Rust 的 KV 存储基座，四引擎：LSM / B+ 树 / bitcask / memory）。
@@ -268,9 +274,10 @@ CAS 那一侧四家一字不变（15.63 MiB / 4 001 文件）⇒ 文件字节根
 ## 怎么验证
 
 ```sh
-cargo test                       # 270 passed / 0 failed / 5 ignored
+cargo test                       # 294 passed / 0 failed / 5 ignored
 cargo clippy --all-targets       # 0 警告
-TWOSYNC_TEST_ENGINE=bplus_tree cargo test    # 同一套用例换引擎，270 / 0
+TWOSYNC_TEST_ENGINE=bplus_tree cargo test    # 同一套用例换引擎，294 / 0
+just check                       # 一键双引擎 + clippy（justfile，无托管 CI 的替代）
 ```
 
 不变量的随机化验证在 `tests/invariants_proptest.rs`：**每条 commit 都能按清单逐字节重建**、
@@ -304,15 +311,16 @@ criterion 那批基准跨引擎要用缩样档（`TWOSYNC_BENCH_QUICK=1` = 10 �
 
 - **CDC 变长分块**：现在按定长 4 MiB 切。变长（滚动 hash）能少传边界移位，但它**与"git 对象格式"无关**，
   是块层的事。M4 增强，未动。
-- **稀疏重建、批传输调优**：`§10` 的差分表已有，性能调优未做。
+- **批传输调优**：`§10` 的差分表已有，性能调优未做。（**稀疏重建已落**，2026-11-19：零块 seek+set_len，
+  Windows 只省写零 IO、不承诺占盘变小，见 §15 第 34 条。）
 - **§10.8 矩阵欠的那两格现在各有一半**：12 GiB 站点上只读那一列**已落**（但只有 `lsm_tree` 一家，
   第二列要在 bplus 上重建一个 12 GiB 站）；criterion 的两引擎对比**可比三格**（bplus 停在
   `scan/forced_1000` 没跑完）。剩下的三件：bplus 那一列补完（要先把本机 C: 空出来）、大站第二列、
   **一个"库字节不变而行数大改"的站**——用来把 §15 第 31 条那条"堆峰 ≈ 1.7 × 库磁盘字节"从假设推成定律。
   （§15 第 31 条那个对照实验 2026-10-25 **已经做过一刀，当场把我上一批写的归因推翻**：压完链
   行数 ÷ 6 而堆峰升 36 %，过程与教训在 `REQUIREMENTS.md` §17 补记四十八。）
-- **72 h 真长跑 / 跨机器真 SSH**：需要第二台机器或对 sshd 的授权；`daemon` 的周期 gc 循环到净减 0 那条
-  判据（§14 Q19）也还悬着。
+- **72 h 真长跑 / 跨机器真 SSH**：需要第二台机器或对 sshd 的授权（用户拍板暂缓）。
+  （`daemon` 周期 gc 循环到净减 0 那条判据 **已落地**，2026-11-19，Q19 方案①；长跑实测仍待第二台机器。）
 - **不承诺**：NAT 穿透、多端 mesh 路由、中心服务器、commit 签名（M5，且要重开范围评审）。
 
 ## 待决问题（会改变判据的，都写在 `REQUIREMENTS.md` §14）
@@ -326,5 +334,5 @@ criterion 那批基准跨引擎要用缩样档（`TWOSYNC_BENCH_QUICK=1` = 10 �
 （目录数只值 7–20 %，装载器七档全部没退预算）；
 `gc --sweep --apply` 在这里还帮不上忙（它把库写大了 34.5 %，历史没丢）。**判据本身没动、也没换成我能过的数字**；
 `NFR-2` 的建库墙钟**未达标**，但归因已做完（死于 fsync 单价，不是代码）；
-`gc` 要不要循环到净减 0（Q19）、head 的来源要不要变成库里的永久事实（Q18）、
-"一边删了某路径另一边改了它"算不算碰撞（Q21，**今天不算**）。
+head 的来源要不要变成库里的永久事实（Q18，仍待拍）。
+**已定案（2026-11-19）**：Q19 gc 循环到净减 0（方案①已落）、Q21 删-vs-改判成碰撞（方案①已落）。

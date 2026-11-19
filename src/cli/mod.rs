@@ -55,6 +55,12 @@ pub struct Cli {
     #[arg(skip)]
     pub io_bucket: crate::store::cas::Bucket,
 
+    /// **这一个进程唯一的 CPU 桶**（FR-15 的 `--max-cpu`）：扣的是"哈希/校验搬动的字节"，
+    /// 与 IO 桶分开——写盘限速和算力限速是两件事，掺在一个桶里两边的账都读不清。
+    /// 语义与 IO 桶同源：累计平均速率（[`crate::store::cas::Bucket`]），`0` = 不限速。
+    #[arg(skip)]
+    pub cpu_bucket: crate::store::cas::Bucket,
+
     /// 第一次 [`Cli::store`] 时打开、之后**一直复用**的那个引擎句柄。同样不由命令行填
     /// （`pub` 只为测试能拼出 `Cli`；命令层一律走 [`Cli::store`]，别自己去 `open_store`，
     /// 那会绕过 FR-21 启动自检与这个缓存）。
@@ -69,6 +75,22 @@ pub struct Cli {
     pub cmd: Cmd,
 }
 
+/// 手写 `Default`（不 derive 到 `Cmd`：那会污染命令语义）。`cmd` 取一个无害的单元变体，
+/// 测试拼 `Cli` 字面量时尾部补 `..Default::default()` 即可，此后加字段不再编译红。
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::from("."),
+            project: None,
+            engine: None,
+            io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
+            store_slot: Default::default(),
+            cmd: Cmd::Init,
+        }
+    }
+}
+
 impl Cli {
     /// 拿到本进程的 IO 桶，并把它设成 `max_bps` 的预算（`0` = 这条命令没给限速，不改已有预算）。
     ///
@@ -77,6 +99,12 @@ impl Cli {
     pub fn budget(&self, max_bps: u64) -> crate::store::cas::Bucket {
         self.io_bucket.configure(max_bps);
         self.io_bucket.clone()
+    }
+
+    /// CPU 桶的同款把手（`--max-cpu-mbps`）：扣的是哈希/校验搬动的字节，与 IO 桶各管各的。
+    pub fn cpu_budget(&self, max_bps: u64) -> crate::store::cas::Bucket {
+        self.cpu_bucket.configure(max_bps);
+        self.cpu_bucket.clone()
     }
 
     /// 打开存储基座。"命令行 > 配置文件 > 内置默认"这条顺序**只在这里实现一次**——

@@ -95,6 +95,7 @@ impl Site {
             project: Some("p".to_string()),
             engine: None,
             io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: Cmd::Init,
         };

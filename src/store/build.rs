@@ -503,6 +503,34 @@ pub fn build_detached(
     work_root: &Path,
     meta: Meta<'_>,
 ) -> Result<Built> {
+    build_inner(db, pid, store, work_root, meta, None, false)
+}
+
+/// `commit --amend` 的库层入口：**新 commit 的亲代 = 旧 head 的亲代**（不是旧 head），
+/// 于是旧 head 失去 main 悬挂 ⇒ 不可达 ⇒ 下次 sweep 收走。tree 来自当前 W 快照。
+///
+/// `force`：amend 允许"内容没变只改 msg"也建 commit（绕过空变更早退）——那是 amend 的正当用途。
+/// 调用方负责前置校验（单 head）与把新 commit `set_ref` 到 MAIN。
+pub fn build_amend(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    store: &cas::Cas,
+    work_root: &Path,
+    meta: Meta<'_>,
+    parents: Vec<Hash>,
+) -> Result<Built> {
+    build_inner(db, pid, store, work_root, meta, Some(parents), true)
+}
+
+fn build_inner(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    store: &cas::Cas,
+    work_root: &Path,
+    meta: Meta<'_>,
+    parents_override: Option<Vec<Hash>>,
+    force: bool,
+) -> Result<Built> {
     let prev_heads = ref_heads(db, pid, MAIN)?;
     let prev_tree = head_tree(db, pid)?;
 
@@ -534,7 +562,7 @@ pub fn build_detached(
     built.epoch = rows.mark;
     // 改名折叠在熔断**之前**：一次大规模 `mv` 之后 `delete` 该归零，而不是去挡 FR-10。
     finish_changes(&mut built, &mut changes);
-    if built.changes.is_empty() {
+    if built.changes.is_empty() && !force {
         return Ok(built); // 不产生空提交：碎 commit 会把引擎版本链白白撑大（§9.6.2）
     }
     check_mass_delete(
@@ -545,7 +573,7 @@ pub fn build_detached(
     )?;
 
     let c = object::Commit {
-        parents: prev_heads.clone(),
+        parents: parents_override.unwrap_or_else(|| prev_heads.clone()),
         tree: built.tree,
         peer: meta.peer.to_string(),
         ts: meta.ts,

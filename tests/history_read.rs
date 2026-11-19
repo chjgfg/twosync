@@ -625,3 +625,68 @@ fn two_independent_roots_collide_on_every_shared_path_they_differ_on() {
     let cs2 = history::collisions(&*engine, PID, &[a, c]).unwrap();
     assert!(cs2.is_empty(), "各有一条独有路径 ⇒ 不该报：{cs2:?}");
 }
+
+// ── Q21（2026-11-19 定案）：删除也是一种改动 ─────────────────────────────────────
+
+/// 一边删了、另一边改了同一条路径 ⇒ **冲突**（git 的 modify/delete 语义）。
+/// 定案前这里静默取存在的那一边（= 静默丢删除），与"绝不静默覆盖"的项目基调相反。
+#[test]
+fn delete_versus_modify_on_the_same_path_is_a_collision() {
+    let (_d, engine) = db();
+    let base = tree_with(&*engine, "a.bin", 1);
+    let g = commit(&*engine, PID, &[], &base, 100);
+    let h_del = commit(&*engine, PID, &[g], &object::empty_tree(), 200);
+    let h_mod = commit(&*engine, PID, &[g], &tree_with(&*engine, "a.bin", 2), 300);
+
+    let cs = history::collisions(&*engine, PID, &[h_del, h_mod]).unwrap();
+    assert_eq!(paths(&cs), vec!["a.bin".to_string()], "删-vs-改必须报：{cs:?}");
+    assert_eq!(cs[0].heads.len(), 2);
+}
+
+/// 两边都删了同一条路径 ⇒ 同一个结果，**不冲突**（删除标记 None == None）。
+#[test]
+fn both_sides_deleting_the_same_path_is_not_a_collision() {
+    let (_d, engine) = db();
+    let base = object::put_tree(&*engine, PID, &[file("a.bin", 1, 10), file("b.bin", 2, 10)]).unwrap();
+    let g = commit(&*engine, PID, &[], &base, 100);
+    let keep_b = object::put_tree(&*engine, PID, &[file("b.bin", 2, 10)]).unwrap();
+    let h1 = commit(&*engine, PID, &[g], &keep_b, 200);
+    let h2 = commit(&*engine, PID, &[g], &keep_b, 300);
+    assert!(
+        history::collisions(&*engine, PID, &[h1, h2]).unwrap().is_empty(),
+        "两边删到同一个结果没有可裁的东西"
+    );
+}
+
+/// 目录被整体删掉 ⇒ 冲突要报到**叶子路径**，不是只报目录名（只报目录名会漏掉真正被删的文件）。
+#[test]
+fn deleting_a_whole_directory_reports_collisions_on_its_leaves() {
+    let (_d, engine) = db();
+    let sub = object::put_tree(&*engine, PID, &[file("x.bin", 1, 10), file("y.bin", 2, 10)]).unwrap();
+    let base = object::put_tree(&*engine, PID, &[dir("d", sub)]).unwrap();
+    let g = commit(&*engine, PID, &[], &base, 100);
+    let h_del = commit(&*engine, PID, &[g], &object::empty_tree(), 200);
+    let sub_mod = object::put_tree(&*engine, PID, &[file("x.bin", 9, 10), file("y.bin", 2, 10)]).unwrap();
+    let h_mod = commit(&*engine, PID, &[g], &object::put_tree(&*engine, PID, &[dir("d", sub_mod)]).unwrap(), 300);
+
+    let cs = history::collisions(&*engine, PID, &[h_del, h_mod]).unwrap();
+    assert_eq!(
+        paths(&cs),
+        vec!["d/x.bin".to_string()],
+        "只有被改的那片叶子冲突；没动的 y.bin 跟着删除走，不算：{cs:?}"
+    );
+}
+
+/// 只有一边删、另一边没动 ⇒ **不冲突**（union 的本意：删除生效，另一边跟着走）。
+#[test]
+fn delete_versus_untouched_is_not_a_collision() {
+    let (_d, engine) = db();
+    let base = object::put_tree(&*engine, PID, &[file("a.bin", 1, 10), file("b.bin", 2, 10)]).unwrap();
+    let g = commit(&*engine, PID, &[], &base, 100);
+    let h_del = commit(&*engine, PID, &[g], &object::put_tree(&*engine, PID, &[file("b.bin", 2, 10)]).unwrap(), 200);
+    let h_same = commit(&*engine, PID, &[g], &base, 300);
+    assert!(
+        history::collisions(&*engine, PID, &[h_del, h_same]).unwrap().is_empty(),
+        "一边删一边没动 ⇒ 删除生效，没有要人选的东西"
+    );
+}

@@ -186,6 +186,29 @@ pub fn scan_scoped(
     batch: usize,
     bucket: &crate::store::cas::Bucket,
 ) -> Result<Report> {
+    scan_scoped_cpu(db, pid, root, scope, force, batch, &ScanBudgets { io: bucket, cpu: &crate::store::cas::Bucket::default() })
+}
+
+/// 扫描的两份预算（FR-15）：IO 桶管写引擎行的字节，CPU 桶管哈希搬动的字节。
+/// 收成结构而不是两个参数：clippy 的 7 参上限报的就是那形状（同 `PushArgs` 那条处理）。
+pub struct ScanBudgets<'a> {
+    pub io: &'a crate::store::cas::Bucket,
+    pub cpu: &'a crate::store::cas::Bucket,
+}
+
+/// [`scan_scoped`] 的带 CPU 桶版本（FR-15 `--max-cpu-mbps`）：哈希每搬动一批字节就从
+/// CPU 桶扣一次。IO 桶与 CPU 桶各管各的账（写引擎行 vs 算力）。
+pub fn scan_scoped_cpu(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    root: &Path,
+    scope: &Scope,
+    force: bool,
+    batch: usize,
+    budgets: &ScanBudgets<'_>,
+) -> Result<Report> {
+    let bucket = budgets.io;
+    let cpu_bucket = budgets.cpu;
     // 窄扫时把遍历起点换成那一个目录，但**相对路径仍然按 root 算**（`rel_path(root, …)`）：
     // `W` 的键是项目内的完整路径，按子树算会把 `d/e/f.bin` 记成 `e/f.bin`，那一行就永远对不上。
     let base = match scope {
@@ -294,6 +317,7 @@ pub fn scan_scoped(
         rep.hashed += 1;
         rep.bytes += size;
         rep.hashed_bytes += size;
+        cpu_bucket.charge(size); // CPU 桶：这一条的哈希搬动了 size 字节（FR-15）
         if rep.sample.len() < SAMPLE_MAX {
             rep.sample.push(rel);
         }

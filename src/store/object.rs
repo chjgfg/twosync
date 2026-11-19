@@ -15,7 +15,7 @@
 //! 10 万目录 × 1000 个 commit 就是 1 亿行垃圾。所以 `put_*` 先查后写；这一跳 `get` 在
 //! diff 层会被"已知集合"替代（引擎点查目前 0.86 ms/次，见 §17 补记）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use storage_engines::KvEngine;
@@ -196,7 +196,11 @@ pub fn read_commit(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Com
 }
 
 /// 走 `c` 索引取 parents：按 ordinal 升序，顺序就是 parents 的顺序。
+/// shallow 边界 commit 返回空（与 [`parent_index`] 同一条规矩）。
 pub fn parents_of(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Vec<Hash>> {
+    if is_shallow(db, pid, hash)? {
+        return Ok(Vec::new());
+    }
     let prefix = {
         let mut p = vec![keys::TAG_PARENT];
         p.extend_from_slice(&pid.to_be_bytes());
@@ -213,6 +217,34 @@ pub fn parents_of(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<Vec<
     Ok(out)
 }
 
+/// 本项目的 shallow 边界集合（`G|p` 前缀扫，一次装好）。
+/// 行数为 0 时这次扫描仍然付一折——但 `parent_index` 本来就只调一次，代价不叠加。
+pub fn shallow_set(db: &dyn KvEngine, pid: ProjectId) -> Result<BTreeSet<Hash>> {
+    let prefix = keys::project_prefix(keys::TAG_SHALLOW, pid);
+    let tx = db.begin();
+    let rows = tx.prefix_scan(&prefix);
+    tx.commit();
+    let mut out = BTreeSet::new();
+    for r in rows {
+        let Some(tail) = r.key.get(prefix.len()..) else { continue };
+        if tail.len() != 32 {
+            continue;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(tail);
+        out.insert(h);
+    }
+    Ok(out)
+}
+
+/// 某个 commit 是不是 shallow 边界（点查一次 `G` 行）。
+pub fn is_shallow(db: &dyn KvEngine, pid: ProjectId, hash: &Hash) -> Result<bool> {
+    let tx = db.begin();
+    let got = tx.get(&keys::shallow_key(pid, hash)).is_some();
+    tx.commit();
+    Ok(got)
+}
+
 /// 本项目的**整个亲代索引**：`child → [parent…]`，**一次** `c|p` 前缀扫装进内存。
 ///
 /// 为什么要它（§15.22、§17 补记廿五）：门面**每次读调用都折一遍全库**（§9.6.1），而历史遍历
@@ -227,6 +259,9 @@ pub fn parent_index(db: &dyn KvEngine, pid: ProjectId) -> Result<BTreeMap<Hash, 
     let tx = db.begin();
     let rows = tx.prefix_scan(&prefix);
     tx.commit();
+    // shallow 边界（prune --expire）：被标记的 commit 当"没有亲代"。
+    // 一次 G|p 前缀扫（通常 0 行或个位数），不逐 commit 点查（门面每读折全库，§9.6.1）。
+    let shallow = shallow_set(db, pid)?;
     let mut out: BTreeMap<Hash, Vec<Hash>> = BTreeMap::new();
     for r in rows {
         // 键尾是 `child(32) + ordinal(4)`； ordinal 的存在就是为了一个提交能有多个亲代（§7.1 合并）。
@@ -236,6 +271,9 @@ pub fn parent_index(db: &dyn KvEngine, pid: ProjectId) -> Result<BTreeMap<Hash, 
         };
         let mut child = [0u8; 32];
         child.copy_from_slice(&tail[..32]);
+        if shallow.contains(&child) {
+            continue; // 边界 commit：C 体里的 parents 指向已被裁掉的历史，索引不展开
+        }
         // ordinal 决定同一 child 下亲代的先后（0 = 第一个亲代，合并提交里那是"主亲代"）。
         let ord = u32::from_be_bytes([tail[32], tail[33], tail[34], tail[35]]);
         let Some(v) = &r.value else { continue };

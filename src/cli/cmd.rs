@@ -48,6 +48,10 @@ pub enum Cmd {
         /// 代价照实说：**窄扫轮报不出删除**，删除要等下一次全量轮确认。`daemon` 的事件轮走的就是这条。
         #[arg(long)]
         only: Option<String>,
+        /// 哈希算力的平均速率上限（MiB/s，FR-15 的 CPU 桶）。0 = 不限速。
+        /// 与 `--max-mbps`（IO 桶）各管各的账：这个管 blake3 搬动的字节。
+        #[arg(long, default_value_t = 0.0)]
+        max_cpu_mbps: f64,
     },
 
     /// 把上一次 `scan` 的结果固化成一个 commit：落块 → 建树 → 比对 → 移 head（FR-4）
@@ -71,6 +75,13 @@ pub enum Cmd {
         /// NFR-3 要的是别把同机策略进程的延迟拖走
         #[arg(long, default_value_t = 0.0)]
         max_mbps: f64,
+        /// 哈希/校验算力的平均速率上限（MiB/s，FR-15 的 CPU 桶）。0 = 不限速
+        #[arg(long, default_value_t = 0.0)]
+        max_cpu_mbps: f64,
+        /// 替换当前唯一 head：新 commit 的亲代 = 旧 head 的亲代，旧 head 变不可达（下次 gc 收）。
+        /// **推过的版本别 amend**：对端仍持旧 commit，union 会把它收回来。
+        #[arg(long)]
+        amend: bool,
     },
 
     /// 列出 head 可达的 commit，时间倒序（FR-4 的历史视图）
@@ -148,9 +159,20 @@ pub enum Cmd {
         /// 同 `commit --max-mbps`
         #[arg(long, default_value_t = 0.0)]
         max_mbps: f64,
+        /// 同 `commit --max-cpu-mbps`
+        #[arg(long, default_value_t = 0.0)]
+        max_cpu_mbps: f64,
     },
     /// 不在这里（要先 `scan`）。这一条与 git 的 `status` 语义相同，代价也相同。
-    Status,
+    Status {
+        /// 给一个对端名（ssh host 别名）才**拨号**问它的实时 head；不给 = 纯本地，不付拨号代价。
+        /// 这是一场 heads-only 会话（只交换 head 不传块，不记 S 账）。
+        #[arg(long)]
+        peer: Option<String>,
+        /// 远端的 twosync 可执行文件（--peer 时用）
+        #[arg(long, default_value = "twosync")]
+        agent_bin: String,
+    },
 
     /// 工作树与任意版本的差异，列出具体路径
     Diff {
@@ -319,6 +341,26 @@ pub enum Cmd {
         quota_mib: f64,
     },
 
+    /// 按策略淘汰老历史（FR-9 的"自动过期"那一半）：裁掉的 commit 变不可达，交给 `gc --sweep` 收
+    ///
+    /// 与 `gc` 的分工：`gc` 只收**已经不可达**的；`prune` 是那个**决定丢哪一版**的策略命令。
+    /// 被 tag/branch/stash 挂住的一律不裁；裁断的亲代链写 shallow 边界标记，
+    /// `log`/`blame`/`bisect` 在边界处停住而不是报错。**默认只报不写**，`--apply` 才落地。
+    Prune {
+        /// 只留最近 D 天（按 commit 时间戳）；不给 = 不按天裁
+        #[arg(long)]
+        days: Option<u64>,
+        /// 每条 head 链只留最新 N 本；不给 = 不按本数裁。两个都给时取更严的
+        #[arg(long)]
+        keep: Option<usize>,
+        /// 真的落改动（写 shallow 标记 + 删被裁 commit + 走一遍 mark-sweep 收块）
+        #[arg(long)]
+        apply: bool,
+        /// 删除字节的速率上限（MiB/s，FR-15 的桶）。0 = 不限速
+        #[arg(long, default_value_t = 0.0)]
+        max_mbps: f64,
+    },
+
     /// 常驻：watch 事件驱动 + debounce + 周期兜底 ⇒ 自动 `scan`/`commit`，可选自动 `push`（M2）
     ///
     /// 一轮 = 静默期到 ⇒ 全量 scan ⇒ commit（**无变更就不产生提交也不移 head**）⇒ 配对了才 push。
@@ -342,6 +384,10 @@ pub enum Cmd {
         /// 不是"每个阶段各 8 MiB/s"。
         #[arg(long, default_value_t = 0.0)]
         max_mbps: f64,
+        /// 哈希/校验算力的平均速率上限（MiB/s，FR-15 的 CPU 桶）。0 = 不限速。
+        /// 管的是 scan 的哈希与 commit 的切块/自证，与 IO 桶各管各的账。
+        #[arg(long, default_value_t = 0.0)]
+        max_cpu_mbps: f64,
         /// 只本地提交，不推送（对端还没接上时先这么跑）
         #[arg(long)]
         no_push: bool,
@@ -645,6 +691,8 @@ pub struct Import {
     pub fast: bool,
     /// 平均写速率上限，MiB/s；0 = 不限速
     pub max_mbps: f64,
+    /// 哈希/校验算力的平均速率上限，MiB/s；0 = 不限速（CPU 桶，与 IO 桶分开）
+    pub max_cpu_mbps: f64,
 }
 
 impl Import {
@@ -654,6 +702,15 @@ impl Import {
             0
         } else {
             (self.max_mbps * 1048576.0) as u64
+        }
+    }
+
+    /// CPU 桶的同款换算。
+    pub fn cpu_rate_bytes_per_sec(&self) -> u64 {
+        if self.max_cpu_mbps <= 0.0 {
+            0
+        } else {
+            (self.max_cpu_mbps * 1048576.0) as u64
         }
     }
 }
@@ -707,6 +764,8 @@ pub struct DaemonArgs<'a> {
     /// 跑满 N 轮退出；0 = 常驻
     pub rounds: u64,
     pub max_mbps: f64,
+    /// CPU 桶（哈希算力），MiB/s；0 = 不限速
+    pub max_cpu_mbps: f64,
     pub no_push: bool,
     pub peer: Option<&'a str>,
     pub agent_bin: &'a str,

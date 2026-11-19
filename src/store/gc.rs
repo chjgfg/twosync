@@ -191,13 +191,28 @@ pub fn pending_total(db: &dyn KvEngine, pid: ProjectId) -> Result<(usize, u64)> 
 
 /// 跑一趟 mark-sweep。`dry = true` 只算账、不落任何改动。
 pub fn sweep(db: &dyn KvEngine, cas: &Cas, pid: ProjectId, dry: bool) -> Result<Plan> {
-    let mut p = Plan::default();
-
     // ── mark：保留集 ──
     // 全部 ref，不是只看 `main`：M4 有 branch/tag 之后，只看一个 ref 就会把还挂在别处的气判成垃圾。
     let heads = build::all_ref_heads(db, pid, None)?;
     let keep_commits = history::reachable_strict(db, pid, &heads, &[])?;
-    let (keep_trees, keep_blobs) = history::marked_objects(db, pid, &keep_commits)?;
+    sweep_with_keep(db, cas, pid, &keep_commits, dry)
+}
+
+/// [`sweep`] 的删除机器，**保留集由调用方给定**。`prune --expire` 用它把"策略裁过的保留集"
+/// 落成删除；普通 `sweep` 是"全部 ref 可达闭包"这个特例。
+///
+/// 边界（与模块头同源）：调用方必须保证 `keep_commits` 里的 commit 都还在库里，
+/// 且**被裁 commit 的 shallow 标记已经写好**（否则保留集里的边界 commit 会在下一次
+/// `reachable_strict` 时把被裁亲代重新标活——那是 prune 命令层的顺序责任）。
+pub fn sweep_with_keep(
+    db: &dyn KvEngine,
+    cas: &Cas,
+    pid: ProjectId,
+    keep_commits: &BTreeSet<Hash>,
+    dry: bool,
+) -> Result<Plan> {
+    let mut p = Plan::default();
+    let (keep_trees, keep_blobs) = history::marked_objects(db, pid, keep_commits)?;
     p.commits_kept = keep_commits.len();
 
     // ── sweep：commit ──
@@ -302,6 +317,115 @@ pub fn sweep(db: &dyn KvEngine, cas: &Cas, pid: ProjectId, dry: bool) -> Result<
     p.orphan_files = n;
     p.orphan_bytes = bytes;
     Ok(p)
+}
+
+/// `prune --expire` 的裁剪结果（FR-9 的"按天数/版本数自动过期"那一半）。
+#[derive(Debug, Default)]
+pub struct PrunePlan {
+    /// 策略裁掉、且没有别的 ref 挂着的 commit（真正会消失的那些）。
+    pub dropped: Vec<Hash>,
+    /// 裁掉但被 tag/branch/stash 挂着 ⇒ 不裁（报给人看）。
+    pub held: Vec<Hash>,
+    /// 保留集里"亲代被裁"的边界 commit（要写 shallow 标记的那些）。
+    pub boundaries: Vec<Hash>,
+    /// 裁剪后的最终保留集（含放回的被挂住 commit）。命令层拿它直接走 [`sweep_with_keep`]，
+    /// 不必再算一遍闭包（那会多付 O(保留集) 折）。
+    pub keep: BTreeSet<Hash>,
+}
+
+/// 按策略裁剪保留集：`days` = 只留最近 D 天（按 `Commit.ts`），`keep_n` = 每个 head 链上
+/// 只留最新 N 本（按时间序）。两个都给时**取交集**（更严的那个生效）。都不给 = 不裁。
+///
+/// 判据与 [`sweep`] 的边界一致：**被别的 ref 挂住的一律不裁**（tag/branch/stash 的 pin 语义），
+/// 裁掉的 commit 的亲代边由调用方写 shallow 标记（[`mark_shallow`]），读侧从此在边界停住。
+///
+/// 内存：一次 `parent_index` + 每个保留 commit 一次 `read_commit`（O(保留集) 折，
+/// 与 `marked_objects` 同量级——prune 是稀有的人工命令，不是常驻循环）。
+pub fn prune_keep(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    days: Option<u64>,
+    keep_n: Option<usize>,
+    now_ns: i64,
+) -> Result<PrunePlan> {
+    let heads = build::all_ref_heads(db, pid, None)?;
+    let index = object::parent_index(db, pid)?;
+    let reachable = history::reachable_from(&index, &heads, &[]);
+    // 全部 ref 的可达闭包按"挂住"分组：main 之外的 ref 挂住的那些不许裁。
+    let mut held_by_others: BTreeSet<Hash> = BTreeSet::new();
+    for (name, hs) in build::all_named_refs(db, pid)? {
+        if name == build::MAIN {
+            continue;
+        }
+        held_by_others.extend(history::reachable_from(&index, &hs, &[]));
+    }
+    // 时间序（新→老）：walk 的堆序就是判据要的序。
+    let ordered = history::walk(db, pid, &heads, 0)?;
+    let mut keep: BTreeSet<Hash> = reachable.clone();
+    if let Some(d) = days {
+        let cutoff = now_ns.saturating_sub(d as i64 * 86_400 * 1_000_000_000);
+        for n in &ordered {
+            if n.commit.ts < cutoff {
+                keep.remove(&n.hash);
+            }
+        }
+    }
+    if let Some(n) = keep_n {
+        // 每个 head 各走一条链（第一亲代），链上第 n+1 本起裁。多 head 共享的祖先
+        // 只要在任何一条链的前 n 本里就保留（与"保留最新 N 版"的直觉一致）。
+        let mut young: BTreeSet<Hash> = BTreeSet::new();
+        for h in &heads {
+            let mut cur = *h;
+            for _ in 0..n {
+                young.insert(cur);
+                match index.get(&cur).and_then(|ps| ps.first()) {
+                    Some(p) => cur = *p,
+                    None => break,
+                }
+            }
+        }
+        keep = keep.intersection(&young).copied().collect();
+    }
+    let mut plan = PrunePlan::default();
+    for h in &reachable {
+        if keep.contains(h) {
+            continue;
+        }
+        if held_by_others.contains(h) {
+            plan.held.push(*h);
+            // 挂住的不裁 ⇒ 放回保留集（它的树与块也都要留）。
+            keep.insert(*h);
+        } else {
+            plan.dropped.push(*h);
+        }
+    }
+    // 边界 = 保留集里"有亲代被裁"的 commit。
+    for h in &keep {
+        if let Some(ps) = index.get(h)
+            && ps.iter().any(|p| !keep.contains(p))
+        {
+            plan.boundaries.push(*h);
+        }
+    }
+    plan.dropped.sort();
+    plan.held.sort();
+    plan.boundaries.sort();
+    plan.keep = keep;
+    Ok(plan)
+}
+
+/// 给边界 commit 写 shallow 标记（存在即语义，值为空）。**必须在删被裁 commit 之前写**：
+/// 反过来崩在中间，读侧会撞 MissingObject；这个顺序下崩在中间最坏是"标记写了但还没删"，
+/// 那只是历史暂时多看得到一段，下一次 prune/sweep 接着收。
+pub fn mark_shallow(db: &dyn KvEngine, pid: ProjectId, boundaries: &[Hash]) -> Result<()> {
+    for h in boundaries {
+        let tx = db.begin();
+        if !tx.set(&keys::shallow_key(pid, h), Vec::new()) {
+            return Err(Error::WriteConflict(keys::short(h)));
+        }
+        tx.commit();
+    }
+    Ok(())
 }
 
 /// 一次 `K|p` 前缀扫：`(块 hash, size, refcnt)` 全量。

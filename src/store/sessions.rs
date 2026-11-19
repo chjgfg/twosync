@@ -52,6 +52,11 @@ pub struct SessionRecord {
     pub their_heads: Vec<Hash>,
     /// 对面最后验收的那个 commit（`None` = 被拒或没动 head）。
     pub accepted: Option<Hash>,
+    /// 本进程 CPU 峰值（占单核的百分比 × 100，如 2350 = 23.5%）。FR-16 的那一格。
+    /// **postcard 兼容边界**：加字段后旧 S 行解码失败 ⇒ `recent()` 静默跳过 ⇒ "上次会话"格
+    /// 空窗到下一场新会话。这是已拍板接受的代价（2026-11-19），不做双读迁移。
+    /// 测量口径：进程起至会话结束的**累计平均** CPU（不是瞬时峰值采样），跨盘型不可比。
+    pub cpu_peak: u64,
 }
 
 /// 本端在这场会话里站的方向。收成枚举而不是布尔：`blocks`/`bytes` 的含义跟着它变，

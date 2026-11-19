@@ -33,6 +33,7 @@ fn rec(ts: i64, dir: Dir, blocks: usize, peer: &str) -> SessionRecord {
         our_heads: vec![[ts as u8; 32]],
         their_heads: vec![],
         accepted: None,
+        cpu_peak: 0,
     }
 }
 

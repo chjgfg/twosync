@@ -33,6 +33,163 @@ use crate::store::keys::Hash;
 use crate::store::{build, cas, checkout, history, keys, object, worktree};
 use crate::utils::objects_dir;
 
+/// `prune`：FR-9 的"按天数/版本数自动过期"。**决定丢哪一版**的策略命令（与 `gc` 的分工见模块头）。
+///
+/// 顺序（FR-13 的镜像）：**先写 shallow 边界标记 → 再删被裁 commit → 最后走 mark-sweep 收块**。
+/// 反过来崩在中间会留下"保留集里的 commit 指向不存在的亲代"；这个顺序下最坏是"标记写了还没删"，
+/// 那只是历史暂时多看得到一段，下一次接着收。
+///
+/// 默认只报不写（FR-7）；`--apply` 才落地。被 tag/branch/stash 挂住的一律不裁。
+pub fn prune(
+    cli: &Cli,
+    days: Option<u64>,
+    keep: Option<usize>,
+    apply: bool,
+    max_mbps: f64,
+) -> Result<()> {
+    let (project, _root) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    if days.is_none() && keep.is_none() {
+        return Err(Error::BadInput(
+            "prune 要给策略：--days D（只留最近 D 天）或 --keep N（每条链留最新 N 本），至少一个".to_string(),
+        ));
+    }
+    let plan = crate::store::gc::prune_keep(&*db, pid, days, keep, worktree::now_ns())?;
+    println!("project   = {project}  (id={pid:#010x})");
+    println!(
+        "策略      = {}{}",
+        days.map(|d| format!("只留最近 {d} 天")).unwrap_or_default(),
+        keep.map(|n| format!("{}每条链留最新 {n} 本", if days.is_some() { " ∧ " } else { "" }))
+            .unwrap_or_default()
+    );
+    println!(
+        "裁剪      = 保留 {} 本；裁掉 {} 本；被 tag/branch/stash 挂住不裁 {} 本",
+        plan.keep.len(),
+        plan.dropped.len(),
+        plan.held.len()
+    );
+    for h in plan.dropped.iter().take(10) {
+        let c = object::read_commit(&*db, pid, h)?;
+        println!("          - {}  {}  {}", keys::short(h), history::fmt_ts(c.ts), c.msg);
+    }
+    if plan.dropped.len() > 10 {
+        println!("          …另有 {} 本", plan.dropped.len() - 10);
+    }
+    for h in &plan.held {
+        println!("          挂住不裁 = {}", keys::short(h));
+    }
+    if !plan.boundaries.is_empty() {
+        println!(
+            "边界      = {} 本保留 commit 的亲代链被裁断 ⇒ 写 shallow 标记，log/blame/bisect 到这里停",
+            plan.boundaries.len()
+        );
+    }
+    if plan.dropped.is_empty() {
+        println!("结果      = 没有可裁的（策略太松，或老历史都被挂住了）⇒ 一个字没写");
+        return Ok(());
+    }
+    if !apply {
+        println!("模式      = 只报（FR-7）。加 --apply 才写 shallow 标记、删 commit、收块");
+        return Ok(());
+    }
+    // ① 先写边界标记（读侧从此在边界停住，不会撞 MissingObject）。
+    crate::store::gc::mark_shallow(&*db, pid, &plan.boundaries)?;
+    // ② 走 mark-sweep 的删除机器：被裁 commit 不在保留集里 ⇒ C/c/T/B 行删、块 refcnt 减、
+    //    归零落 D 表。与 gc --sweep 同一份实现，不另写一套删除。
+    let cas = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
+        .with_bucket(&cli.budget((max_mbps * 1048576.0) as u64));
+    let p = crate::store::gc::sweep_with_keep(&*db, &cas, pid, &plan.keep, false)?;
+    let ul = crate::store::gc::unlink_pending(&*db, &cas, pid, usize::MAX, false)?;
+    println!(
+        "落地      = 回收 事务 {} / tree {} / 清单 {}；实删块 {} / {:.1} MiB",
+        p.commits_dropped,
+        p.trees_dropped,
+        p.blobs_dropped,
+        ul.files,
+        ul.bytes as f64 / 1048576.0
+    );
+    println!(
+        "提醒      = 被裁的历史**不可恢复**（这不是备份，§1）。对端若还留着那些 commit，\
+         下一次 push/pull 的 union 会把它们收回来 ⇒ 两端都要 prune 才算真腾了地方"
+    );
+    Ok(())
+}
+
+/// `commit --amend`：替换当前唯一 head。新 commit 的亲代 = 旧 head 的亲代（不是旧 head），
+/// 旧 head 失去 main 悬挂 ⇒ 不可达 ⇒ 下次 `gc --sweep --apply` 收走。
+///
+/// 前置校验：必须恰好一个 head（多 head 时"替换哪一个"没有定义，§7.1 不许猜）。
+/// 两条警告如实打印：① 旧 head 被 tag/branch/stash 挂着时它不会真消失；
+/// ② **推过的版本别 amend**——对端仍持旧 commit，下一次 union 会把它收回来。
+pub fn amend(cli: &Cli, msg: Option<&str>, allow_mass_delete: bool) -> Result<()> {
+    let (project, root) = m0::resolve_project(cli)?;
+    let db = cli.store()?;
+    let pid = keys::project_id(&project);
+    let heads = build::ref_heads(&*db, pid, build::MAIN)?;
+    if heads.len() != 1 {
+        return Err(Error::BadInput(format!(
+            "amend 要替换唯一一个 head，而现在有 {} 个 ⇒ 先 `merge --keep-both` 或 `reset <hash>` 收成一个",
+            heads.len()
+        )));
+    }
+    let old = heads[0];
+    let old_commit = object::read_commit(&*db, pid, &old)?;
+    // 被别的 ref 挂着 ⇒ 旧 head 不会真消失（pin 语义），如实说。
+    let refs = build::all_named_refs(&*db, pid)?;
+    let index = object::parent_index(&*db, pid)?;
+    let lost = history::unheld_by_other_refs(&refs, &index, build::MAIN, &[old]);
+    println!("project   = {project}  (id={pid:#010x})");
+    println!("替换      = {}  {}  {}", keys::short(&old), history::fmt_ts(old_commit.ts), old_commit.msg);
+    if lost.is_empty() && refs.iter().any(|(n, hs)| n != build::MAIN && hs.contains(&old)) {
+        println!("注意      = 旧 head 还有别的 ref 挂着 ⇒ 它不会变不可达，gc 收不到它");
+    }
+    // 会话账里出现过这个 head = 它推过/收过 ⇒ union 会把它收回来。
+    let pushed = crate::store::sessions::recent(&*db, pid, 64)?
+        .iter()
+        .any(|r| r.our_heads.contains(&old) || r.their_heads.contains(&old));
+    if pushed {
+        println!(
+            "警告      = 这个 head 在会话账里出现过（推过/收过）⇒ 对端可能仍持有它，\
+             下一次 push/pull 的 union 会把旧 commit 收回来。amend 只适合**没推过**的版本"
+        );
+    }
+    let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?;
+    let new_msg = msg.unwrap_or(&old_commit.msg);
+    let built = build::build_amend(
+        &*db,
+        pid,
+        &store,
+        &root,
+        build::Meta {
+            peer: m0::PEER_LOCAL,
+            msg: new_msg,
+            ts: worktree::now_ns(),
+            allow_mass_delete,
+        },
+        old_commit.parents.clone(),
+    )?;
+    let Some(new) = built.commit else {
+        return Err(Error::BadInput("amend 没建出 commit（工作树快照异常）".to_string()));
+    };
+    build::set_ref(&*db, pid, build::MAIN, &[new])?;
+    println!(
+        "新 head   = {}（亲代 = {}）",
+        keys::short(&new),
+        if old_commit.parents.is_empty() {
+            "（无，初始提交）".to_string()
+        } else {
+            old_commit.parents.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+        }
+    );
+    println!(
+        "旧 head   = {} 已不可达 ⇒ 下一次 `gc --sweep --apply` 收走（要留就先 `tag add`）",
+        keys::short(&old)
+    );
+    println!("提醒      = 工作树没动（amend 只换历史那一笔）；`W` 仍是旧快照，下一步照常 `scan`");
+    Ok(())
+}
+
 pub fn tag(cli: &Cli, cmd: &TagCmd) -> Result<()> {
     let (name, _) = m0::resolve_project(cli)?;
     let db = cli.store()?;
@@ -699,6 +856,15 @@ fn reapply(
              （git 要 `-m N`，本项目不给这个旋钮）。想丢掉那一支就 `reset <hash>` 点名",
             commit.parents.len(),
             what = which.name()
+        )));
+    }
+    // shallow 边界（prune --expire）：这一版的亲代被裁掉了 ⇒ "相对亲代的改动"没有定义。
+    // 不许静默当成根（那会把"撤掉它引入的一切"这种完全不同的语义偷偷换上来）。
+    if !commit.parents.is_empty() && object::is_shallow(&*db, pid, &target)? {
+        return Err(Error::BadInput(format!(
+            "{rev} 的亲代链已被 prune 裁断（shallow 边界）⇒ {} 它需要亲代那一版当基，而基已经不在了。\
+             想丢掉这一版之后的改动就 `reset <hash>` 点名",
+            which.name()
         )));
     }
     // 无亲代 = 与**空树**比：`revert` 一个根就是把它引入的一切撤掉 —— 那会正撞 FR-10，也正是它该撞的地方。

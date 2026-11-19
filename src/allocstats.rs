@@ -158,3 +158,59 @@ mod imp {
 pub fn peak_rss() -> Option<Rss> {
     imp::sample()
 }
+
+/// **进程自己的累计 CPU 时间**（用户态 + 内核态，纳秒），拿不到就 `None`。
+///
+/// FR-16 的"CPU 峰值"格用的就是它：会话结束时采一次，除以进程墙钟得到"占单核百分比"。
+/// 口径如实说：这是**进程起至采样点的累计平均**，不是瞬时峰值采样（没有后台采样线程，
+/// 那会自己变成一个新的 CPU 突发源，与 NFR-3 相反）。
+///
+/// - Windows：`GetProcessTimes`（手工声明，同 RSS 那条"不为一个结构体拉 windows crate"）。
+/// - Linux：`/proc/self/stat` 的 utime+stime（clock ticks，按 100 Hz 换算）。
+#[cfg(windows)]
+pub fn process_cpu_ns() -> Option<u64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetProcessTimes(
+            process: *mut core::ffi::c_void,
+            creation: *mut u64,
+            exit: *mut u64,
+            kernel: *mut u64,
+            user: *mut u64,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    // FILETIME 是 100 ns 一格。
+    Some((kernel + user) * 100)
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_cpu_ns() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // comm 字段可能含空格/括号 ⇒ 从最后一个 ')' 之后切。
+    let rest = text.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // ')' 之后第 12 个字段是 utime（索引 11），第 13 个是 stime（索引 12）。
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    // clock ticks 按 100 Hz（USER_HZ 的常见值；_SC_CLK_TCK 要 libc，这里不拉依赖）。
+    Some((utime + stime) * 10_000_000)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn process_cpu_ns() -> Option<u64> {
+    None
+}

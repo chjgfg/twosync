@@ -57,6 +57,7 @@ impl Site {
             project: Some("p".to_string()),
             engine: Some(common::engine()),
             io_bucket: bucket,
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         }
@@ -111,6 +112,7 @@ fn one_round(max_mbps: f64) -> DaemonArgs<'static> {
         debounce: 1,
         rounds: 1,
         max_mbps,
+        max_cpu_mbps: 0.0,
         no_push: true,
         peer: None,
         agent_bin: "twosync",
@@ -254,6 +256,7 @@ fn zero_intervals_are_clamped_to_one_second() {
             project: Some("p".to_string()),
             engine: Some(common::engine()),
             io_bucket: Bucket::default(),
+            cpu_bucket: Default::default(),
             store_slot: Default::default(),
             cmd: twosync::cli::Cmd::Init,
         };

@@ -40,11 +40,18 @@ pub struct Config {
     pub engine: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_size: Option<u64>,
+    /// 拨号偏好（§16.3）：`both`（默认，一轮先 pull 再 push）/ `pull-only` / `push-only`。
+    /// 消费者是 `m2::daemon` 的 pull/push 段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial_preference: Option<String>,
 }
+
+/// 拨号偏好的三个合法值。
+pub const DIAL_VALUES: [&str; 3] = ["both", "pull-only", "push-only"];
 
 impl Config {
     /// 全部可配键。`config get`（不带参数）与"未知键"的报错都从这里出。
-    pub const KEYS: &'static [&'static str] = &["engine", "block_size"];
+    pub const KEYS: &'static [&'static str] = &["engine", "block_size", "dial_preference"];
 
     /// 缺文件 = 全默认（首次 `init` 之前也会走到这里）。**解析失败必须报错**，不许当成
     /// 空表再写回去——那和注册表那条是同一个道理：一次坏文件清空全部配置。
@@ -80,6 +87,7 @@ impl Config {
         match key {
             "engine" => self.engine.clone(),
             "block_size" => self.block_size.map(|b| b.to_string()),
+            "dial_preference" => self.dial_preference.clone(),
             _ => None,
         }
     }
@@ -94,6 +102,10 @@ impl Config {
             "block_size" => match self.block_size {
                 Some(b) => Ok((b.to_string(), "配置文件")),
                 None => Ok((DEFAULT_BLOCK.to_string(), "内置默认")),
+            },
+            "dial_preference" => match &self.dial_preference {
+                Some(d) => Ok((d.clone(), "配置文件")),
+                None => Ok(("both".to_string(), "内置默认")),
             },
             other => Err(unknown_key(other)),
         }
@@ -117,6 +129,15 @@ impl Config {
                 }
                 self.block_size = Some(n);
             }
+            "dial_preference" => {
+                if !DIAL_VALUES.contains(&value) {
+                    return Err(Error::BadInput(format!(
+                        "拨号偏好 {value:?} 不认识；可用：{}",
+                        DIAL_VALUES.join(" / ")
+                    )));
+                }
+                self.dial_preference = Some(value.to_string());
+            }
             other => return Err(unknown_key(other)),
         }
         Ok(())
@@ -127,6 +148,7 @@ impl Config {
         match key {
             "engine" => Ok(self.engine.take().is_some()),
             "block_size" => Ok(self.block_size.take().is_some()),
+            "dial_preference" => Ok(self.dial_preference.take().is_some()),
             other => Err(unknown_key(other)),
         }
     }
@@ -140,6 +162,19 @@ impl Config {
 
     pub fn block_size(&self) -> u64 {
         self.block_size.unwrap_or(DEFAULT_BLOCK)
+    }
+
+    /// 生效的拨号偏好（`both` / `pull-only` / `push-only`）。坏值在 `set` 那道闸就拒了，
+    /// 这里再兜一次是因为配置文件可以被人手改。
+    pub fn dial_preference(&self) -> Result<String> {
+        match &self.dial_preference {
+            Some(d) if DIAL_VALUES.contains(&d.as_str()) => Ok(d.clone()),
+            Some(d) => Err(Error::BadInput(format!(
+                "配置里的 dial_preference {d:?} 不认识；可用：{}",
+                DIAL_VALUES.join(" / ")
+            ))),
+            None => Ok("both".to_string()),
+        }
     }
 }
 

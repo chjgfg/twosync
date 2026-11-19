@@ -57,6 +57,20 @@ use crate::store::sessions::{self, Dir, SessionRecord};
 use crate::store::worktree;
 use crate::utils::{self, objects_dir, site_id};
 
+/// 本进程 CPU 占单核的百分比 × 100（如 2350 = 23.5%）。累计平均口径，见 `allocstats::process_cpu_ns`。
+/// 拿不到 CPU 时间或墙钟为 0 时给 0（不编一个数）。
+fn cpu_pct_x100(started: Instant) -> u64 {
+    let Some(cpu_ns) = crate::allocstats::process_cpu_ns() else {
+        return 0;
+    };
+    let wall_ns = started.elapsed().as_nanos() as u64;
+    if wall_ns == 0 {
+        return 0;
+    }
+    // cpu_ns / wall_ns = 占单核的倍数；×10000 = 百分比×100。
+    (cpu_ns as u128 * 10_000 / wall_ns as u128) as u64
+}
+
 /// 写一行会话账（FR-16 的"上次会话耗时/传输字节/对端 head"）。
 ///
 /// **写失败只警告，不改命令的成败**：同步已经发生了，让一次已完成的 push 因为记账失败而退出码
@@ -274,6 +288,7 @@ pub fn push(cli: &Cli, a: &PushArgs) -> Result<()> {
             our_heads: build::ref_heads(&*db, pid, build::MAIN)?,
             their_heads: rep.their_heads.clone(),
             accepted: rep.accepted.first().copied(),
+            cpu_peak: cpu_pct_x100(started),
         },
     );
     io.finish()
@@ -402,6 +417,7 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
             their_heads: rep.their_heads.clone(),
             // 本端就是验收的那一侧：拒了就没有新 head。
             accepted: if rep.accepted { rep.heads_after.first().copied() } else { None },
+            cpu_peak: cpu_pct_x100(started),
         },
     );
     let verdict = io.finish();
@@ -411,7 +427,94 @@ pub fn pull(cli: &Cli, a: &PullArgs) -> Result<()> {
             rep.reason
         )));
     }
+    // §16.2 那句"并检出"的落地（2026-11-19）：收进来的历史要变成工作树才算"拉到了"。
+    // 顺序不可换：会话开头已自动 commit（§7.2）→ accept 移 head（既成事实）→ 现在才检出。
+    land_after_pull(cli, &name, &rep.heads_after, &cas, allow_mass_delete);
     verdict
+}
+
+/// `pull` 验收成功之后的检出那一半。**单独成函数是为了能测**：`pull` 剩下的部分要 ssh，
+/// 而这半截只需要库 + 工作树（与 [`paired_root`] 同一条理由）。
+///
+/// 三条边界：
+/// - **多 head 不检出**：union 之后两个 head 是正常态，检出哪一个就是猜（§7.1）⇒ 指路
+///   `merge --keep-both` / `checkout --at`，历史已经收进库，一个字不丢；
+/// - **检出失败只警告不回滚**：历史与 head 前移是会话里已经发生的既成事实，把检出失败
+///   升级成"pull 失败"会让 daemon 走退避曲线重拉一遍——重拉也修不好工作树的问题；
+/// - **检出之后 `W` 是旧的**：与 `checkout`/`reset` 同一口径，下一步 `scan` 才认得盘上的新样子
+///   （daemon 下一轮开头的全量 scan 天然补上）。
+pub fn land_after_pull(
+    cli: &Cli,
+    name: &str,
+    heads_after: &[keys::Hash],
+    cas: &Cas,
+    allow_mass_delete: bool,
+) {
+    if heads_after.len() != 1 {
+        println!(
+            "检出        = **跳过**：union 之后有 {} 个 head，检出哪一个都是猜（§7.1）⇒ \
+             `merge --keep-both`（路径无交集时）或 `checkout --at <hash>` 点名。历史已收进库，不丢",
+            heads_after.len()
+        );
+        return;
+    }
+    let target = heads_after[0];
+    let db = match cli.store() {
+        Ok(db) => db,
+        Err(e) => {
+            println!("检出        = 跳过（开不了库：{e}）；历史已收进库，`checkout --at` 可补");
+            return;
+        }
+    };
+    let pid = keys::project_id(name);
+    let work = match m0::project_root(cli, name) {
+        Ok(w) => w,
+        Err(e) => {
+            println!("检出        = 跳过（找不到工作树：{e}）；历史已收进库，`checkout --at` 可补");
+            return;
+        }
+    };
+    match crate::store::checkout::checkout(
+        &*db,
+        pid,
+        cas,
+        &work,
+        &target,
+        None,
+        crate::store::checkout::Opts {
+            apply: true,
+            allow_mass_delete,
+        },
+    ) {
+        Ok(rep) => {
+            println!(
+                "检出        = 建 {} / 建目录 {} / 覆盖 {} / 删 {} / 删目录 {} / 跳过 {}{}",
+                rep.create,
+                rep.mkdir,
+                rep.overwrite,
+                rep.delete,
+                rep.rmdir,
+                rep.skipped,
+                if rep.deferred > 0 {
+                    format!(" / deferred 不动 {}", rep.deferred)
+                } else {
+                    String::new()
+                }
+            );
+            m0::note_checkout_dirty(&rep);
+            println!(
+                "          = 工作树已落成 {}；`W` 还是旧快照，下一步 `scan` 才认得盘上的新样子",
+                keys::short(&target)
+            );
+        }
+        Err(e) => {
+            println!(
+                "检出        = **失败，只警告不回滚**：{e}\n  \
+                 历史与 head 已经收进库（既成事实）；工作树的问题修好后 `checkout --at {}` 可补",
+                keys::short(&target)
+            );
+        }
+    }
 }
 
 /// 服务端：stdin 读帧、stdout 写帧。**给人用 `ssh` 调，不是给人敲的**。
@@ -462,6 +565,12 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
         match session::serve(&mut io, &*db, &cas, &site, !0, &mut resolve, false) {
             Ok(rep) => {
                 sessions += 1;
+                // heads-only 查询（status --peer）：不是同步，**不记 S 账**——它没搬一个块，
+                // 记进去会把"上次会话"那一格变成一次问路。
+                if rep.reason.starts_with("heads-only") {
+                    eprintln!("agent #{sessions}: project={} heads-only 查询（不记 S 账）", rep.project);
+                    continue;
+                }
                 // 服务端也要记账（这一侧的账只有它自己知道：落盘块数、验收结果、当时看到的对面 head）。
                 // `peer` 留空是**如实**：被拨的一侧在协议里拿不到"谁拨的"——对端身份可以照抄（§9.5.2
                 // 不签名），所以这里不编一个名字出来，宁可空着让人看见"这一格没有"。
@@ -491,6 +600,8 @@ pub fn agent(cli: &Cli, only: Option<&str>) -> Result<()> {
                         } else {
                             None
                         },
+                        // 被拨的一侧没有整场起点（同 ms 那条理由）⇒ 不编一个 CPU 数。
+                        cpu_peak: 0,
                     },
                 );
                 // 两种角色两种账：`sent` 有值 = 对面 `pull` 了我们，这一场本端是**发送方**。
@@ -546,6 +657,36 @@ fn io_kind_eof() -> std::io::ErrorKind {
     std::io::ErrorKind::UnexpectedEof
 }
 
+/// 拨号问对端的实时 head（status --peer 用）。起一条 ssh 管子跑 heads-only 会话，
+/// 只交换 head 不传块、不记 S 账。配对闸与 push/pull 同一道（§9.5.3）。
+pub fn query_peer_heads(cli: &Cli, name: &str, peer: &str, agent_bin: &str) -> Result<Vec<keys::Hash>> {
+    let db = cli.store()?;
+    let remote_root = paired_root(cli, name, None)?;
+    let remote_cmd = format!("{agent_bin} --root \"{remote_root}\" agent");
+    let child = Command::new("ssh")
+        .arg(peer)
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            Error::BadInput(format!("起不了 `ssh {peer} {remote_cmd}`：{e}"))
+        })?;
+    let mut io = Duplex::from_child(child)?;
+    let site = site_id(&cli.root)?;
+    let opts = PushOpts {
+        project: name,
+        peer_id: &site,
+        peer_name: peer.as_bytes(),
+        caps: caps::FIXED_CHUNK | caps::SPARSE | caps::XATTR_MODE,
+        max_block_bytes: u64::MAX,
+        allow_mass_delete: false,
+    };
+    let heads = session::query_heads(&mut io, &*db, &opts)?;
+    let _ = io.finish();
+    Ok(heads)
+}
+
 
 /// `gc`：**引擎版本回收**（全库一轮 `vacuum()`，前后各读一次 §9.6.2 的 `health()`），
 /// 外加 `--sweep` 的 §9.3 mark-sweep（两趟：记账 → 限额删）。
@@ -598,33 +739,53 @@ pub fn gc(
     // 这一半干的，而 mark-sweep 那半确实一个字节没动。测量台被自己改了一遍 ⇒ 前后两批墙钟不能比。
     // 规矩收敛成一条与 FR-7 同源的：**改东西的那一步必须 `--apply`，不带就只许读。**
     if apply {
-        let stats = db.vacuum()?;
-        println!(
-            "本轮        = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
-            stats.rows_scanned, stats.versions_removed, stats.xmin
-        );
-        // **FR-15 也管 vacuum**（这一条以前漏着：桶只挂在 CAS 上，而 `vacuum` 不碰 CAS）。
-        // 字节数我们看不到——门面只报行数，也不给分片版（§14 Q14），所以这里只能**折算**：
-        // 用 §11.4b 量出来的物化口径 207 B/键 × 扫过的行数。它必然不准（真实写量还含 WAL 框架、
-        // 且只有被重写的文件才产生新字节），但它做的事是对的：**这一趟的账记进同一份预算**，
-        // 于是同一轮里后面的 `push`/`gc unlink` 必须等它把平均速率还回来。
-        // 折算系数写成常量、打印出来，别让它藏在一条注释里。
+        // **循环到净减 0**（§14 Q19 定案 2026-11-19，方案①）：一趟 `vacuum()` 收不到不动点
+        // （§11.4h 实测：同一状态连做三趟净减 374 470 / 143 928 / 0 行），所以"跑过 gc 的周期点上
+        // max_chain 不单调上升"这条 M2 判据必须以"收到不动点"为前提。判停两条：
+        // ① `health().total_rows` 不再下降（与下面"净减"打印同一把尺子）；
+        // ② `skipped_active_txn` = 整轮没开工，再转也是空转（§9.6.2）。
+        // 每趟都扣桶（FR-15），趟数打印出来。**dry 分支不进这个循环**（FR-7）。
+        // 注意：循环不解决"全库一刀"的 IO 突发（那要引擎侧的 vacuum_bounded，§14 Q14），
+        // 它只是把"收干净"从期望变成保证。
         const VACUUM_BYTES_PER_ROW: u64 = 207;
-        let charged = stats.rows_scanned * VACUUM_BYTES_PER_ROW;
-        cli.io_bucket.charge(charged);
-        println!(
-            "过桶        = vacuum 按 {VACUUM_BYTES_PER_ROW} B/行折算扣 {:.2} MiB（门面不报真实写量，也不给分片 vacuum ⇒ 这是记账不是测量）",
-            charged as f64 / 1048576.0
-        );
-        if matches!(stats.blob_rewritten, Some(true)) {
-            println!("blob 文件   = 已重写（外置 value 被压实过）");
-        }
-        if stats.skipped_active_txn {
+        let mut prev_rows = before.total_rows;
+        let mut rounds = 0usize;
+        loop {
+            let stats = db.vacuum()?;
+            rounds += 1;
             println!(
-                "注意        = 有活跃事务 ⇒ **整轮跳过，一个版本都没裁**（`versions_removed = 0` \
-                 不等于「没垃圾」，是「没开工」，§9.6.2）"
+                "第 {rounds} 趟    = 读 {} 行，裁掉 {} 个旧版本（水位 xmin {}）",
+                stats.rows_scanned, stats.versions_removed, stats.xmin
             );
+            // **FR-15 也管 vacuum**（这一条以前漏着：桶只挂在 CAS 上，而 `vacuum` 不碰 CAS）。
+            // 字节数我们看不到——门面只报行数，也不给分片版（§14 Q14），所以这里只能**折算**：
+            // 用 §11.4b 量出来的物化口径 207 B/键 × 扫过的行数。它必然不准（真实写量还含 WAL 框架、
+            // 且只有被重写的文件才产生新字节），但它做的事是对的：**这一趟的账记进同一份预算**，
+            // 于是同一轮里后面的 `push`/`gc unlink` 必须等它把平均速率还回来。
+            // 折算系数写成常量、打印出来，别让它藏在一条注释里。
+            let charged = stats.rows_scanned * VACUUM_BYTES_PER_ROW;
+            cli.io_bucket.charge(charged);
+            println!(
+                "过桶        = vacuum 按 {VACUUM_BYTES_PER_ROW} B/行折算扣 {:.2} MiB（门面不报真实写量，也不给分片 vacuum ⇒ 这是记账不是测量）",
+                charged as f64 / 1048576.0
+            );
+            if matches!(stats.blob_rewritten, Some(true)) {
+                println!("blob 文件   = 已重写（外置 value 被压实过）");
+            }
+            if stats.skipped_active_txn {
+                println!(
+                    "注意        = 有活跃事务 ⇒ **整轮跳过，一个版本都没裁**（`versions_removed = 0` \
+                     不等于「没垃圾」，是「没开工」，§9.6.2）⇒ 不再继续循环"
+                );
+                break;
+            }
+            let now = db.health();
+            if now.total_rows >= prev_rows {
+                break; // 净减 0 = 不动点
+            }
+            prev_rows = now.total_rows;
         }
+        println!("vacuum      = 共 {rounds} 趟，收到净减 0 为止（Q19）");
     } else {
         println!(
             "版本链      = **只报账，没裁**（没给 `--apply`）。多余版本行的上界 = rows_above_one {}；\

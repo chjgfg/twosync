@@ -293,3 +293,49 @@ fn zero_limit_means_no_limit_at_all() {
     store.put_file(&src).unwrap();
     assert!(started.elapsed().as_secs() < 2, "不该有任何等待");
 }
+
+/// 稀疏重建（2026-11-19）：零块 seek 跳过 + set_len，读回的内容与长度逐字节对，
+/// 整文件 hash 校验照常过（hasher 喂零没被跳过）。
+#[test]
+fn sparse_rebuild_keeps_content_and_hash_correct() {
+    let site = tmpdir();
+    let store = cas(site.path());
+    // 头一块有内容、中间两块全零、尾块又有**不同**内容 ⇒ 零块夹在中间，seek 必须落对位置。
+    // 尾块故意与头块不同：相同的话 CAS 去重成一块，stored 就不是 2 了。
+    let mut body = distinct_body(DEFAULT_BLOCK as usize);
+    body.extend_from_slice(&vec![0u8; (DEFAULT_BLOCK * 2) as usize]);
+    let mut tail = distinct_body(DEFAULT_BLOCK as usize);
+    tail[0] ^= 0xFF;
+    body.extend_from_slice(&tail);
+    let src = site.path().join("holey.bin");
+    fs::write(&src, &body).unwrap();
+    let out = store.put_file(&src).unwrap();
+    assert_eq!(out.zero, 2, "中间两块全零");
+    assert_eq!(out.stored, 2, "头尾两块有内容");
+
+    let back = site.path().join("out.bin");
+    store.read_blob(&out.blob, &back).unwrap();
+    assert_eq!(fs::read(&back).unwrap(), body, "稀疏重建后逐字节必须一致");
+}
+
+/// CPU 桶（FR-15 --max-cpu-mbps）：哈希搬动的字节真的扣进 CPU 桶，与 IO 桶各管各的账。
+#[test]
+fn cpu_bucket_charges_hashed_bytes_separately_from_io() {
+    let site = tmpdir();
+    let cpu = twosync::store::cas::Bucket::limited(1 << 30); // 1 GiB/s，不拖慢用例
+    let store = Cas::new(&site.path().join("objects"), DEFAULT_BLOCK)
+        .unwrap()
+        .with_cpu_bucket(&cpu);
+    let src = site.path().join("in.bin");
+    let body = distinct_body((DEFAULT_BLOCK * 2) as usize);
+    fs::write(&src, &body).unwrap();
+    store.put_file(&src).unwrap();
+    let charged = cpu.written().expect("CPU 桶该有扣账");
+    assert!(
+        charged >= body.len() as u64,
+        "plan 与 copy_block 都哈希了这些字节，扣账 {charged} 不该少于 {}",
+        body.len()
+    );
+    // IO 桶没开 ⇒ 它的账是空的（两个桶不掺）。
+    assert_eq!(store.paced_bytes(), None, "IO 桶没开就不该有账");
+}

@@ -1747,7 +1747,10 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
        就到 20 万行 / 28 层 ⇒ 峰值本身就是那把尺子的读数，难看但诚实）。
     **我推荐 ①**：它是 twosync 一侧十几行的事，做完之后 M2 那条判据在"跑过 gc"的每个周期点上都成立；
     ②只是把话说弱，不解决任何东西。
-    > **边界（2026-10-21 更正，用户点名）**：这里原来还有第三条"去引擎要 `vacuum_to_fixpoint`"
+    > **已落地（2026-11-19，方案①）**：`m1::gc` 的引擎那一半改成循环到 `health().total_rows` 不再下降
+   > （+ `skipped_active_txn` 防死循环），每趟扣桶、打印趟数；dry 分支不进循环。daemon 调同一函数，
+   > 两边一起生效。用例 `gc_apply_vacuums_to_the_fixpoint` / `gc_dry_run_does_not_enter_the_vacuum_loop`。
+   > **边界（2026-10-21 更正，用户点名）**：这里原来还有第三条"去引擎要 `vacuum_to_fixpoint`"
     > 与一条"这是不是引擎 bug、要不要报"——**两条都撤**。存储引擎不归我改，也不归我把问题递到你面前：
     > `storage-engines` 按 crates.io 的 `0.4.0` 依赖（无 path、无 patch），引擎侧另有其人。
     > 本仓库只回答"拿到这个引擎，我这一侧要做成什么样"。同类读数的机制解释也不在这里追，
@@ -1772,6 +1775,10 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
     "同一路径被两个 head 改成**不同的内容**"，并在 `merge`/`revert` 的输出里明说"这一支里有个删除被丢了"。
     **我倾向 ①**（静默丢删除与"绝不静默覆盖"这条项目基调相反），但这是判据改动、会让已有用例的期望值变，
     所以等你点头再做。**在你表态之前，本轮不动判据**，只在 §16.2 与本条把它写清楚。
+    > **已落地（2026-11-19，用户拍板①）**：`changed_paths` 值改 `Option<(Hash,u32)>`（`None`=删除），
+    > `collect_changed` 补"基里有、head 里没有"枚举（目录缺席递归基子树；bases 空不产删），
+    > `Merger::level` 规则④查基（基里有 ⇒ 删-vs-改记冲突），`collisions` 认删除标记（双删=相等不碰撞）。
+    > 护栏：单 head 零引擎调用、独立根用例不破。新增用例覆盖删-改/双删/目录递归删/删-未动/revert 跨界。
 （v0.1 的 Q1「服务器侧写入是程序产出还是人编辑」已不再是阻塞项——版本库 + 多 head 天生支持两端都写。）
 
 ## 15. 已知限制（README 必须原样列出）
@@ -1942,6 +1949,27 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
     > 判据没动、选项没动、裁决没动；§9.6.1 的 (f2) 那条老账照旧，(f1) 那条"每单位成本平直"仍然待验
     > （见本条第 30 项）。
 
+32. **协议版本升到 3，无协商回退**（2026-11-19，`Proto::HeadsQuery`）：v2 旧对端的**所有**会话
+    （不只 `--peer` 查询）都会被拒——`PROTO_VER` 是等值硬校验。两端必须同步升级二进制。
+    这是按 frame.rs 那条"新增消息类型 = 不兼容"的规矩做的，不是疏忽。
+
+33. **`prune --expire` 的 shallow 边界**（2026-11-19）：被裁 commit 的亲代链用 `G|p|hash` 标记断点，
+    `log`/`blame`/`bisect` 在边界处停住而不是报 `MissingObject`；**跨界 `revert`/`cherry-pick` 报明确错误**
+    （基已不在，"相对亲代的改动"没有定义）。被裁历史**不可恢复**；对端若仍持有那些 commit，
+    下一次 union 会收回来 ⇒ 两端都要 prune 才算真腾了地方。被 tag/branch/stash 挂住的一律不裁。
+
+34. **稀疏重建在 Windows 上只省写零的 IO，不承诺占盘变小**（2026-11-19）：零块 seek 跳过 + `set_len`，
+    Unix 天然成洞；NTFS 上 seek 写尾仍实分配中间簇（`FSCTL_SET_ZERO_DATA` 留 M4）。
+    hasher 照常喂零，整文件校验不受影响。
+
+35. **`commit --amend` 只适合没推过的版本**（2026-11-19）：旧 head 变不可达交 sweep 收，
+    但对端若仍持有它，union 会收回来。命令在会话账里见过这个 head 时打印警告。
+    多 head 时拒绝（替换哪一个没有定义）。
+
+36. **会话账加 `cpu_peak` 字段，旧 S 行空窗一轮**（2026-11-19）：postcard 非自描述，加字段后
+    旧行解码失败 ⇒ `recent()` 静默跳过 ⇒ "上次会话"格空窗到下一场新会话。已拍板接受，不做双读迁移。
+    CPU 口径是**进程累计平均**（不是瞬时峰值采样），跨盘型不可比。
+
 ## 16. 附录：多项目布局与命令面（v0.3 新增）
 
 ### 16.1 多项目布局
@@ -1960,6 +1988,8 @@ scan 3        max_chain 50   rows_above_one 415 812     ← 一趟 +375 382
 | 二：图上重写/重放 | `branch tag reset revert stash cherry-pick commit --amend blame bisect project use` | 中。`branch` = ref 命名空间（`H` 前缀里换 `ref_name`）；`blame/bisect` = DAG 遍历；`stash` = 一个临时 commit，近乎免费。**落地状态（2026-10-21）**：`tag`（钉子）、`reset`（挪 head 集合）、`branch`（活口：`list/add/rm/move/rename`，存在 `refs/heads/` 那一格、名字直接当 revspec、**不参与同步**）三条已在；`revert`/`cherry-pick`（`40bcd7c`）= 同一次结构三方合并的参数换位（ours=当前 head，
 theirs=那一版，base=它的亲代/它自己），所以它们复用 §7.1 那把尺、共享"有冲突就不落盘"；
 `blame`（§15 第 27 条）、`bisect`（§15 第 28 条）与 `stash`（本批）也已在 ⇒ **这一层八条全落**。
+> **2026-11-19 补**：`commit --amend`（替换唯一 head，亲代=旧 head 的亲代，§15 第 35 条）与
+> `prune --expire`（FR-9 自动过期，shallow 边界，§15 第 33 条）也已落。`project use` 仍在注册表侧。
 `stash` 的前置出口是库层新开的 `build::build_detached`（"落库但别成为 head"）；她每次落地之后**自己补一次全量 `scan`**，理由与代价见 §15 第 29 条 | M3–M4 |
 | 三：内容三方合并 | `merge`（有同路径交集时）、`rebase -i` 的冲突解决 | **另一个量级的工程，且与 §1 的分工矛盾**（跨 OS 编辑同一份源码本该交给真 git）→ 不提供，给明确报错 | **结构那一半已落**（M3，`e6323a5`）；内容合并不做 |
 
@@ -1985,6 +2015,9 @@ theirs=那一版，base=它的亲代/它自己），所以它们复用 §7.1 那
   所以 FR-10、§9.4.1 路径校验、缺块自证、闭合性差集在两个方向上是同一份代码（§17 补记三十）。
   "并检出"这半**还没做**：`pull` 只把历史与对象收进版本库（head 前移、块落 CAS），
   不动工作树 —— 那条要等 M3 的"按需双向检出"，`checkout` 目前得手动跑。
+  > **已落地（2026-11-19）**：`m1::land_after_pull` 在 accept 成功且**单 head** 时调库层
+  > `checkout::checkout` 把工作树落成那个样子；多 head 跳过并指路 `merge`/`checkout --at`（不猜）；
+  > 检出失败**只警告不回滚**（历史已入库是既成事实）。检出后 `W` 旧，下一步 `scan` 补（daemon 天然补）。
 
 ### 16.3 对等（P2P）具体改了什么
 
@@ -1994,6 +2027,8 @@ theirs=那一版，base=它的亲代/它自己），所以它们复用 §7.1 那
    > ① **每场会话内容只单向流动** —— "双向"要靠两边各发起一次（`daemon` 一轮里就是先 pull 再 push），
    > 而不是一场会话里双向传数据；② `dial_preference` 这个字段**还没做**，现在"谁拨谁"就是"谁跑了
    > `daemon`/`push`/`pull`"；③ "按需检出"没做（见 §16.2 那条）。
+   > **2026-11-19 补**：② 已落 —— 站点配置 `dial_preference`（both/pull-only/push-only，默认 both），
+   > daemon 按它决定一轮里 pull/push 的取舍；③ 的 pull 侧已落（见 §16.2 那条补记）。
    > 已经验到的部分：两边各自独立提交 → 互相拉一次 → **两边 head 集合相等且两笔历史都在**
    > （`pull_then_pull_converges_two_independently_committed_sites`）——那是 §7 的 union 那一行，
    > 走 pull 这条路第一次跑通。
@@ -2009,6 +2044,30 @@ theirs=那一版，base=它的亲代/它自己），所以它们复用 §7.1 那
 - **部分连通收敛**：A-B 直连、B-C 直连、A-C 不通时，历史经 B 传播且不变形。union 语义让这件事**原理上成立**（B 是 C 的可达性来源），但证明与测试需要 3-peer 生成器，§10.1 已提前留口子。→ M5。
 
 ## 17. 修订记录
+
+### v0.4 补记五十一（2026-11-19，补缺一批：Q21/Q19 落地 + prune/amend/稀疏/CPU 桶/日志/heads 查询）
+
+用户拍板三件：Q21 删-vs-改**判成碰撞**；真 SSH 与 72h 长跑**暂缓**（文档保持未验证）；
+crates.io 发布那格**完全不动**。本轮把"本仓库侧能做"的缺口补完，分八批，每批双引擎全绿再进下一批。
+
+**落地清单**（判据与边界见 §15 第 32–36 条、§14 Q19/Q21 的定案注记、§16.2/16.3 的补记）：
+1. **Q21**：`changed_paths` 值改 `Option`，删除进变更集；规则④查基；`collisions` 认删除标记。
+2. **Q19**：`gc` 引擎那一半循环到净减 0（`total_rows` 不降 + `skipped_active_txn` 双判停），dry 不进循环。
+3. **pull 自动检出**：`land_after_pull`，单 head 才检出，失败只警告不回滚。
+4. **prune --expire**：`prune_keep` 裁保留集 + `sweep_with_keep` 复用删除机器 + `G` 标签 shallow 边界；
+   `walk`/`parent_index`/`parents_of` 认边界；跨界 revert 报错。
+5. **CPU 桶**：`Cli.cpu_bucket` + `--max-cpu-mbps`（Scan/Commit/Apply/Daemon），Cas 与 scan 热点扣账；
+   `ScanBudgets` 收双桶（clippy 7 参）。`Cli` 手写 Default，测试字面量补 `cpu_bucket`。
+6. **dial_preference**：站点配置键 both/pull-only/push-only，daemon 消费。
+7. **status 两格**：`--peer` 拨号问实时 head（`HeadsQuery`，**PROTO_VER=3**，heads-only 不记 S 账）；
+   `SessionRecord.cpu_peak`（进程累计平均 CPU，旧 S 行空窗一轮）。
+8. **稀疏重建**：零块 seek+set_len，hasher 照常喂零；Windows 只省写零 IO（§15 第 34 条）。
+9. **commit --amend**：`build_amend`（parents_override + force 绕空变更早退），单 head 校验、被挂/已 push 警告。
+10. **日志接线**：main 初始化 tracing-subscriber（EnvFilter+JSON+按日轮转），agent writer 只走文件；
+    daemon 轮边界结构化 info!。**工程配套**：justfile（check=双引擎+clippy）、`[profile.release]` thin-LTO+strip。
+
+** measurement 纪律照旧**：本轮新增用例全部用计数/字节/行数断言，不掐墙钟（本机 ±2×）。
+**未动**：NFR-1 内存架构债（引擎侧另有人）、CDC、静态加密（Q4 未拍）、M5、真 SSH/72h、发布。
 
 ### v0.4 补记（2026-10-16，实测更正 + CAS 落地）
 

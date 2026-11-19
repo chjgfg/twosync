@@ -36,7 +36,9 @@ use crate::store::object::{Commit, TreeEntry};
 ///
 /// **2**：`Proto::PullRequest`（M2 的 `pull`，反方向开场）。按上面那条规矩这就是一次不兼容新增，
 /// 所以两边必须在同一版本上说话。
-pub const PROTO_VER: u32 = 2;
+/// **3**：`Proto::HeadsQuery`（status 的"实时对端 head"，只交换 head 不传块）。同上，不兼容新增
+/// ⇒ **v2 旧对端的所有会话都会被拒**，两端必须同步升级（§15 明记，无协商回退）。
+pub const PROTO_VER: u32 = 3;
 
 /// 单帧上限。§9.4.5 的"PushBatch 单帧上限"就是这一条。
 /// 8 MiB 的来由：一个目录清单在 20 万条目时约 10 MB ⇒ 超限就得多帧，
@@ -173,6 +175,15 @@ pub enum Proto {
         /// 所以这条由收的一方声明、发送方照它自我了断（超了就 Abort，一个字不发）。
         /// `u64::MAX` = 不限。
         max_bytes: u64,
+    },
+    /// **只问 head，不传块**（status 的"实时对端 head"格，2026-11-19）。
+    ///
+    /// 放在枚举最后（别的变体序号不变）+ `PROTO_VER` 升 3：老对端解不出这一帧 ⇒ 响亮失败。
+    /// 对端回 `HeadsState` 之后**直接收尾**，不进 push/serve body —— 这是一场零传输的会话，
+    /// 不记 S 账（它不是同步，只是一次问路）。
+    HeadsQuery {
+        project: String,
+        pid: ProjectId,
     },
 }
 

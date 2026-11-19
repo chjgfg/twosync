@@ -2122,3 +2122,116 @@ fn accepting_a_diverged_head_reports_the_collision_instead_of_choosing() {
     // 是 `Site::open()` 手搓的，没有注册表，走命令行只会先撞"没有这个项目"。
     // 那条闸在 `m0::one_commit`，由 tests/cli_surface.rs 那一侧覆盖（有注册表才有意义）。
 }
+
+// ── pull 的"并检出"那一半（2026-11-19，§16.2 落地）─────────────────────────────
+//
+// 测的是 `m1::land_after_pull`（pull 验收成功后的检出函数）：`pull` 剩下的部分要 ssh，
+// 而这半截只需要库 + 注册表 + 工作树。会话本身用内存管子跑同一份 `session::pull`。
+
+/// `land_after_pull` 用例的接收端夹具：`Site` 的引擎句柄移交给 `Cli.store_slot`
+/// （同一进程再开第二个句柄会撞库锁，§9.6.4），临时目录由本结构保住。
+/// 库侧断言走 `cli.store()`，文件侧走 `proj()`。
+struct PullCli {
+    cli: twosync::cli::Cli,
+    tmp: tempfile::TempDir,
+    pid: u32,
+}
+
+impl PullCli {
+    fn from(site: Site) -> Self {
+        let Site { db, tmp, pid } = site;
+        let mut reg = twosync::cli::registry::Registry::default();
+        reg.add(PROJECT, PROJECT).expect("注册项目");
+        reg.save(tmp.path()).expect("写注册表");
+        let cli = twosync::cli::Cli {
+            root: tmp.path().to_path_buf(),
+            project: Some(PROJECT.to_string()),
+            engine: None,
+            io_bucket: Default::default(),
+            cpu_bucket: Default::default(),
+            store_slot: Default::default(),
+            cmd: twosync::cli::Cmd::Init,
+        };
+        let _ = cli.store_slot.set(std::sync::Arc::from(db));
+        Self { cli, tmp, pid }
+    }
+
+    fn proj(&self) -> PathBuf {
+        self.tmp.path().join(PROJECT)
+    }
+
+    fn cas(&self) -> Cas {
+        Cas::new(&objects_dir(self.tmp.path()), cas::DEFAULT_BLOCK).expect("CAS")
+    }
+
+    fn heads(&self) -> Vec<[u8; 32]> {
+        let db = self.cli.store().expect("共享句柄");
+        build::ref_heads(&*db, self.pid, MAIN).expect("heads")
+    }
+}
+
+/// 单 head ⇒ pull 收完历史**顺手检出**：工作树里真的有那些文件。
+#[test]
+fn pull_lands_the_worktree_when_there_is_a_single_head() {
+    let sender = Site::open();
+    let puller = Site::open();
+    sender.commit(&[("d0/f0.bin", b"hello from the sender")], 1);
+    let (got, _) = round_pull(&puller, &sender, &opts(PROJECT));
+    let rep = got.expect("pull 该成功");
+    assert!(rep.accepted, "{}", rep.reason);
+    assert_eq!(rep.heads_after.len(), 1);
+
+    let p = PullCli::from(puller);
+    // 全新站点的工作树目录还不存在（Site::open 只建了站点根）：真实场景里 `project add`
+    // 会建好它，这里补上那一步，检出才有落点。
+    fs::create_dir_all(p.proj()).expect("建工作树目录");
+    m1::land_after_pull(&p.cli, PROJECT, &rep.heads_after, &p.cas(), false);
+    let f = p.proj().join("d0").join("f0.bin");
+    assert!(f.exists(), "单 head 的 pull 要把工作树落成那个样子");
+    assert_eq!(fs::read(&f).expect("读回"), b"hello from the sender");
+}
+
+/// 多 head ⇒ **不检出、不猜**：工作树一个字节不动，历史照样收进库。
+#[test]
+fn pull_with_multiple_heads_skips_the_checkout() {
+    let sender = Site::open();
+    let puller = Site::open();
+    // 先铺共同祖先，再两边各提一笔 ⇒ union 之后两个 head。
+    sender.commit(&[("base.bin", b"common")], 1);
+    let (got, _) = round_pull(&puller, &sender, &opts(PROJECT));
+    got.expect("第一次 pull");
+    puller.commit(&[("local.bin", b"puller's own")], 2);
+    sender.commit(&[("remote.bin", b"sender's new")], 3);
+    let (got, _) = round_pull(&puller, &sender, &opts(PROJECT));
+    let rep = got.expect("第二次 pull 该成功（union 不猜）");
+    assert!(rep.accepted, "{}", rep.reason);
+    assert_eq!(rep.heads_after.len(), 2, "台架前提：union 出两个 head");
+
+    let p = PullCli::from(puller);
+    // 工作树此刻只有 puller 自己提交过的文件；检出若发生会把 remote.bin 写进来。
+    m1::land_after_pull(&p.cli, PROJECT, &rep.heads_after, &p.cas(), false);
+    assert!(
+        !p.proj().join("remote.bin").exists(),
+        "多 head 不许猜一个检出 ⇒ 对面的文件不该出现在工作树"
+    );
+    assert_eq!(p.heads().len(), 2, "历史照收，head 集合不动");
+}
+
+/// 检出失败（工作树目录不存在）**只警告不回滚**：head 与历史是既成事实。
+#[test]
+fn a_failed_checkout_after_pull_does_not_undo_the_history() {
+    let sender = Site::open();
+    let puller = Site::open();
+    sender.commit(&[("f.bin", b"content")], 1);
+    let (got, _) = round_pull(&puller, &sender, &opts(PROJECT));
+    let rep = got.expect("pull 该成功");
+    assert!(rep.accepted);
+
+    let p = PullCli::from(puller);
+    // 全新站点的工作树目录本就不存在 ⇒ project_root 找不到目录 ⇒ 检出那一半失败。
+    // （不先建再删：那会多一步与判据无关的动作。）
+    assert!(!p.proj().exists(), "台架前提：工作树目录不存在");
+    m1::land_after_pull(&p.cli, PROJECT, &rep.heads_after, &p.cas(), false);
+    // 不 panic、不回滚：head 仍在，历史仍可检出到别处。
+    assert_eq!(p.heads(), rep.heads_after, "检出失败不许动 head");
+}

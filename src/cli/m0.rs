@@ -406,7 +406,7 @@ pub fn autocommit_for_session(
     Ok(())
 }
 
-pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<()> {
+pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>, max_cpu_mbps: f64) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
@@ -417,7 +417,17 @@ pub fn scan(cli: &Cli, force: bool, batch: usize, only: Option<&str>) -> Result<
         None => worktree::Scope::Full,
         Some(d) => worktree::Scope::Dir(d.to_string()),
     };
-    let rep = worktree::scan_scoped(&*db, pid, &root, &scope, force, batch, &cli.io_bucket)?;
+    let cpu = cli.cpu_budget((max_cpu_mbps * 1048576.0) as u64);
+    if let Some(bps) = cpu.limit() {
+        println!(
+            "CPU 限速  = {:.1} MiB/s（哈希算力，FR-15 的 CPU 桶，与 IO 桶各管各的账）",
+            bps as f64 / 1048576.0
+        );
+    }
+    let rep = worktree::scan_scoped_cpu(
+        &*db, pid, &root, &scope, force, batch,
+        &worktree::ScanBudgets { io: &cli.io_bucket, cpu: &cpu },
+    )?;
     let peak = wm.peak_growth();
 
     let secs = rep.elapsed_ms as f64 / 1000.0;
@@ -516,7 +526,8 @@ pub fn commit_project(
     // 块仓是**站点级**的一份（挂在 `--root` 下），不是每项目一份：跨项目去重靠这个。
     let store = cas::Cas::new(&objects_dir(&cli.root), cli.block_size()?)?
         .with_fsync(!import.fast)
-        .with_bucket(&cli.budget(import.rate_bytes_per_sec()));
+        .with_bucket(&cli.budget(import.rate_bytes_per_sec()))
+        .with_cpu_bucket(&cli.cpu_budget(import.cpu_rate_bytes_per_sec()));
 
     let started = Instant::now();
     let wm = allocstats::watermark();
@@ -658,10 +669,16 @@ pub fn show(cli: &Cli, rev: &str, path: Option<&str>) -> Result<()> {
     println!("project   = {name}  (id={pid:#010x})");
     println!("commit    = {}", keys::hex(&hash));
     println!("tree      = {}", keys::hex(&c.tree));
+    let shallow = object::is_shallow(&*db, pid, &hash)?;
     println!(
         "parents   = {}",
         if c.parents.is_empty() {
             "（无，初始提交）".to_string()
+        } else if shallow {
+            format!(
+                "{}（shallow 边界：亲代已被 prune 裁掉，历史到这里为止）",
+                c.parents.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+            )
         } else {
             c.parents
                 .iter()
@@ -1101,7 +1118,7 @@ fn work_path(root: &Path, repo_path: &str) -> PathBuf {
 }
 
 /// `status`：工作树（按最后一次扫描）与 HEAD 的差。**走 `build::plan`，不落任何盘**。
-pub fn status(cli: &Cli) -> Result<()> {
+pub fn status(cli: &Cli, peer: Option<&str>, agent_bin: &str) -> Result<()> {
     let (name, root) = resolve_project(cli)?;
     let db = cli.store()?;
     let pid = keys::project_id(&name);
@@ -1183,8 +1200,34 @@ pub fn status(cli: &Cli) -> Result<()> {
             } else {
                 println!("          = 耗时未记（这一侧是被拨的，没有整场起点）");
             }
+            if r.cpu_peak > 0 {
+                println!(
+                    "          = CPU {:.1}% 单核（进程累计平均，发起方测量）",
+                    r.cpu_peak as f64 / 100.0
+                );
+            }
             let ab = sessions::ahead_behind(&*db, pid, &heads, &r.their_heads)?;
             println!("          = {}", ab.line());
+        }
+    }
+    // 实时对端 head（FR-16 的那一格，2026-11-19）：**给了 --peer 才拨号**，默认纯本地不付代价。
+    // 这是一场 heads-only 会话（只交换 head 不传块，不记 S 账）。措辞与"上次会话"那格分清：
+    // 这一格是**现在**问到的，那一格是上次会话时看到的那一面。
+    if let Some(peer) = peer {
+        match crate::cli::m1::query_peer_heads(cli, &name, peer, agent_bin) {
+            Ok(their) => {
+                println!(
+                    "对端 head = {}（实时问到的，heads-only 会话，不传块）",
+                    if their.is_empty() {
+                        "（对端还没有 commit）".to_string()
+                    } else {
+                        their.iter().map(keys::short).collect::<Vec<_>>().join(" ")
+                    }
+                );
+                let ab = sessions::ahead_behind(&*db, pid, &heads, &their)?;
+                println!("          = {}", ab.line());
+            }
+            Err(e) => println!("对端 head = 问不到（{e}）；本地读数照常"),
         }
     }
     print_changes(&p.changes);

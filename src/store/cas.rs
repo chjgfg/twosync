@@ -118,6 +118,9 @@ pub struct Cas {
     /// 写字节的平均速率闸。**`Cas` 全程按 `&self` 传**（`put_file`/`read_blob` 都是），
     /// 而限速要累计已写字节 ⇒ 放进 `Bucket` 的 `Arc<Mutex<..>>` 里。
     bucket: Bucket,
+    /// **CPU 桶**（FR-15 的 `--max-cpu-mbps`）：扣的是哈希/校验搬动的字节，与 IO 桶分开。
+    /// 默认不限速（`charge` 空操作）。语义与 IO 桶同源：累计平均，不削瞬时突发。
+    cpu_bucket: Bucket,
 }
 
 /// 漏桶限速：**只保证平均速率**，不削瞬时突发。
@@ -220,6 +223,7 @@ impl Cas {
             block_size,
             fsync_blocks: true,
             bucket: Bucket::default(),
+            cpu_bucket: Bucket::default(),
         })
     }
 
@@ -241,6 +245,22 @@ impl Cas {
     pub fn with_bucket(mut self, bucket: &Bucket) -> Self {
         self.bucket = bucket.clone();
         self
+    }
+
+    /// 用**别人的 CPU 桶**（同一个算力预算）。与 `with_bucket` 同款，各管各的账。
+    pub fn with_cpu_bucket(mut self, bucket: &Bucket) -> Self {
+        self.cpu_bucket = bucket.clone();
+        self
+    }
+
+    /// CPU 桶的把手（命令层打印与核对用）。
+    pub fn cpu_bucket(&self) -> Bucket {
+        self.cpu_bucket.clone()
+    }
+
+    /// 从 CPU 桶扣 `n` 字节（哈希/校验搬动的量）。没开限速时是空操作。
+    pub fn pace_cpu(&self, n: u64) {
+        self.cpu_bucket.charge(n);
     }
 
     /// 命令层要把它印出来（"这一轮的预算是多少、有没有共享"），不许静默生效。
@@ -325,6 +345,7 @@ impl Cas {
             }
             whole.update(&buf[..n]);
             block_hasher.update(&buf[..n]);
+            self.pace_cpu(n as u64); // CPU 桶：哈希搬动的字节（FR-15 --max-cpu-mbps）
             block_len += n as u64;
             total += n as u64;
             all_zero &= buf[..n].iter().all(|b| *b == 0);
@@ -381,13 +402,23 @@ impl Cas {
         let tmp = temp_in(dest.parent().unwrap_or(Path::new(".")));
         let mut f = File::create(&tmp)?;
         let mut check = blake3::Hasher::new();
+        // 稀疏重建（2026-11-19）：零块**不真写零**，seek 跳过 + 末尾 set_len。
+        // Unix 上天然成洞；Windows NTFS 上 seek 写尾仍会实分配中间簇（FSCTL_SET_ZERO_DATA
+        // 留 M4），所以这里只省"写零的 IO"，不承诺 Windows 上占盘变小 —— 如实打印在命令层。
+        // **hasher 照常喂零**：跳过写盘不能跳过校验，否则末尾整文件 hash 必炸。
+        let mut pos: u64 = 0;
         for b in &blob.blocks {
             if b.zero {
-                write_zeros(&mut f, &mut check, b.size)?;
+                feed_zeros(&mut check, b.size);
+                pos += b.size as u64;
+                f.seek(std::io::SeekFrom::Start(pos))?;
             } else {
+                f.seek(std::io::SeekFrom::Start(pos))?;
                 self.copy_out(&b.hash, b.size, &mut f, &mut check)?;
+                pos += b.size as u64;
             }
         }
+        f.set_len(blob.size)?;
         f.flush()?;
         f.sync_all()?;
         drop(f);
@@ -511,6 +542,7 @@ impl Cas {
                     ))));
                 }
                 check.update(&buf[..n]);
+                self.pace_cpu(n as u64); // CPU 桶：落块前的自证哈希
                 out.write_all(&buf[..n])?;
                 left -= n;
             }
@@ -607,6 +639,7 @@ impl Cas {
             }
             whole.update(&buf[..n]);
             block_hasher.update(&buf[..n]);
+            self.pace_cpu(n as u64); // CPU 桶：读回校验的哈希
             dst.write_all(&buf[..n])?;
             left -= n;
         }
@@ -638,15 +671,14 @@ fn close_block(hasher: &mut blake3::Hasher, len: u64, zero: bool) -> BlockRef {
 /// 补零用的常量缓冲：`static` 而非 `const`，否则每个调用点都会复制一份 64 KiB 进栈帧。
 static ZEROS: [u8; CHUNK] = [0u8; CHUNK];
 
-fn write_zeros(dst: &mut impl Write, hasher: &mut blake3::Hasher, size: u32) -> Result<()> {
+/// 稀疏重建时给整文件 hasher 喂零（**不写盘**）：跳过写盘不能跳过校验。
+fn feed_zeros(hasher: &mut blake3::Hasher, size: u32) {
     let mut left = size as usize;
     while left > 0 {
         let want = left.min(CHUNK);
         hasher.update(&ZEROS[..want]);
-        dst.write_all(&ZEROS[..want])?;
         left -= want;
     }
-    Ok(())
 }
 
 fn temp_in(dir: &Path) -> PathBuf {

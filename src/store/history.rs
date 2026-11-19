@@ -61,6 +61,9 @@ impl Eq for Node {}
 /// 用堆而不是 DFS：DFS 给出的是"某一条链连续"，`log` 要的是全局时间序；多 head 时两者
 /// 结果不同，而多 head 是这个模型的正常态（§4）。菱形历史的共同祖先只出现一次（`seen`）。
 pub fn walk(db: &dyn KvEngine, pid: ProjectId, from: &[Hash], max: usize) -> Result<Vec<Node>> {
+    // shallow 边界（prune --expire）：边界 commit 的 C 体里 parents 仍指向被裁掉的老历史，
+    // 但那些亲代已不在库里 ⇒ 遍历到这里就停，不撞 MissingObject（与 parent_index 同一条规矩）。
+    let shallow = object::shallow_set(db, pid)?;
     let mut seen: HashSet<Hash> = HashSet::with_capacity(from.len());
     let mut heap: BinaryHeap<Node> = BinaryHeap::new();
     for h in from {
@@ -71,6 +74,14 @@ pub fn walk(db: &dyn KvEngine, pid: ProjectId, from: &[Hash], max: usize) -> Res
 
     let mut out = Vec::new();
     while let Some(node) = heap.pop() {
+        if shallow.contains(&node.hash) {
+            let stop = max > 0 && out.len() + 1 >= max;
+            out.push(node);
+            if stop {
+                break;
+            }
+            continue;
+        }
         for p in &node.commit.parents {
             if seen.insert(*p) {
                 heap.push(read_node(db, pid, p)?);
@@ -544,7 +555,9 @@ pub struct Collision {
 ///
 /// 判据是"**与共同祖先比，两边都动了这条路径，而且动出来的不一样**"：
 /// - 只有一边动 ⇒ 不冲突（另一边跟着走，这是 union 的本意）；
-/// - 两边动到**同一个结果**（同 hash 同 mode）⇒ 也不冲突（字节一样的两份改动没有可裁的东西）。
+/// - 两边动到**同一个结果**（同 hash 同 mode）⇒ 也不冲突（字节一样的两份改动没有可裁的东西）；
+/// - **删除也是一种改动**（§14 Q21 定案 2026-11-19）：一边删了、另一边改了 ⇒ 冲突；
+///   两边都删了 ⇒ 同一个结果，不冲突。变更集里删除记作 `None`（[`changed_paths`]）。
 ///
 /// 共同祖先不止一个（criss-cross）时用的是"与**任一个**祖先比都一样就算没动"这条近似：
 /// 真正的 recursive merge base 是一个**决策**（选哪几个虚拟祖先、多个基怎么叠），不是实现细节，
@@ -836,7 +849,8 @@ pub enum Emit {
 /// 1. 两边同名条**完全相同**（`hash`+`mode`）⇒ 取它（目录走 hash 短路：整棵子树不必下去）；
 /// 2. 两边都是目录且不一样 ⇒ **递归下去**（子项各算各的，父层自己不算一条冲突——与碰撞判定同一条规矩）；
 /// 3. 有一边相对祖先**没动** ⇒ 取动了的那一边的结果（包括它把这条删掉 ⇒ 删除生效）；
-/// 4. 只有一边有这一条、而祖先也没有 ⇒ 那是**新增**，取存在的那一边；
+/// 4. 只有一边有这一条：**基里也没有** ⇒ 那是新增，取存在的那一边；**基里有** ⇒ 缺席侧是删除，
+///    删-vs-改按第 5 条记冲突（Q21 定案 2026-11-19，此前这里不查基、静默丢删除）；
 /// 5. 剩下就是"两边各改成不同的东西"（或一边改一边删）⇒ 记进冲突路径，**这一层一个字都不写**。
 ///
 /// 冲突是**收集完再返回**的，不是遇到就停：只报第一条冲突等于让人猜还有几条。
@@ -965,10 +979,19 @@ impl Merger<'_> {
                 }
                 continue;
             }
-            // ④ 祖先里都没有 ⇒ 有一边纯粹是新增，取存在的那一边
-            //    （与 `collisions` 同一条判据：只有"两边都有且不一样"才算冲突）。
+            // ④ 有一边没有这一条：**先查基**（Q21 定案 2026-11-19）。
+            //    基里有 ⇒ 缺席那一侧是**删除**，另一侧是改动 ⇒ 删-vs-改 = 冲突，交给人选
+            //    （git 的 modify/delete 语义；静默取存在边 = 静默丢删除，与项目基调相反）。
+            //    基里也没有 ⇒ 纯粹新增，取存在的那一边。
             if ea.is_none() || eb.is_none() {
-                out.push(ea.or(eb).unwrap().clone());
+                let in_base = base_lists
+                    .iter()
+                    .any(|l| l.iter().any(|x| x.name == name));
+                if in_base {
+                    self.conflicts.push(path);
+                } else {
+                    out.push(ea.or(eb).unwrap().clone());
+                }
                 continue;
             }
             // ⑤ 两边各改成不同东西 ⇒ 记下来，这一层不写盘。
@@ -998,22 +1021,26 @@ impl Merger<'_> {
 }
 
 
-/// 一棵树相对**若干基的清单**（`bases` 是 tree 哈希，不是 commit 哈希）的变更集：路径 → 那条路径上的 `(hash, mode)`（新增时基里没有 ⇒ 也算变更）。
+/// 一棵树相对**若干基的清单**（`bases` 是 tree 哈希，不是 commit 哈希）的变更集：
+/// 路径 → `Some((hash, mode))` = 这一侧现在的内容；`None` = **基里有、这一侧删了**（Q21）。
 ///
-/// `bases` 为空 = 没有共同祖先 ⇒ 与空树比，两边所有路径都算"自己动的"。
+/// `bases` 为空 = 没有共同祖先 ⇒ 与空树比，两边所有路径都算"自己动的"，
+/// 且**不产生任何删除**（没有基就没有"基里有"，独立根不许被报成删了对方的一切）。
 fn changed_paths(
     db: &dyn KvEngine,
     pid: ProjectId,
     trees: &object::TreeIndex,
     bases: &[Hash],
     head: &Hash,
-) -> Result<BTreeMap<String, (Hash, u32)>> {
+) -> Result<BTreeMap<String, Option<(Hash, u32)>>> {
     let mut out = BTreeMap::new();
     collect_changed(db, pid, trees, bases, head, "", &mut out)?;
     Ok(out)
 }
 
 /// 深度优先比一层：`head` 这一层的每条与基层的同名条比，不同就记下来；目录继续往下走。
+/// **基里有而 head 里没有的名字也要枚举**（删除是一种改动，Q21）：文件记 `None`，
+/// 目录缺席要把基子树的叶子逐个记 `None`（只报目录名会漏掉真正被删的路径）。
 fn collect_changed(
     db: &dyn KvEngine,
     pid: ProjectId,
@@ -1021,7 +1048,7 @@ fn collect_changed(
     bases: &[Hash],
     head: &Hash,
     prefix: &str,
-    out: &mut BTreeMap<String, (Hash, u32)>,
+    out: &mut BTreeMap<String, Option<(Hash, u32)>>,
 ) -> Result<()> {
     // 基那一侧可能有几张候选清单（criss-cross）：只要**任何**一个基里这条路径一模一样，
     // 就算"这一侧没动过它"（§7 那条近似的落点）。
@@ -1029,7 +1056,8 @@ fn collect_changed(
         .iter()
         .map(|h| trees.list(db, pid, h))
         .collect::<Result<_>>()?;
-    for e in trees.list(db, pid, head)? {
+    let head_list = trees.list(db, pid, head)?;
+    for e in &head_list {
         let path = if prefix.is_empty() {
             e.name.clone()
         } else {
@@ -1046,9 +1074,59 @@ fn collect_changed(
         }
         if e.kind == Kind::Dir {
             // 目录自己不一样不算一条冲突：子项各算各的（否则改一个文件会把整层报成冲突）。
-            collect_changed(db, pid, trees, bases, &e.hash, &path, out)?;
+            // 递归的基 = 各基清单里**同名且是目录**的那些（文件基没有子层可枚举）。
+            let sub_bases: Vec<Hash> = base_lists
+                .iter()
+                .filter_map(|l| l.iter().find(|x| x.name == e.name))
+                .filter(|x| x.kind == Kind::Dir)
+                .map(|x| x.hash)
+                .collect();
+            collect_changed(db, pid, trees, &sub_bases, &e.hash, &path, out)?;
         } else {
-            out.insert(path, (e.hash, e.mode));
+            out.insert(path, Some((e.hash, e.mode)));
+        }
+    }
+    // 删除侧：基里有、head 这一层没有的名字。bases 为空时 base_lists 恒空 ⇒ 自然不产生删除。
+    for bl in &base_lists {
+        for be in bl {
+            if head_list.iter().any(|x| x.name == be.name) {
+                continue;
+            }
+            let path = if prefix.is_empty() {
+                be.name.clone()
+            } else {
+                format!("{prefix}/{}", be.name)
+            };
+            if be.kind == Kind::Dir {
+                collect_deleted(db, pid, trees, &be.hash, &path, out)?;
+            } else {
+                // 两个基都删了同一个名字 ⇒ 插两次 None，幂等。
+                out.insert(path, None);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把一棵**被整体删掉**的基子树的叶子路径逐个记成 `None`（Q21 的目录缺席那一半）。
+fn collect_deleted(
+    db: &dyn KvEngine,
+    pid: ProjectId,
+    trees: &object::TreeIndex,
+    tree: &Hash,
+    prefix: &str,
+    out: &mut BTreeMap<String, Option<(Hash, u32)>>,
+) -> Result<()> {
+    for e in trees.list(db, pid, tree)? {
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        if e.kind == Kind::Dir {
+            collect_deleted(db, pid, trees, &e.hash, &path, out)?;
+        } else {
+            out.insert(path, None);
         }
     }
     Ok(())
